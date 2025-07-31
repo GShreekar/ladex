@@ -1,7 +1,5 @@
-use actix::{Actor, ActorContext, Addr, AsyncContext, Context, Handler, Message};
-use std::collections::{HashMap, HashSet};
-use serde::{Deserialize, Serialize};
-use uuid::Uuid;
+use actix::{Actor, Addr, Context, Handler, Message};
+use std::collections::{HashMap};
 
 use crate::models::{Metadata, MessageType, Peer};
 
@@ -45,7 +43,7 @@ impl Coordinator {
     }
 
     // Broadcast metadata updates to all sessions
-    fn broadcast_metadata(&self, ctx: &mut Context<Self>) {
+    fn broadcast_metadata(&self, _ctx: &mut Context<Self>) {
         let metadata_list: Vec<Metadata> = self.metadata.values().cloned().collect();
         for session in self.sessions.values() {
             for metadata in &metadata_list {
@@ -145,20 +143,16 @@ impl Handler<CoordinatorMessage> for Coordinator {
                     }
                 }
             }
-            // Forward WebRTC offer to the requester
+            // Forward WebRTC offer to the target peer
             MessageType::Offer { metadata_id, from_peer, sdp } => {
-                if let Some(metadata) = self.metadata.get(&metadata_id) {
-                    if let Some(requester_id) = metadata.hosts.iter().find(|id| *id != &from_peer) {
-                        self.forward_signaling(
-                            requester_id,
-                            MessageType::Offer {
-                                metadata_id,
-                                from_peer,
-                                sdp,
-                            },
-                        );
-                    }
-                }
+                self.forward_signaling(
+                    &from_peer,
+                    MessageType::Offer {
+                        metadata_id,
+                        from_peer: msg.session_id,
+                        sdp,
+                    },
+                );
             }
             // Forward WebRTC answer to the original offerer
             MessageType::Answer { metadata_id, from_peer, sdp } => {

@@ -17,7 +17,7 @@ pub struct Peer {
     pub ip: String,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum MessageType {
     // Broadcast new/changed metadata to all peers
     MetadataUpdate(Metadata),
