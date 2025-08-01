@@ -143,16 +143,20 @@ impl Handler<CoordinatorMessage> for Coordinator {
                     }
                 }
             }
-            // Forward WebRTC offer to the target peer
+            // Improve forwarding of WebRTC offers
             MessageType::Offer { metadata_id, from_peer, sdp } => {
-                self.forward_signaling(
-                    &from_peer,
-                    MessageType::Offer {
-                        metadata_id,
-                        from_peer: msg.session_id,
-                        sdp,
-                    },
-                );
+                for (session_id, session) in &self.sessions {
+                    if session_id != &msg.session_id {
+                        session.do_send(CoordinatorMessage {
+                            session_id: session_id.clone(),
+                            msg: MessageType::Offer {
+                                metadata_id: metadata_id.clone(),
+                                from_peer: msg.session_id.clone(),
+                                sdp: sdp.clone(),
+                            },
+                        });
+                    }
+                }
             }
             // Forward WebRTC answer to the original offerer
             MessageType::Answer { metadata_id, from_peer, sdp } => {

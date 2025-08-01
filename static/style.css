@@ -1,0 +1,345 @@
+@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&display=swap');
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    background: linear-gradient(135deg, #0a0a0a 0%, #1a1a2e 50%, #16213e 100%);
+    font-family: 'Orbitron', monospace;
+    overflow: hidden;
+    position: relative;
+}
+
+body::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: 
+        radial-gradient(circle at 20% 80%, rgba(120, 119, 198, 0.3) 0%, transparent 50%),
+        radial-gradient(circle at 80% 20%, rgba(255, 119, 198, 0.15) 0%, transparent 50%),
+        radial-gradient(circle at 40% 40%, rgba(120, 219, 226, 0.1) 0%, transparent 50%);
+    pointer-events: none;
+}
+
+.futuristic-container {
+    position: relative;
+    background: rgba(0, 0, 0, 0.4);
+    backdrop-filter: blur(15px);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 20px;
+    padding: 1rem 2.5rem;
+    min-width: 900px;
+    min-height: 100vh;
+    box-shadow: 
+        0 8px 32px rgba(0, 0, 0, 0.3),
+        inset 0 1px 0 rgba(255, 255, 255, 0.1),
+        0 0 50px rgba(120, 119, 198, 0.1);
+    transition: all 0.3s ease;
+    display: flex;
+    flex-direction: column;
+}
+
+.futuristic-container::before {
+    content: '';
+    position: absolute;
+    top: -1px;
+    left: -1px;
+    right: -1px;
+    bottom: -1px;
+    border-radius: 20px;
+    z-index: -1;
+    opacity: 0;
+    transition: opacity 0.3s ease;
+}
+
+.futuristic-container:hover::before {
+    opacity: 1;
+}
+
+.futuristic-container:hover {
+    transform: translateY(-5px);
+    box-shadow: 
+        0 15px 50px rgba(0, 0, 0, 0.4),
+        inset 0 1px 0 rgba(255, 255, 255, 0.2),
+        0 0 80px rgba(120, 119, 198, 0.2);
+}
+
+.futuristic-title {
+    font-family: 'Orbitron', monospace;
+    font-weight: 700;
+    font-size: 2rem;
+    text-align: center;
+    margin-bottom: 2rem;
+    background: linear-gradient(135deg, #7877c6, #ff77c6, #78dbe2);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    text-shadow: 0 0 30px rgba(120, 119, 198, 0.5);
+    letter-spacing: 0.1em;
+    position: relative;
+}
+
+.futuristic-title::after {
+    content: '';
+    position: absolute;
+    bottom: -10px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 100px;
+    height: 2px;
+    background: linear-gradient(90deg, transparent, #7877c6, transparent);
+    border-radius: 1px;
+}
+
+.upload-area {
+    flex: 1;
+    border: 2px dashed rgba(120, 119, 198, 0.3);
+    border-radius: 15px;
+    background: rgba(0, 0, 0, 0.2);
+    transition: all 0.3s ease;
+    position: relative;
+    overflow: hidden;
+}
+
+.upload-area::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: -100%;
+    width: 100%;
+    height: 100%;
+    background: linear-gradient(90deg, 
+        transparent, 
+        rgba(37, 36, 36, 0.1), 
+        transparent);
+    transition: left 2s ease;
+}
+
+.upload-area:hover::before {
+    left: 100%;
+}
+
+.futuristic-container::after {
+    content: '';
+    position: absolute;
+    top: 10%;
+    left: 10%;
+    width: 4px;
+    height: 4px;
+    background: rgba(120, 219, 226, 0.6);
+    border-radius: 50%;
+    animation: float 6s ease-in-out infinite;
+    box-shadow: 
+        20px 30px 0 rgba(255, 119, 198, 0.4),
+        40px 70px 0 rgba(120, 119, 198, 0.3),
+        70px 20px 0 rgba(120, 219, 226, 0.5),
+        90px 50px 0 rgba(255, 119, 198, 0.3);
+}
+
+.status-section {
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid rgba(120, 119, 198, 0.2);
+    border-radius: 10px;
+    padding: 1rem;
+}
+
+.status-text {
+    color: #78dbe2;
+    font-family: 'Orbitron', monospace;
+    font-size: 0.9rem;
+    font-weight: 400;
+}
+
+.qr-container {
+    display: flex;
+    justify-content: flex-end;
+}
+
+.qr-container canvas {
+    border-radius: 8px;
+    box-shadow: 0 4px 15px rgba(120, 119, 198, 0.3);
+}
+
+.upload-content {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 200px;
+    position: relative;
+}
+
+.file-input {
+    opacity: 0;
+    position: absolute;
+    width: 100%;
+    height: 100%;
+    cursor: pointer;
+    z-index: 2;
+}
+
+.upload-label {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    color: rgba(120, 119, 198, 0.8);
+    cursor: pointer;
+    transition: all 0.3s ease;
+    pointer-events: none;
+}
+
+.upload-icon {
+    font-size: 3rem;
+    margin-bottom: 1rem;
+    opacity: 0.7;
+}
+
+.upload-text h3 {
+    font-family: 'Orbitron', monospace;
+    font-size: 1.2rem;
+    margin-bottom: 0.5rem;
+    color: #7877c6;
+}
+
+.upload-text p {
+    font-size: 0.9rem;
+    color: rgba(120, 219, 226, 0.6);
+    margin: 0;
+}
+
+.upload-area:hover .upload-label {
+    color: rgba(120, 219, 226, 1);
+    transform: scale(1.05);
+}
+
+.upload-area:hover {
+    border-color: rgba(120, 119, 198, 0.6);
+    background: rgba(120, 119, 198, 0.05);
+}
+
+.file-list-section {
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid rgba(120, 119, 198, 0.2);
+    border-radius: 10px;
+    padding: 1.5rem;
+}
+
+.section-title {
+    font-family: 'Orbitron', monospace;
+    font-size: 1.1rem;
+    color: #7877c6;
+    margin-bottom: 1rem;
+    text-align: center;
+}
+
+.futuristic-table {
+    background: transparent;
+    border: none;
+}
+
+.futuristic-table th {
+    background: rgba(120, 119, 198, 0.1);
+    border: 1px solid rgba(120, 119, 198, 0.3);
+    color: #78dbe2;
+    font-family: 'Orbitron', monospace;
+    font-weight: 400;
+    font-size: 0.9rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.futuristic-table td {
+    background: rgba(0, 0, 0, 0.2);
+    border: 1px solid rgba(120, 119, 198, 0.2);
+    color: rgba(255, 255, 255, 0.8);
+    font-family: 'Orbitron', monospace;
+    font-size: 0.8rem;
+    vertical-align: middle;
+}
+
+.futuristic-table tbody tr:hover td {
+    background: rgba(120, 119, 198, 0.1);
+    color: #78dbe2;
+}
+
+.futuristic-table button {
+    background: linear-gradient(135deg, #7877c6, #78dbe2);
+    border: none;
+    border-radius: 5px;
+    color: white;
+    padding: 0.3rem 0.8rem;
+    font-family: 'Orbitron', monospace;
+    font-size: 0.7rem;
+    font-weight: 400;
+    cursor: pointer;
+    transition: all 0.3s ease;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.futuristic-table button:hover {
+    background: linear-gradient(135deg, #ff77c6, #7877c6);
+    transform: translateY(-2px);
+    box-shadow: 0 4px 15px rgba(120, 119, 198, 0.4);
+}
+
+progress {
+    width: 100px;
+    height: 8px;
+    border-radius: 4px;
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid rgba(120, 119, 198, 0.3);
+}
+
+progress::-webkit-progress-bar {
+    background: rgba(0, 0, 0, 0.3);
+    border-radius: 4px;
+}
+
+progress::-webkit-progress-value {
+    background: linear-gradient(90deg, #7877c6, #78dbe2);
+    border-radius: 4px;
+}
+
+@media (max-width: 768px) {
+    .futuristic-container {
+        min-width: 100vw;
+        min-height: 100vh;
+        padding: 1rem;
+        margin: 0;
+        border-radius: 0;
+    }
+    
+    .futuristic-title {
+        font-size: 1.8rem;
+        margin-bottom: 1rem;
+    }
+    
+    .upload-area {
+        min-height: 200px;
+        margin: 0;
+    }
+}
+
+@media (max-width: 480px) {
+    .futuristic-container {
+        padding: 0.75rem;
+    }
+    
+    .futuristic-title {
+        font-size: 1.5rem;
+        margin-bottom: 0.75rem;
+    }
+    
+    .futuristic-title::after {
+        width: 80px;
+        bottom: -5px;
+    }
+}
