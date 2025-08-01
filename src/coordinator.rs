@@ -144,7 +144,7 @@ impl Handler<CoordinatorMessage> for Coordinator {
                 }
             }
             // Improve forwarding of WebRTC offers
-            MessageType::Offer { metadata_id, from_peer, sdp } => {
+            MessageType::Offer { metadata_id, from_peer: _, sdp } => {
                 for (session_id, session) in &self.sessions {
                     if session_id != &msg.session_id {
                         session.do_send(CoordinatorMessage {

@@ -1,6 +1,6 @@
-import SimplePeer from './libs/simple-peer.min.js';
-import JSZip from './libs/jszip.min.js';
-import QRCode from './libs/qrcode.min.js';
+const SimplePeer = window.SimplePeer;
+const JSZip = window.JSZip;
+const QRCode = window.QRCode;
 
 const sessionId = crypto.randomUUID();
 const ws = new WebSocket(`ws://${window.location.hostname}:8080/ws`);
@@ -12,13 +12,40 @@ const uploadInput = document.getElementById('upload-input');
 const qrCodeContainer = document.getElementById('qrcode');
 const peerStatus = document.getElementById('peer-status');
 
-function generateQRCode() {
-    const url = `http://${window.location.hostname}:8080`;
-    new QRCode(qrCodeContainer, {
-        text: url,
-        width: 128,
-        height: 128,
-    });
+async function getLocalIPs() {
+  const ips = new Set();
+  const pc = new RTCPeerConnection({ iceServers: [] });
+  pc.createDataChannel('');
+  pc.onicecandidate = e => {
+    if (!e.candidate) return;
+    const parts = e.candidate.candidate.split(' ');
+    const addr = parts[4];
+    if (addr) ips.add(addr);
+  };
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  await new Promise(r => setTimeout(r, 500));
+  pc.close();
+  return Array.from(ips);
+}
+
+async function generateQRCode() {
+  let host = window.location.hostname;
+
+  try {
+    const ips = await getLocalIPs();
+    host = ips.find(ip => ip !== '127.0.0.1') || host;
+  } catch (e) {
+    console.warn('Could not determine LAN IP, falling back to hostname:', e);
+  }
+
+  const url = `http://${host}:8080`;
+  qrCodeContainer.innerHTML = '';
+  new QRCode(qrCodeContainer, {
+    text: url,
+    width: 128,
+    height: 128
+  });
 }
 
 function updatePeerStatus() {
@@ -54,15 +81,21 @@ ws.onmessage = (event) => {
     }
 };
 
-ws.onopen = () => {
-    console.log('WebSocket connected');
-    generateQRCode();
-    updatePeerStatus();
+// make onopen async so we can await generateQRCode()
+ws.onopen = async () => {
+  console.log('WebSocket connected');
+  await generateQRCode();
+  updatePeerStatus();
 };
 
 ws.onclose = () => {
     console.log('WebSocket disconnected');
     peerStatus.textContent = 'Disconnected from coordinator';
+};
+
+ws.onerror = (error) => {
+    console.error('WebSocket error:', error);
+    peerStatus.textContent = 'Error connecting to coordinator';
 };
 
 function updateFileList(metadata) {

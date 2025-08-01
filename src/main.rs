@@ -36,8 +36,8 @@ async fn main() -> std::io::Result<()> {
         App::new()
             .wrap(Logger::default())
             .app_data(web::Data::new(coordinator_data.clone()))
+            .route("/ws", web::get().to(ws_route))                    // ← register WS first
             .service(Files::new("/", "./static").index_file("index.html"))
-            .route("/ws", web::get().to(ws_route))
     })
     .bind("0.0.0.0:8080")?
     .run()
