@@ -15,34 +15,45 @@
             
             <!-- Status Section -->
             <div class="status-section mb-4">
-                <div class="row align-items-center">
-                    <div class="col-md-6">
-                        <div id="peer-status" class="status-text">Connecting...</div>
-                    </div>
-                    <div class="col-md-6 text-end">
-                        <div id="qrcode" class="qr-container"></div>
-                    </div>
-                </div>
+                <div id="peer-status" class="status-text">Connecting...</div>
             </div>
 
             <!-- Upload Area -->
-            <div class="upload-area">
+            <div class="upload-area" style="height: 140px; margin-bottom: 15px;">
                 <div class="upload-content">
-                    <input type="file" id="upload-input" multiple webkitdirectory="" class="file-input" accept="*/*">
-                    <label for="upload-input" class="upload-label">
-                        <div class="upload-icon">📁</div>
-                        <div class="upload-text">
-                            <h3>Drop files or folders here</h3>
-                            <p>or click to browse</p>
+                    <div style="display: flex; gap: 10px; align-items: center; justify-content: center;">
+                        <div style="text-align: center;">
+                            <input type="file" id="upload-files" multiple class="file-input" accept="*/*">
+                            <label for="upload-files" class="upload-label" style="font-size: 0.8em; padding: 10px 15px; margin: 0;">
+                                <div class="upload-icon" style="font-size: 1.2em;">�</div>
+                                <div>Files</div>
+                            </label>
                         </div>
-                    </label>
+                        <div style="text-align: center;">
+                            <input type="file" id="upload-folders" multiple webkitdirectory class="file-input">
+                            <label for="upload-folders" class="upload-label" style="font-size: 0.8em; padding: 10px 15px; margin: 0;">
+                                <div class="upload-icon" style="font-size: 1.2em;">📁</div>
+                                <div>Folders</div>
+                            </label>
+                        </div>
+                    </div>
+                    <p style="margin: 5px 0 0 0; font-size: 0.7em; color: #888; text-align: center;">or drag and drop here</p>
                 </div>
             </div>
 
+            <!-- Text Message Area -->
+            <div class="text-message-area mt-4">
+                <div class="input-group">
+                    <input type="text" id="text-input" class="form-control" placeholder="Type a message to share..." maxlength="1000">
+                    <button id="send-text-btn" class="btn btn-outline-success">📤 Send Text</button>
+                </div>
+                <small class="text-muted">Messages are shared with all connected peers</small>
+            </div>
+
             <!-- File List Section -->
-            <div class="file-list-section mt-4">
+            <div class="file-list-section mt-4" style="flex-grow: 1;">
                 <h3 class="section-title">Available Files</h3>
-                <div class="table-responsive">
+                <div class="file-list-container">
                     <table class="table table-dark table-striped futuristic-table">
                         <thead>
                             <tr>
@@ -58,13 +69,29 @@
                     </table>
                 </div>
             </div>
+
+            <!-- Custom Text Message Modal -->
+            <div id="text-message-modal" class="text-modal" style="display: none;">
+                <div class="text-modal-content">
+                    <div class="text-modal-header">
+                        <h4 id="text-modal-title">Text Message</h4>
+                        <button class="text-modal-close" onclick="closeTextModal()">&times;</button>
+                    </div>
+                    <div class="text-modal-body">
+                        <div id="text-modal-sender" class="text-sender"></div>
+                        <div id="text-modal-content" class="text-content"></div>
+                    </div>
+                    <div class="text-modal-footer">
+                        <button class="btn btn-primary" onclick="closeTextModal()">Close</button>
+                    </div>
+                </div>
+            </div>
         </div>
     </div>
     
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.7/dist/js/bootstrap.bundle.min.js" integrity="sha384-ndDqU0Gzau9qJ1lfW4pNLlhNTkCfHzAVBReH9diLvGRem5+R9g2FzA8ZGN954O5Q" crossorigin="anonymous"></script>
     <script src="https://cdn.jsdelivr.net/npm/simple-peer@9.11.1/simplepeer.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
     <script type="module" src="./app.js"></script>
 </body>
 </html>

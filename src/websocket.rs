@@ -69,14 +69,33 @@ impl StreamHandler<Result<Message, ProtocolError>> for WebSocketSession {
     fn handle(&mut self, msg: Result<Message, ProtocolError>, ctx: &mut Self::Context) {
         match msg {
             Ok(Message::Text(text)) => {
+                if text.len() > 1024 * 1024 { // 1MB limit for messages
+                    eprintln!("Message too large from session: {}", self.session_id);
+                    ctx.text(r#"{"error": "Message too large"}"#);
+                    return;
+                }
                 self.handle_message(&text, ctx);
             }
-            Ok(Message::Close(_)) => {
+            Ok(Message::Binary(_)) => {
+                eprintln!("Unexpected binary message from session: {}", self.session_id);
+                ctx.text(r#"{"error": "Binary messages not supported"}"#);
+            }
+            Ok(Message::Close(reason)) => {
+                println!("WebSocket closing for session {}: {:?}", self.session_id, reason);
                 ctx.stop();
             }
-            Ok(_) => {}
+            Ok(Message::Ping(bytes)) => {
+                ctx.pong(&bytes);
+            }
+            Ok(Message::Pong(_)) => {
+                // Heartbeat response received
+                println!("Pong received from session: {}", self.session_id);
+            }
+            Ok(_) => {
+                // Handle other message types
+            }
             Err(e) => {
-                eprintln!("WebSocket error: {}", e);
+                eprintln!("WebSocket protocol error for session {}: {}", self.session_id, e);
                 ctx.stop();
             }
         }

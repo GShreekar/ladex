@@ -11,6 +11,8 @@ body {
     font-family: 'Orbitron', monospace;
     overflow: hidden;
     position: relative;
+    height: 100vh;
+    width: 100vw;
 }
 
 body::before {
@@ -35,7 +37,10 @@ body::before {
     border-radius: 20px;
     padding: 1rem 2.5rem;
     min-width: 900px;
-    min-height: 100vh;
+    height: 100vh;
+    width: 100%;
+    max-width: 100vw;
+    overflow: hidden;
     box-shadow: 
         0 8px 32px rgba(0, 0, 0, 0.3),
         inset 0 1px 0 rgba(255, 255, 255, 0.1),
@@ -98,13 +103,16 @@ body::before {
 }
 
 .upload-area {
-    flex: 1;
+    min-height: 140px;
+    height: 140px;
     border: 2px dashed rgba(120, 119, 198, 0.3);
     border-radius: 15px;
     background: rgba(0, 0, 0, 0.2);
     transition: all 0.3s ease;
     position: relative;
     overflow: hidden;
+    margin-bottom: 15px;
+    flex-shrink: 0;
 }
 
 .upload-area::before {
@@ -156,22 +164,14 @@ body::before {
     font-weight: 400;
 }
 
-.qr-container {
-    display: flex;
-    justify-content: flex-end;
-}
-
-.qr-container canvas {
-    border-radius: 8px;
-    box-shadow: 0 4px 15px rgba(120, 119, 198, 0.3);
-}
-
 .upload-content {
     display: flex;
+    flex-direction: column;
     align-items: center;
     justify-content: center;
-    height: 200px;
+    height: 100%;
     position: relative;
+    padding: 10px;
 }
 
 .file-input {
@@ -181,6 +181,8 @@ body::before {
     height: 100%;
     cursor: pointer;
     z-index: 2;
+    top: 0;
+    left: 0;
 }
 
 .upload-label {
@@ -192,7 +194,12 @@ body::before {
     color: rgba(120, 119, 198, 0.8);
     cursor: pointer;
     transition: all 0.3s ease;
-    pointer-events: none;
+    pointer-events: auto;
+    padding: 15px 20px;
+    border: 1px solid rgba(120, 119, 198, 0.2);
+    border-radius: 10px;
+    background: rgba(0, 0, 0, 0.1);
+    min-width: 100px;
 }
 
 .upload-icon {
@@ -217,6 +224,8 @@ body::before {
 .upload-area:hover .upload-label {
     color: rgba(120, 219, 226, 1);
     transform: scale(1.05);
+    border-color: rgba(120, 219, 226, 0.5);
+    background: rgba(120, 219, 226, 0.1);
 }
 
 .upload-area:hover {
@@ -224,11 +233,60 @@ body::before {
     background: rgba(120, 119, 198, 0.05);
 }
 
+/* Upload button container styling */
+.upload-content > div:first-child {
+    display: flex;
+    gap: 15px;
+    align-items: center;
+    justify-content: center;
+    margin-bottom: 8px;
+}
+
+.upload-content > div:first-child > div {
+    position: relative;
+}
+
 .file-list-section {
     background: rgba(0, 0, 0, 0.3);
     border: 1px solid rgba(120, 119, 198, 0.2);
     border-radius: 10px;
     padding: 1.5rem;
+    flex-grow: 1;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+}
+
+/* Custom scrollbar for file list */
+.file-list-container {
+    flex-grow: 1;
+    overflow-y: auto;
+    overflow-x: hidden;
+}
+
+.file-list-container::-webkit-scrollbar {
+    width: 8px;
+}
+
+.file-list-container::-webkit-scrollbar-track {
+    background: rgba(0, 0, 0, 0.3);
+    border-radius: 4px;
+}
+
+.file-list-container::-webkit-scrollbar-thumb {
+    background: linear-gradient(135deg, #7877c6, #78dbe2);
+    border-radius: 4px;
+    border: 1px solid rgba(120, 119, 198, 0.3);
+}
+
+.file-list-container::-webkit-scrollbar-thumb:hover {
+    background: linear-gradient(135deg, #ff77c6, #7877c6);
+}
+
+/* Firefox scrollbar */
+.file-list-container {
+    scrollbar-width: thin;
+    scrollbar-color: #7877c6 rgba(0, 0, 0, 0.3);
 }
 
 .section-title {
@@ -242,6 +300,48 @@ body::before {
 .futuristic-table {
     background: transparent;
     border: none;
+    table-layout: fixed;
+    width: 100%;
+}
+
+.futuristic-table th,
+.futuristic-table td {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    padding: 0.5rem 0.3rem;
+}
+
+.futuristic-table th:nth-child(1),
+.futuristic-table td:nth-child(1) {
+    width: 40%;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.futuristic-table th:nth-child(2),
+.futuristic-table td:nth-child(2) {
+    width: 25%;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.futuristic-table th:nth-child(3),
+.futuristic-table td:nth-child(3) {
+    width: 15%;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.futuristic-table th:nth-child(4),
+.futuristic-table td:nth-child(4) {
+    width: 20%;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
 .futuristic-table th {
@@ -311,10 +411,11 @@ progress::-webkit-progress-value {
 @media (max-width: 768px) {
     .futuristic-container {
         min-width: 100vw;
-        min-height: 100vh;
+        height: 100vh;
         padding: 1rem;
         margin: 0;
         border-radius: 0;
+        overflow: hidden;
     }
     
     .futuristic-title {
@@ -323,14 +424,17 @@ progress::-webkit-progress-value {
     }
     
     .upload-area {
-        min-height: 200px;
-        margin: 0;
+        min-height: 120px;
+        height: 120px;
+        margin: 0 0 15px 0;
     }
 }
 
 @media (max-width: 480px) {
     .futuristic-container {
         padding: 0.75rem;
+        height: 100vh;
+        overflow: hidden;
     }
     
     .futuristic-title {
@@ -342,4 +446,205 @@ progress::-webkit-progress-value {
         width: 80px;
         bottom: -5px;
     }
+    
+    .upload-area {
+        min-height: 100px;
+        height: 100px;
+    }
+}
+
+/* QR Code Section */
+.qr-section {
+    text-align: center;
+    margin-top: 15px;
+}
+
+#qr-canvas {
+    border: 2px solid #00d4ff;
+    border-radius: 10px;
+    margin: 10px 0;
+    animation: qrGlow 2s ease-in-out infinite alternate;
+}
+
+@keyframes qrGlow {
+    0% { box-shadow: 0 0 10px rgba(0, 212, 255, 0.3); }
+    100% { box-shadow: 0 0 20px rgba(0, 212, 255, 0.6); }
+}
+
+/* Text Message Area */
+.text-message-area {
+    background: rgba(0, 212, 255, 0.05);
+    border: 1px solid rgba(0, 212, 255, 0.2);
+    border-radius: 10px;
+    padding: 15px;
+    margin-top: 20px;
+    flex-shrink: 0;
+}
+
+.text-message-area .input-group {
+    margin-bottom: 8px;
+}
+
+.text-message-area .form-control {
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid rgba(0, 212, 255, 0.3);
+    color: #00d4ff;
+    border-radius: 8px 0 0 8px;
+}
+
+.text-message-area .form-control:focus {
+    background: rgba(0, 0, 0, 0.5);
+    border-color: #00d4ff;
+    color: #ffffff;
+    box-shadow: 0 0 10px rgba(0, 212, 255, 0.3);
+}
+
+.text-message-area .btn-outline-success {
+    border-color: #00ff88;
+    color: #00ff88;
+    border-radius: 0 8px 8px 0;
+}
+
+.text-message-area .btn-outline-success:hover {
+    background-color: #00ff88;
+    color: #000;
+}
+
+/* Enhanced table styling */
+.futuristic-table tbody tr:hover {
+    background: rgba(0, 212, 255, 0.1);
+    transform: translateX(5px);
+    transition: all 0.3s ease;
+}
+
+.futuristic-table .btn {
+    margin: 2px;
+    font-size: 0.85rem;
+    padding: 0.25rem 0.5rem;
+}
+
+/* Progress bars */
+.progress {
+    background: rgba(0, 0, 0, 0.5);
+    border-radius: 10px;
+    overflow: hidden;
+}
+
+.progress-bar {
+    background: linear-gradient(90deg, #00d4ff, #00ff88);
+    color: #000;
+    font-weight: bold;
+    font-size: 0.7rem;
+    text-align: center;
+    line-height: 5px;
+}
+
+/* Additional responsive design for new features */
+@media (max-width: 768px) {
+    .text-message-area {
+        padding: 10px;
+    }
+}
+
+/* Custom Text Message Modal */
+.text-modal {
+    position: fixed;
+    z-index: 1000;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    background-color: rgba(0, 0, 0, 0.8);
+    backdrop-filter: blur(5px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.text-modal-content {
+    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+    border: 1px solid rgba(0, 212, 255, 0.3);
+    border-radius: 15px;
+    padding: 0;
+    max-width: 500px;
+    width: 90%;
+    max-height: 80vh;
+    overflow: hidden;
+    box-shadow: 
+        0 10px 40px rgba(0, 0, 0, 0.5),
+        0 0 30px rgba(0, 212, 255, 0.2);
+    animation: modalFadeIn 0.3s ease;
+}
+
+@keyframes modalFadeIn {
+    from { opacity: 0; transform: scale(0.8); }
+    to { opacity: 1; transform: scale(1); }
+}
+
+.text-modal-header {
+    background: linear-gradient(90deg, rgba(0, 212, 255, 0.2), rgba(0, 255, 136, 0.2));
+    padding: 15px 20px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.text-modal-header h4 {
+    color: #00d4ff;
+    margin: 0;
+    font-family: 'Orbitron', monospace;
+    font-weight: 700;
+}
+
+.text-modal-close {
+    background: none;
+    border: none;
+    color: #ff6b6b;
+    font-size: 24px;
+    cursor: pointer;
+    padding: 0;
+    width: 30px;
+    height: 30px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    transition: background-color 0.3s ease;
+}
+
+.text-modal-close:hover {
+    background-color: rgba(255, 107, 107, 0.2);
+}
+
+.text-modal-body {
+    padding: 20px;
+    max-height: 300px;
+    overflow-y: auto;
+}
+
+.text-sender {
+    color: #00ff88;
+    font-weight: bold;
+    font-size: 0.9rem;
+    margin-bottom: 10px;
+    font-family: 'Orbitron', monospace;
+}
+
+.text-content {
+    color: #ffffff;
+    font-size: 1rem;
+    line-height: 1.5;
+    background: rgba(0, 0, 0, 0.3);
+    padding: 15px;
+    border-radius: 10px;
+    border-left: 3px solid #00d4ff;
+    word-wrap: break-word;
+}
+
+.text-modal-footer {
+    padding: 15px 20px;
+    border-top: 1px solid rgba(255, 255, 255, 0.1);
+    display: flex;
+    justify-content: flex-end;
 }

@@ -1,5 +1,6 @@
 use actix::{Actor, Addr, Context, Handler, Message};
 use std::collections::{HashMap};
+use local_ip_address::local_ip;
 
 use crate::models::{Metadata, MessageType, Peer};
 
@@ -70,6 +71,8 @@ impl Actor for Coordinator {
     type Context = Context<Self>;
 
     fn started(&mut self, _ctx: &mut Self::Context) {
+        let ip = local_ip().unwrap();
+        println!("Your LAN address: http://{}:8080", ip);
         println!("Coordinator actor started");
     }
     fn stopped(&mut self, _ctx: &mut Self::Context) {
@@ -182,6 +185,21 @@ impl Handler<CoordinatorMessage> for Coordinator {
             }
             MessageType::PeerDisconnect(_) => {
                 //Handled by UnregisterSession
+            }
+            // Broadcast text messages to all connected peers
+            MessageType::TextMessage { id, content, sender } => {
+                for (session_id, session) in &self.sessions {
+                    if session_id != &msg.session_id {
+                        session.do_send(CoordinatorMessage {
+                            session_id: session_id.clone(),
+                            msg: MessageType::TextMessage {
+                                id: id.clone(),
+                                content: content.clone(),
+                                sender: sender.clone(),
+                            },
+                        });
+                    }
+                }
             }
         }
     }

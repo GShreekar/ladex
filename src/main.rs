@@ -3,6 +3,7 @@ use actix_files::Files;
 use actix_web::{web, App, Error, HttpServer, middleware::Logger};
 use actix_web_actors::ws;
 use std::sync::Arc;
+use local_ip_address::local_ip;
 
 mod coordinator;
 mod models;
@@ -28,6 +29,9 @@ async fn ws_route(
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     env_logger::init();
+    let local_ip = local_ip().unwrap_or_else(|_| "unknown".parse().unwrap());
+    println!("🚀 LADEX starting on http://{}:8080", local_ip);
+    println!("📱 Share this URL with other devices on the LAN");
     
     let coordinator = Coordinator::new().start();
     let coordinator_data = Arc::new(coordinator);
@@ -36,7 +40,7 @@ async fn main() -> std::io::Result<()> {
         App::new()
             .wrap(Logger::default())
             .app_data(web::Data::new(coordinator_data.clone()))
-            .route("/ws", web::get().to(ws_route))                    // ← register WS first
+            .route("/ws", web::get().to(ws_route))
             .service(Files::new("/", "./static").index_file("index.html"))
     })
     .bind("0.0.0.0:8080")?
