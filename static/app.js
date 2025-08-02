@@ -353,8 +353,7 @@ class LADEXApp {
             
             const chunkSize = 64 * 1024;
             const totalChunks = Math.ceil(file.size / chunkSize);
-            
-            // First, send file metadata
+
             const metadataMessage = {
                 type: 'file_metadata',
                 session_id: this.sessionId,
@@ -369,14 +368,15 @@ class LADEXApp {
             
             this.showProgress(`Sending ${file.name}`, 0);
             
-            const reader = new FileReader();
+            const arrayBuffer = await this.fileToArrayBuffer(file);
+            const uint8Array = new Uint8Array(arrayBuffer);
             
             for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
                 const start = chunkIndex * chunkSize;
-                const end = Math.min(start + chunkSize, file.size);
-                const chunk = file.slice(start, end);
+                const end = Math.min(start + chunkSize, uint8Array.length);
+                const chunkData = uint8Array.slice(start, end);
                 
-                const base64Data = await this.fileToBase64(chunk);
+                const base64Data = this.arrayBufferToBase64(chunkData);
                 
                 const chunkMessage = {
                     type: 'file_chunk',
@@ -406,11 +406,29 @@ class LADEXApp {
         }
     }
 
+    async fileToArrayBuffer(file) {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(reader.result);
+            reader.onerror = reject;
+            reader.readAsArrayBuffer(file);
+        });
+    }
+
+    arrayBufferToBase64(buffer) {
+        let binary = '';
+        const bytes = new Uint8Array(buffer);
+        const len = bytes.byteLength;
+        for (let i = 0; i < len; i++) {
+            binary += String.fromCharCode(bytes[i]);
+        }
+        return btoa(binary);
+    }
+
     async fileToBase64(file) {
         return new Promise((resolve, reject) => {
             const reader = new FileReader();
             reader.onload = () => {
-                // Remove the data URL prefix (data:*/*;base64,)
                 const base64 = reader.result.split(',')[1];
                 resolve(base64);
             };
@@ -451,8 +469,15 @@ class LADEXApp {
             return;
         }
         
+        if (!message.data || typeof message.data !== 'string') {
+            console.error(`Invalid chunk data received for ${message.file_id}, chunk ${message.chunk_index}`);
+            return;
+        }
+        
         download.chunks[message.chunk_index] = message.data;
         download.receivedChunks++;
+        
+        console.log(`Received chunk ${message.chunk_index + 1}/${download.expectedChunks} for ${download.fileName}`);
         
         const progress = Math.round((download.receivedChunks / download.expectedChunks) * 100);
         this.showProgress(`Downloading ${download.fileName}`, progress);
@@ -466,15 +491,36 @@ class LADEXApp {
         try {
             console.log(`Assembling file ${fileId} from ${download.receivedChunks} chunks`);
             
-            const combinedBase64 = download.chunks.join('');
-            
-            const binaryString = atob(combinedBase64);
-            const bytes = new Uint8Array(binaryString.length);
-            for (let i = 0; i < binaryString.length; i++) {
-                bytes[i] = binaryString.charCodeAt(i);
+            // Check for missing chunks
+            const missingChunks = [];
+            for (let i = 0; i < download.expectedChunks; i++) {
+                if (!download.chunks[i]) {
+                    missingChunks.push(i);
+                }
             }
             
-            const blob = new Blob([bytes], { type: download.mimeType });
+            if (missingChunks.length > 0) {
+                throw new Error(`Missing chunks: ${missingChunks.join(', ')}`);
+            }
+            
+            // Convert each chunk from base64 back to binary and combine
+            const allBytes = [];
+            for (let i = 0; i < download.expectedChunks; i++) {
+                const chunkBase64 = download.chunks[i];
+                try {
+                    const binaryString = atob(chunkBase64);
+                    for (let j = 0; j < binaryString.length; j++) {
+                        allBytes.push(binaryString.charCodeAt(j));
+                    }
+                } catch (error) {
+                    throw new Error(`Failed to decode chunk ${i}: ${error.message}`);
+                }
+            }
+            
+            console.log(`Total bytes assembled: ${allBytes.length}, expected: ${download.fileSize}`);
+            
+            const uint8Array = new Uint8Array(allBytes);
+            const blob = new Blob([uint8Array], { type: download.mimeType });
             const file = new File([blob], download.fileName, { type: download.mimeType });
             
             this.storeFile(fileId, file);
