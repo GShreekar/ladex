@@ -35,7 +35,7 @@ body::before {
     backdrop-filter: blur(15px);
     border: 1px solid rgba(255, 255, 255, 0.1);
     border-radius: 20px;
-    padding: 1rem 2.5rem;
+    padding: 1rem 1.5rem;
     height: 100vh;
     width: 100%;
     max-width: 100vw;
@@ -76,9 +76,9 @@ body::before {
 
 header {
     text-align: center;
-    margin-bottom: 30px;
+    margin-bottom: 15px;
     background: transparent;
-    padding: 20px;
+    padding: 10px;
     border-radius: 15px;
 }
 
@@ -87,7 +87,7 @@ h1 {
     font-weight: 700;
     font-size: 2rem;
     text-align: center;
-    margin-bottom: 2rem;
+    margin-bottom: 1rem;
     background: linear-gradient(135deg, #7877c6, #ff77c6, #78dbe2);
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
@@ -144,26 +144,38 @@ h1::after {
 }
 
 main {
-    display: grid;
-    gap: 30px;
-    grid-template-columns: 1fr;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
     flex-grow: 1;
     overflow: hidden;
 }
 
 section {
     background: rgba(0, 0, 0, 0.3);
-    padding: 25px;
     border-radius: 15px;
     border: 1px solid rgba(120, 119, 198, 0.2);
     box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+}
+
+.upload-section {
+    padding: 15px 20px;
+    flex-shrink: 0;
+}
+
+.files-section {
+    padding: 15px 20px;
+    flex-grow: 1;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
 }
 
 h2 {
     font-family: 'Orbitron', monospace;
     font-size: 1.1rem;
     color: #7877c6;
-    margin-bottom: 1rem;
+    margin-bottom: 10px;
     text-align: center;
 }
 
@@ -274,12 +286,13 @@ h2 {
 }
 
 .files-container {
-    overflow-x: auto;
+    overflow-x: hidden;
+    overflow-y: auto;
     -webkit-overflow-scrolling: touch;
     border-radius: 10px;
     box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
     flex-grow: 1;
-    overflow-y: auto;
+    max-height: calc(100vh - 250px);
 }
 
 /* Custom scrollbar */
@@ -386,40 +399,7 @@ th:nth-child(5), td:nth-child(5) { width: 15%; }
     border: 1px solid rgba(120, 219, 226, 0.3);
 }
 
-.peers-container {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
-    gap: 15px;
-}
-
-.peer-card {
-    background: rgba(0, 0, 0, 0.3);
-    padding: 15px;
-    border-radius: 10px;
-    border: 2px solid rgba(120, 119, 198, 0.2);
-}
-
-.peer-id {
-    font-weight: 600;
-    color: #78dbe2;
-    margin-bottom: 5px;
-    font-family: 'Orbitron', monospace;
-}
-
-.peer-info {
-    font-size: 0.9em;
-    color: rgba(120, 219, 226, 0.7);
-    font-family: 'Orbitron', monospace;
-}
-
-.no-peers {
-    text-align: center;
-    color: rgba(120, 219, 226, 0.6);
-    font-style: italic;
-    padding: 40px;
-    font-family: 'Orbitron', monospace;
-}
-
+/* Progress Modal */
 .modal {
     display: none;
     position: fixed;
@@ -489,17 +469,32 @@ th:nth-child(5), td:nth-child(5) { width: 15%; }
 /* Responsive Design */
 @media (max-width: 768px) {
     .container {
-        width: 100vw;
+        padding: 0.75rem;
         height: 100vh;
-        padding: 1rem;
-        margin: 0;
         border-radius: 0;
         overflow: hidden;
     }
     
+    header {
+        margin-bottom: 10px;
+        padding: 5px;
+    }
+    
     h1 {
-        font-size: 1.8rem;
-        margin-bottom: 1rem;
+        font-size: 1.6rem;
+        margin-bottom: 0.5rem;
+    }
+    
+    main {
+        gap: 15px;
+    }
+    
+    .upload-section {
+        padding: 10px 15px;
+    }
+    
+    .files-section {
+        padding: 10px 15px;
     }
     
     .upload-area {
@@ -525,9 +520,12 @@ th:nth-child(5), td:nth-child(5) { width: 15%; }
         text-align: center;
     }
     
+    /* Remove horizontal scrolling on mobile */
     .files-container {
         overflow-x: hidden;
+        overflow-y: auto;
         -webkit-overflow-scrolling: touch;
+        max-height: calc(100vh - 220px);
     }
     
     table {
@@ -565,10 +563,6 @@ th:nth-child(5), td:nth-child(5) { width: 15%; }
         font-size: 0.8em;
     }
     
-    .peers-container {
-        grid-template-columns: 1fr;
-    }
-    
     .modal-content {
         margin: 10% auto;
         padding: 20px;
@@ -578,14 +572,19 @@ th:nth-child(5), td:nth-child(5) { width: 15%; }
 
 @media (max-width: 480px) {
     .container {
-        padding: 0.75rem;
+        padding: 0.5rem;
         height: 100vh;
         overflow: hidden;
     }
     
+    header {
+        margin-bottom: 8px;
+        padding: 3px;
+    }
+    
     h1 {
-        font-size: 1.5rem;
-        margin-bottom: 0.75rem;
+        font-size: 1.4rem;
+        margin-bottom: 0.5rem;
     }
     
     h1::after {
@@ -593,21 +592,31 @@ th:nth-child(5), td:nth-child(5) { width: 15%; }
         bottom: -5px;
     }
     
+    main {
+        gap: 10px;
+    }
+    
+    .upload-section {
+        padding: 8px 10px;
+    }
+    
+    .files-section {
+        padding: 8px 10px;
+    }
+    
     .upload-area {
-        min-height: 100px;
-        height: 100px;
-    }
-    
-    .subtitle {
-        font-size: 1em;
-    }
-    
-    section {
+        min-height: 90px;
+        height: 90px;
         padding: 15px;
     }
     
+    .files-container {
+        max-height: calc(100vh - 180px);
+    }
+    
     h2 {
-        font-size: 1.3em;
+        font-size: 1rem;
+        margin-bottom: 8px;
     }
     
     table {
@@ -615,16 +624,23 @@ th:nth-child(5), td:nth-child(5) { width: 15%; }
     }
     
     th, td {
-        padding: 6px 4px;
+        padding: 6px 3px;
+        font-size: 0.75em;
     }
     
     .btn {
-        padding: 10px 16px;
-        font-size: 0.9em;
+        padding: 8px 12px;
+        font-size: 0.85em;
+    }
+    
+    .btn.download {
+        padding: 5px 10px;
+        font-size: 0.75em;
     }
     
     .upload-info p {
-        font-size: 0.9em;
+        font-size: 0.85em;
+        margin-bottom: 10px;
     }
     
     .modal-content {

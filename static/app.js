@@ -99,13 +99,11 @@ class LADEXApp {
     handlePeerJoined(message) {
         this.peers.set(message.peer.session_id, message.peer);
         this.updatePeerStatus(message.total_peers);
-        this.updatePeersList();
     }
 
     handlePeerLeft(message) {
         this.peers.delete(message.session_id);
         this.updatePeerStatus(message.total_peers);
-        this.updatePeersList();
     }
 
     updateConnectionStatus(connected) {
@@ -121,26 +119,6 @@ class LADEXApp {
 
     updatePeerStatus(count) {
         document.getElementById('peer-status').textContent = `Connected peers: ${count}`;
-    }
-
-    updatePeersList() {
-        const container = document.getElementById('peers-list');
-        
-        if (this.peers.size === 0) {
-            container.innerHTML = '<p class="no-peers">No other peers connected</p>';
-            return;
-        }
-
-        const peersHtml = Array.from(this.peers.values()).map(peer => `
-            <div class="peer-card">
-                <div class="peer-id">${peer.session_id}</div>
-                <div class="peer-info">
-                    Connected: ${new Date(peer.connected_at).toLocaleTimeString()}
-                </div>
-            </div>
-        `).join('');
-
-        container.innerHTML = peersHtml;
     }
 
     setupEventListeners() {
