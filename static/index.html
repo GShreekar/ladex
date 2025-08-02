@@ -2,96 +2,82 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
     <title>LADEX</title>
-    <link rel="icon" type="image/x-icon" href="data:image/x-icon;base64,AAABAAEAEBAQAAEABAAoAQAAFgAAACgAAAAQAAAAIAAAAAEABAAAAAAAgAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAD/AAAA/wD//wAAAP//AP8A//8AAAAA/////wAA////AP///wD///8A////AP///wD///8A////AP///wAIiIiIiIiIiAiIiIiIiIiIAIiIiIiIiIgAiIiIiIiIiACIiIiIiIiIAIiIiIiIiIgAiIiIiIiIiACIiIiIiIiIAIiIiIiIiIgAiIiIiIiIiACIiIiIiIiIAIiIiIiIiIgAiIiIiIiIiACIiIiIiIiIAIiIiIiIiIgAiIiIiIiIiAAAAAAAAAAAAA==">
-    <link rel="stylesheet" href="./style.css">
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.7/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-LN+7fdVzj6u52u30Kp6M/trliBMCMKTyK833zpbD+pXdCLuTusPj697FH4R/5mcr" crossorigin="anonymous">
+    <link rel="stylesheet" href="static/style.css">
 </head>
 <body>
-    <div class="container-fluid vh-100 d-flex align-items-center justify-content-center">
-        <div class="futuristic-container">
-            <h1 class="futuristic-title">LADEX</h1>
-            
-            <!-- Status Section -->
-            <div class="status-section mb-4">
-                <div id="peer-status" class="status-text">Connecting...</div>
+    <div class="container">
+        <header>
+            <h1>LADEX</h1>
+            <div class="status-bar">
+                <span id="peer-status">Connected peers: 0</span>
+                <span id="connection-status" class="status-disconnected">Disconnected</span>
             </div>
+        </header>
 
-            <!-- Upload Area -->
-            <div class="upload-area" style="height: 140px; margin-bottom: 15px;">
-                <div class="upload-content">
-                    <div style="display: flex; gap: 10px; align-items: center; justify-content: center;">
-                        <div style="text-align: center;">
-                            <input type="file" id="upload-files" multiple class="file-input" accept="*/*">
-                            <label for="upload-files" class="upload-label" style="font-size: 0.8em; padding: 10px 15px; margin: 0;">
-                                <div class="upload-icon" style="font-size: 1.2em;">�</div>
-                                <div>Files</div>
-                            </label>
-                        </div>
-                        <div style="text-align: center;">
-                            <input type="file" id="upload-folders" multiple webkitdirectory class="file-input">
-                            <label for="upload-folders" class="upload-label" style="font-size: 0.8em; padding: 10px 15px; margin: 0;">
-                                <div class="upload-icon" style="font-size: 1.2em;">📁</div>
-                                <div>Folders</div>
-                            </label>
-                        </div>
+        <main>
+            <section class="upload-section">
+                <div class="upload-area">
+                    <input type="file" id="file-input" multiple webkitdirectory="" style="display: none;">
+                    <input type="file" id="file-input-single" multiple style="display: none;">
+                    <div class="upload-buttons">
+                        <button id="upload-files-btn" class="btn primary">Upload Files</button>
+                        <button id="upload-folder-btn" class="btn secondary">Upload Folder</button>
                     </div>
-                    <p style="margin: 5px 0 0 0; font-size: 0.7em; color: #888; text-align: center;">or drag and drop here</p>
                 </div>
-            </div>
+            </section>
 
-            <!-- Text Message Area -->
-            <div class="text-message-area mt-4">
-                <div class="input-group">
-                    <input type="text" id="text-input" class="form-control" placeholder="Type a message to share..." maxlength="1000">
-                    <button id="send-text-btn" class="btn btn-outline-success">📤 Send Text</button>
-                </div>
-                <small class="text-muted">Messages are shared with all connected peers</small>
-            </div>
-
-            <!-- File List Section -->
-            <div class="file-list-section mt-4" style="flex-grow: 1;">
-                <h3 class="section-title">Available Files</h3>
-                <div class="file-list-container">
-                    <table class="table table-dark table-striped futuristic-table">
+            <section class="files-section">
+                <h2>Shared Files</h2>
+                <div class="files-container">
+                    <table id="files-table">
                         <thead>
                             <tr>
                                 <th>Name</th>
                                 <th>Type</th>
                                 <th>Size</th>
-                                <th>Action</th>
+                                <th>Hosts</th>
+                                <th>Actions</th>
                             </tr>
                         </thead>
-                        <tbody id="file-list">
-                            <!-- Files will be populated here by JavaScript -->
+                        <tbody id="files-list">
+                            <tr class="no-files">
+                                <td colspan="5">No files shared yet. Upload some files to get started!</td>
+                            </tr>
                         </tbody>
                     </table>
                 </div>
-            </div>
+            </section>
 
-            <!-- Custom Text Message Modal -->
-            <div id="text-message-modal" class="text-modal" style="display: none;">
-                <div class="text-modal-content">
-                    <div class="text-modal-header">
-                        <h4 id="text-modal-title">Text Message</h4>
-                        <button class="text-modal-close" onclick="closeTextModal()">&times;</button>
-                    </div>
-                    <div class="text-modal-body">
-                        <div id="text-modal-sender" class="text-sender"></div>
-                        <div id="text-modal-content" class="text-content"></div>
-                    </div>
-                    <div class="text-modal-footer">
-                        <button class="btn btn-primary" onclick="closeTextModal()">Close</button>
-                    </div>
+            <section class="peers-section">
+                <h2>Connected Peers</h2>
+                <div id="peers-list" class="peers-container">
+                    <p class="no-peers">No peers connected</p>
                 </div>
+            </section>
+        </main>
+    </div>
+
+    <div id="progress-modal" class="modal">
+        <div class="modal-content">
+            <h3>File Transfer</h3>
+            <div class="progress-info">
+                <span id="progress-filename">Downloading file...</span>
+                <span id="progress-percentage">0%</span>
             </div>
+            <div class="progress-bar">
+                <div id="progress-fill"></div>
+            </div>
+            <div class="progress-stats">
+                <span id="progress-speed">0 MB/s</span>
+                <span id="progress-eta">Calculating...</span>
+            </div>
+            <button id="cancel-transfer" class="btn secondary">Cancel</button>
         </div>
     </div>
-    
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.7/dist/js/bootstrap.bundle.min.js" integrity="sha384-ndDqU0Gzau9qJ1lfW4pNLlhNTkCfHzAVBReH9diLvGRem5+R9g2FzA8ZGN954O5Q" crossorigin="anonymous"></script>
-    <script src="https://cdn.jsdelivr.net/npm/simple-peer@9.11.1/simplepeer.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
-    <script type="module" src="./app.js"></script>
+
+    <script src="static/jszip.min.js"></script>
+    <script src="static/app.js"></script>
 </body>
 </html>

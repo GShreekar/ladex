@@ -1,49 +1,89 @@
-use actix::{Actor, Addr};
-use actix_files::Files;
-use actix_web::{web, App, Error, HttpServer, middleware::Logger};
-use actix_web_actors::ws;
+use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
-use local_ip_address::local_ip;
+use tokio::sync::{broadcast, RwLock};
+use warp::Filter;
 
-mod coordinator;
-mod models;
+mod types;
 mod websocket;
+mod handlers;
 
-use coordinator::Coordinator;
-use websocket::WebSocketSession;
+use types::*;
 
-async fn ws_route(
-    req: actix_web::HttpRequest,
-    stream: web::Payload,
-    coordinator: web::Data<Arc<Addr<Coordinator>>>,
-) -> Result<actix_web::HttpResponse, Error> {
-    let client_addr = req.peer_addr();
-    
-    ws::start(
-        WebSocketSession::new(coordinator.get_ref().as_ref().clone(), client_addr),
-        &req,
-        stream,
-    )
+type Peers = Arc<RwLock<HashMap<SessionId, PeerInfo>>>;
+type Files = Arc<RwLock<HashMap<String, FileMetadata>>>;
+
+#[derive(Clone)]
+pub struct AppState {
+    pub peers: Peers,
+    pub files: Files,
+    pub tx: broadcast::Sender<ServerMessage>,
 }
 
-#[actix_web::main]
-async fn main() -> std::io::Result<()> {
-    env_logger::init();
-    let local_ip = local_ip().unwrap_or_else(|_| "unknown".parse().unwrap());
-    println!("🚀 LADEX starting on http://{}:8080", local_ip);
-    println!("📱 Share this URL with other devices on the LAN");
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt::init();
     
-    let coordinator = Coordinator::new().start();
-    let coordinator_data = Arc::new(coordinator);
+    let (tx, _rx) = broadcast::channel::<ServerMessage>(1000);
+    
+    let app_state = AppState {
+        peers: Arc::new(RwLock::new(HashMap::new())),
+        files: Arc::new(RwLock::new(HashMap::new())),
+        tx,
+    };
 
-    HttpServer::new(move || {
-        App::new()
-            .wrap(Logger::default())
-            .app_data(web::Data::new(coordinator_data.clone()))
-            .route("/ws", web::get().to(ws_route))
-            .service(Files::new("/", "./static").index_file("index.html"))
-    })
-    .bind("0.0.0.0:8080")?
-    .run()
-    .await
+    // Serve static files from static directory
+    let static_files = warp::path("static")
+        .and(warp::fs::dir("static"));
+    let index = warp::path::end()
+        .and(warp::fs::file("static/index.html"));
+    
+    // WebSocket endpoint
+    let app_state_ws = app_state.clone();
+    let websocket = warp::path("ws")
+        .and(warp::ws())
+        .and(warp::any().map(move || app_state_ws.clone()))
+        .and_then(websocket::websocket_handler);
+
+    // API endpoints
+    let app_state_api = app_state.clone();
+    let api = warp::path("api")
+        .and(
+            warp::path("peers")
+                .and(warp::get())
+                .and(warp::any().map(move || app_state_api.clone()))
+                .and_then(handlers::get_peers)
+        );
+
+    let cors = warp::cors()
+        .allow_any_origin()
+        .allow_headers(vec!["content-type"])
+        .allow_methods(vec!["GET", "POST", "PUT", "DELETE"]);
+
+    let routes = index
+        .or(static_files)
+        .or(websocket)
+        .or(api)
+        .with(cors);
+
+    let addr: SocketAddr = ([0, 0, 0, 0], 8080).into();
+    println!("LADEX server starting on http://{}", addr);
+    println!("Access the interface at: http://localhost:8080");
+    println!("Share with peers: http://{}:8080", get_local_ip().unwrap_or_else(|| "YOUR_IP".to_string()));
+    
+    warp::serve(routes)
+        .run(addr)
+        .await;
+}
+
+fn get_local_ip() -> Option<String> {
+    use std::net::UdpSocket;
+    if let Ok(socket) = UdpSocket::bind("0.0.0.0:0") {
+        if socket.connect("8.8.8.8:80").is_ok() {
+            if let Ok(addr) = socket.local_addr() {
+                return Some(addr.ip().to_string());
+            }
+        }
+    }
+    None
 }
