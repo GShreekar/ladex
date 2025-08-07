@@ -22,6 +22,15 @@ pub struct FileMetadata {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TextMessage {
+    pub id: String,
+    pub content: String,
+    pub sender_id: SessionId,
+    pub sender_name: Option<String>,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ClientMessage {
     #[serde(rename = "join")]
@@ -66,6 +75,11 @@ pub enum ClientMessage {
     #[serde(rename = "ping")]
     Ping {
         session_id: SessionId,
+    },
+    #[serde(rename = "text_message")]
+    TextMessage {
+        session_id: SessionId,
+        content: String,
     },
 }
 
@@ -125,6 +139,10 @@ pub enum ServerMessage {
     },
     #[serde(rename = "pong")]
     Pong,
+    #[serde(rename = "text_message")]
+    TextMessage {
+        message: TextMessage,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

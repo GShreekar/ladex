@@ -196,6 +196,19 @@ async fn handle_client_message(
                 target_session_id,
             });
         }
+        ClientMessage::TextMessage {
+            session_id: sender_id,
+            content,
+        } => {
+            let message = TextMessage {
+                id: format!("msg_{}_{}", sender_id, chrono::Utc::now().timestamp_millis()),
+                content,
+                sender_id: sender_id.clone(),
+                sender_name: None,
+                timestamp: chrono::Utc::now(),
+            };
+            let _ = state.tx.send(ServerMessage::TextMessage { message });
+        }
     }
     Ok(())
 }

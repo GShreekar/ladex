@@ -8,6 +8,8 @@ class LADEXApp {
         this.activeDownloads = new Map();
         this.pendingDownloads = new Set();
         this.rtcConnections = new Map();
+        this.messages = [];
+        this.unreadCount = 0;
         
         this.init();
     }
@@ -93,6 +95,9 @@ class LADEXApp {
             case 'pong':
                 console.log('Pong received');
                 break;
+            case 'text_message':
+                this.handleTextMessage(message);
+                break;
         }
     }
 
@@ -141,6 +146,34 @@ class LADEXApp {
         document.getElementById('cancel-transfer').addEventListener('click', () => {
             this.cancelActiveTransfer();
         });
+
+        document.getElementById('send-message-btn').addEventListener('click', () => {
+            this.sendTextMessage();
+        });
+
+        document.getElementById('message-input').addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                this.sendTextMessage();
+            }
+        });
+
+        document.getElementById('message-input').addEventListener('input', (e) => {
+            this.autoResizeTextarea(e.target);
+            this.updateSendButton();
+        });
+
+        document.getElementById('close-messages').addEventListener('click', () => {
+            this.hideMessageModal();
+        });
+
+        document.getElementById('messages-modal').addEventListener('click', (e) => {
+            if (e.target.id === 'messages-modal') {
+                this.hideMessageModal();
+            }
+        });
+
+        this.updateSendButton();
     }
 
     async handleFileUpload(files, isFolder) {
@@ -221,36 +254,79 @@ class LADEXApp {
     updateFileList(files) {
         const tbody = document.getElementById('files-list');
         
-        if (!files || files.length === 0) {
-            tbody.innerHTML = '<tr class="no-files"><td colspan="5">No files shared yet. Upload some files to get started!</td></tr>';
+        const allItems = [];
+        
+        if (files && files.length > 0) {
+            files.forEach(file => {
+                allItems.push({
+                    type: 'file',
+                    data: file,
+                    timestamp: new Date(file.uploaded_at)
+                });
+            });
+        }
+        
+        this.messages.forEach(message => {
+            allItems.push({
+                type: 'message',
+                data: message,
+                timestamp: new Date(message.timestamp)
+            });
+        });
+        
+        allItems.sort((a, b) => b.timestamp - a.timestamp);
+        
+        if (allItems.length === 0) {
+            tbody.innerHTML = '<tr class="no-files"><td colspan="5">No files or messages shared yet!</td></tr>';
             return;
         }
 
-        const filesHtml = files.map(file => {
-            const hosts = Array.isArray(file.hosts) ? file.hosts : Array.from(file.hosts || []);
-            const isDownloadable = hosts.length > 0;
-            
-            return `
-                <tr>
-                    <td class="file-name">${file.name}</td>
-                    <td class="file-type">${file.mime_type}</td>
-                    <td class="file-size">${this.formatSize(file.size)}</td>
-                    <td>
-                        <div class="file-hosts">
-                            ${hosts.map(host => `<span class="host-badge">${host}</span>`).join('')}
-                        </div>
-                    </td>
-                    <td class="file-actions">
-                        ${isDownloadable ? 
-                            `<button class="btn download" onclick="app.downloadFile('${file.id}')">⬇️ Download</button>` :
-                            '<span style="color: #a0aec0;">No hosts</span>'
-                        }
-                    </td>
-                </tr>
-            `;
+        const itemsHtml = allItems.map(item => {
+            if (item.type === 'file') {
+                const file = item.data;
+                const hosts = Array.isArray(file.hosts) ? file.hosts : Array.from(file.hosts || []);
+                const isDownloadable = hosts.length > 0;
+                
+                return `
+                    <tr class="file-row">
+                        <td class="file-name">📄 ${file.name}</td>
+                        <td class="file-type">${file.mime_type}</td>
+                        <td class="file-size">${this.formatSize(file.size)}</td>
+                        <td>
+                            <div class="file-hosts">
+                                ${hosts.map(host => `<span class="host-badge">${host.slice(-6)}</span>`).join('')}
+                            </div>
+                        </td>
+                        <td class="file-actions">
+                            ${isDownloadable ? 
+                                `<button class="btn download" onclick="app.downloadFile('${file.id}')">⬇️ Download</button>` :
+                                '<span style="color: #a0aec0;">No hosts</span>'
+                            }
+                        </td>
+                    </tr>
+                `;
+            } else {
+                const message = item.data;
+                const isOwn = message.sender_id === this.sessionId;
+                const senderName = isOwn ? 'You' : `User ${message.sender_id.slice(-6)}`;
+                const preview = message.content.length > 50 ? message.content.substring(0, 50) + '...' : message.content;
+                const time = new Date(message.timestamp).toLocaleString();
+                
+                return `
+                    <tr class="message-row">
+                        <td class="file-name">💬 ${preview}</td>
+                        <td class="file-type">Text Message</td>
+                        <td class="file-size">${message.content.length} chars</td>
+                        <td><span class="host-badge">${senderName}</span></td>
+                        <td class="file-actions">
+                            <button class="btn download" onclick="app.viewMessage('${message.id}')">View</button>
+                        </td>
+                    </tr>
+                `;
+            }
         }).join('');
 
-        tbody.innerHTML = filesHtml;
+        tbody.innerHTML = itemsHtml;
     }
 
     formatSize(bytes) {
@@ -579,3 +655,69 @@ window.addEventListener('beforeunload', () => {
         window.app.ws.close();
     }
 });
+
+// Text Message Methods for LADEXApp
+LADEXApp.prototype.sendTextMessage = function() {
+    const messageInput = document.getElementById('message-input');
+    const content = messageInput.value.trim();
+    
+    if (!content) return;
+
+    const message = {
+        type: 'text_message',
+        session_id: this.sessionId,
+        content: content
+    };
+
+    this.sendMessage(message);
+    messageInput.value = '';
+    this.autoResizeTextarea(messageInput);
+    this.updateSendButton();
+};
+
+LADEXApp.prototype.handleTextMessage = function(message) {
+    this.messages.push(message.message);
+    
+    // Refresh the combined files and messages list
+    const files = Array.from(this.files.values());
+    this.updateFileList(files);
+};
+
+LADEXApp.prototype.viewMessage = function(messageId) {
+    const message = this.messages.find(m => m.id === messageId);
+    if (!message) return;
+    
+    const isOwn = message.sender_id === this.sessionId;
+    const senderName = isOwn ? 'You' : `User ${message.sender_id.slice(-6)}`;
+    const time = new Date(message.timestamp).toLocaleString();
+    
+    document.getElementById('modal-sender').textContent = senderName;
+    document.getElementById('modal-time').textContent = time;
+    document.getElementById('modal-message-text').textContent = message.content;
+    
+    document.getElementById('messages-modal').style.display = 'block';
+};
+
+LADEXApp.prototype.hideMessageModal = function() {
+    document.getElementById('messages-modal').style.display = 'none';
+};
+
+LADEXApp.prototype.autoResizeTextarea = function(textarea) {
+    textarea.style.height = 'auto';
+    const newHeight = Math.min(textarea.scrollHeight, 100);
+    textarea.style.height = newHeight + 'px';
+};
+
+LADEXApp.prototype.updateSendButton = function() {
+    const messageInput = document.getElementById('message-input');
+    const sendButton = document.getElementById('send-message-btn');
+    const hasContent = messageInput.value.trim().length > 0;
+    
+    sendButton.disabled = !hasContent;
+};
+
+LADEXApp.prototype.escapeHtml = function(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+};

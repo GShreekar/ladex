@@ -18,18 +18,37 @@
 
         <main>
             <section class="upload-section">
-                <div class="upload-area">
+                <div class="message-composer">
+                    <div class="composer-buttons">
+                        <button id="upload-files-btn" class="icon-btn" title="Upload Files">
+                            <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
+                                <path d="M14,2H6A2,2 0 0,0 4,4V20A2,2 0 0,0 6,22H18A2,2 0 0,0 20,20V8L14,2M18,20H6V4H13V9H18V20Z"/>
+                            </svg>
+                        </button>
+                        <button id="upload-folder-btn" class="icon-btn" title="Upload Folder">
+                            <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
+                                <path d="M10,4H4C2.89,4 2,4.89 2,6V18A2,2 0 0,0 4,20H20A2,2 0 0,0 22,18V8C22,6.89 21.1,6 20,6H12L10,4Z"/>
+                            </svg>
+                        </button>
+                    </div>
+                    <textarea id="message-input" placeholder="Type a message..." rows="1"></textarea>
+                    <button id="send-message-btn" class="icon-btn send-btn" title="Send Message">
+                        <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
+                            <path d="M2,21L23,12L2,3V10L17,12L2,14V21Z"/>
+                        </svg>
+                    </button>
+                </div>
+                <div class="upload-area" id="upload-area" style="display: none;">
                     <input type="file" id="file-input" multiple webkitdirectory="" style="display: none;">
                     <input type="file" id="file-input-single" multiple style="display: none;">
-                    <div class="upload-buttons">
-                        <button id="upload-files-btn" class="btn primary">Upload Files</button>
-                        <button id="upload-folder-btn" class="btn secondary">Upload Folder</button>
+                    <div class="upload-drop-text">
+                        <p>Drop files here or click to select</p>
                     </div>
                 </div>
             </section>
 
             <section class="files-section">
-                <h2>Shared Files</h2>
+                <h2>Shared Files and Messages</h2>
                 <div class="files-container">
                     <table id="files-table">
                         <thead>
@@ -67,6 +86,24 @@
                 <span id="progress-eta">Calculating...</span>
             </div>
             <button id="cancel-transfer" class="btn secondary">Cancel</button>
+        </div>
+    </div>
+
+    <div id="messages-modal" class="modal">
+        <div class="modal-content messages-modal">
+            <div class="modal-header">
+                <h3>Message Content</h3>
+                <button id="close-messages" class="close-btn">&times;</button>
+            </div>
+            <div id="message-content" class="message-content-viewer">
+                <div class="message-details">
+                    <div class="message-meta">
+                        <span class="message-sender">From: <span id="modal-sender"></span></span>
+                        <span class="message-time">Sent: <span id="modal-time"></span></span>
+                    </div>
+                    <div class="message-text" id="modal-message-text"></div>
+                </div>
+            </div>
         </div>
     </div>
 
