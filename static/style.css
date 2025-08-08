@@ -126,11 +126,20 @@ h1::after {
     border: 1px solid rgba(120, 119, 198, 0.2);
 }
 
-#peer-status, #connection-status {
+#peer-status, #peer-number, #connection-status {
     color: #78dbe2;
     font-family: 'Orbitron', monospace;
     font-size: 0.9rem;
     font-weight: 400;
+}
+
+#peer-number {
+    background: linear-gradient(135deg, #7877c6, #78dbe2);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    font-weight: bold;
+    text-shadow: 0 0 10px rgba(120, 119, 198, 0.3);
 }
 
 .status-connected {
@@ -550,6 +559,14 @@ th:nth-child(5), td:nth-child(5) { width: 15%; }
     font-size: 0.8em;
     font-weight: 600;
     border: 1px solid rgba(120, 219, 226, 0.3);
+}
+
+.host-badge.host-self {
+    background: linear-gradient(135deg, #ff77c6, #7877c6);
+    color: white;
+    border-color: rgba(255, 119, 198, 0.5);
+    font-weight: bold;
+    box-shadow: 0 2px 8px rgba(255, 119, 198, 0.3);
 }
 
 /* Progress Modal */

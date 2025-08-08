@@ -4,7 +4,13 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
     <title>LADEX</title>
-    <link rel="stylesheet" href="static/style.css">
+    <link rel="stylesheet" href="static/style.css?v=2">
+    <script>
+        // Force cache refresh on localhost
+        if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
+            console.log('Localhost detected - forcing cache refresh');
+        }
+    </script>
 </head>
 <body>
     <div class="container">
@@ -12,6 +18,7 @@
             <h1>LADEX</h1>
             <div class="status-bar">
                 <span id="peer-status">Connected peers: 0</span>
+                <span id="peer-number">Peer: ---</span>
                 <span id="connection-status" class="status-disconnected">Disconnected</span>
             </div>
         </header>
@@ -108,6 +115,6 @@
     </div>
 
     <script src="static/jszip.min.js"></script>
-    <script src="static/app.js"></script>
+    <script src="static/app.js?v=2"></script>
 </body>
 </html>

@@ -18,10 +18,51 @@ class LADEXApp {
         return 'peer_' + Math.random().toString(36).substr(2, 9) + '_' + Date.now();
     }
 
+    getShortPeerId() {
+        return this.sessionId.slice(-6);
+    }
+
     init() {
+        console.log('Initializing LADEX app...');
+        console.log('Session ID:', this.sessionId);
+        console.log('Short Peer ID:', this.getShortPeerId());
+        
+        this.initializePeerDisplay();
+        
+        if (document.fonts) {
+            document.fonts.ready.then(() => {
+                console.log('Fonts loaded');
+            });
+        }
+        
+        const stylesheets = Array.from(document.styleSheets);
+        console.log('Stylesheets loaded:', stylesheets.length);
+        
         this.connectWebSocket();
         this.setupEventListeners();
         this.setupRTC();
+    }
+
+    initializePeerDisplay() {
+        const updatePeerDisplay = () => {
+            const peerNumberElement = document.getElementById('peer-number');
+            if (peerNumberElement) {
+                peerNumberElement.textContent = `Peer: ${this.getShortPeerId()}`;
+                console.log('Peer number updated:', this.getShortPeerId());
+                return true;
+            } else {
+                console.warn('Peer number element not found, retrying...');
+                return false;
+            }
+        };
+
+        if (!updatePeerDisplay()) {
+            setTimeout(() => {
+                if (!updatePeerDisplay()) {
+                    setTimeout(updatePeerDisplay, 1000);
+                }
+            }, 100);
+        }
     }
 
     connectWebSocket() {
@@ -123,7 +164,26 @@ class LADEXApp {
     }
 
     updatePeerStatus(count) {
-        document.getElementById('peer-status').textContent = `Connected peers: ${count}`;
+        const peerStatusElement = document.getElementById('peer-status');
+        const peerNumberElement = document.getElementById('peer-number');
+        
+        if (peerStatusElement) {
+            peerStatusElement.textContent = `Connected peers: ${count}`;
+        } else {
+            console.warn('Peer status element not found');
+        }
+        
+        if (peerNumberElement) {
+            peerNumberElement.textContent = `Peer: ${this.getShortPeerId()}`;
+        } else {
+            console.warn('Peer number element not found');
+            setTimeout(() => {
+                const retryElement = document.getElementById('peer-number');
+                if (retryElement) {
+                    retryElement.textContent = `Peer: ${this.getShortPeerId()}`;
+                }
+            }, 500);
+        }
     }
 
     setupEventListeners() {
@@ -294,7 +354,13 @@ class LADEXApp {
                         <td class="file-size">${this.formatSize(file.size)}</td>
                         <td>
                             <div class="file-hosts">
-                                ${hosts.map(host => `<span class="host-badge">${host.slice(-6)}</span>`).join('')}
+                                ${hosts.map(host => {
+                                    if (host === this.sessionId) {
+                                        return '<span class="host-badge host-self">You</span>';
+                                    } else {
+                                        return `<span class="host-badge">${host.slice(-6)}</span>`;
+                                    }
+                                }).join('')}
                             </div>
                         </td>
                         <td class="file-actions">
@@ -647,7 +713,32 @@ class LADEXApp {
 }
 
 document.addEventListener('DOMContentLoaded', () => {
+    console.log('DOM Content Loaded');
+    console.log('Current URL:', window.location.href);
+    
+    const requiredElements = [
+        'peer-status', 'peer-number', 'connection-status',
+        'upload-files-btn', 'upload-folder-btn', 'message-input', 'send-message-btn'
+    ];
+    
+    const missingElements = requiredElements.filter(id => !document.getElementById(id));
+    
+    if (missingElements.length > 0) {
+        console.error('Missing required elements:', missingElements);
+    } else {
+        console.log('All required elements found');
+    }
+    
     window.app = new LADEXApp();
+    
+    setTimeout(() => {
+        const peerNumberEl = document.getElementById('peer-number');
+        if (peerNumberEl) {
+            console.log('Peer number element content:', peerNumberEl.textContent);
+        } else {
+            console.error('Peer number element still not found after initialization');
+        }
+    }, 1000);
 });
 
 window.addEventListener('beforeunload', () => {
