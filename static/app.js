@@ -139,6 +139,9 @@ class LADEXApp {
             case 'text_message':
                 this.handleTextMessage(message);
                 break;
+            case 'message_history':
+                this.handleMessageHistory(message);
+                break;
         }
     }
 
@@ -769,7 +772,14 @@ LADEXApp.prototype.sendTextMessage = function() {
 LADEXApp.prototype.handleTextMessage = function(message) {
     this.messages.push(message.message);
     
-    // Refresh the combined files and messages list
+    const files = Array.from(this.files.values());
+    this.updateFileList(files);
+};
+
+LADEXApp.prototype.handleMessageHistory = function(message) {
+    console.log('Received message history:', message.messages.length, 'messages');
+    
+    this.messages = message.messages;
     const files = Array.from(this.files.values());
     this.updateFileList(files);
 };

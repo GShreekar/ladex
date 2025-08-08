@@ -143,6 +143,10 @@ pub enum ServerMessage {
     TextMessage {
         message: TextMessage,
     },
+    #[serde(rename = "message_history")]
+    MessageHistory {
+        messages: Vec<TextMessage>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -86,6 +86,16 @@ async fn handle_client_message(
             };
             
             let _ = state.tx.send(ServerMessage::FileListUpdate { files });
+            
+            // Send message history to the new peer
+            let messages = {
+                let messages = state.messages.read().await;
+                messages.clone()
+            };
+            
+            if !messages.is_empty() {
+                let _ = state.tx.send(ServerMessage::MessageHistory { messages });
+            }
 
             // Notify all peers about new peer
             let _ = state.tx.send(ServerMessage::PeerJoined {
@@ -207,6 +217,11 @@ async fn handle_client_message(
                 sender_name: None,
                 timestamp: chrono::Utc::now(),
             };
+            {
+                let mut messages = state.messages.write().await;
+                messages.push(message.clone());
+            }
+            
             let _ = state.tx.send(ServerMessage::TextMessage { message });
         }
     }

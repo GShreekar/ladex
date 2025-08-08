@@ -12,11 +12,13 @@ use types::*;
 
 type Peers = Arc<RwLock<HashMap<SessionId, PeerInfo>>>;
 type Files = Arc<RwLock<HashMap<String, FileMetadata>>>;
+type Messages = Arc<RwLock<Vec<types::TextMessage>>>;
 
 #[derive(Clone)]
 pub struct AppState {
     pub peers: Peers,
     pub files: Files,
+    pub messages: Messages,
     pub tx: broadcast::Sender<ServerMessage>,
 }
 
@@ -29,6 +31,7 @@ async fn main() {
     let app_state = AppState {
         peers: Arc::new(RwLock::new(HashMap::new())),
         files: Arc::new(RwLock::new(HashMap::new())),
+        messages: Arc::new(RwLock::new(Vec::new())),
         tx,
     };
 
