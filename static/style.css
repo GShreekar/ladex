@@ -120,10 +120,28 @@ h1::after {
     display: flex;
     justify-content: space-between;
     align-items: center;
+    position: relative;
     background: rgba(0, 0, 0, 0.3);
     padding: 10px 20px;
     border-radius: 10px;
     border: 1px solid rgba(120, 119, 198, 0.2);
+}
+
+#peer-status {
+    flex: 1;
+    text-align: left;
+}
+
+#peer-number {
+    position: absolute;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 1;
+}
+
+#connection-status {
+    flex: 1;
+    text-align: right;
 }
 
 #peer-status, #peer-number, #connection-status {
@@ -140,6 +158,7 @@ h1::after {
     background-clip: text;
     font-weight: bold;
     text-shadow: 0 0 10px rgba(120, 119, 198, 0.3);
+    white-space: nowrap;
 }
 
 .status-connected {
@@ -726,8 +745,17 @@ th:nth-child(5), td:nth-child(5) { width: 15%; }
     }
     
     .status-bar {
+        display: flex;
         flex-direction: column;
         gap: 10px;
+        text-align: center;
+        position: static;
+    }
+    
+    #peer-status, #peer-number, #connection-status {
+        position: static;
+        transform: none;
+        flex: none;
         text-align: center;
     }
     
