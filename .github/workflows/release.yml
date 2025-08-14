@@ -1,11 +1,12 @@
-# .github/workflows/release.yml
-
 name: Release Ladex CLI
 
 on:
   push:
     tags:
       - 'v*.*.*'
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -44,7 +45,7 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
 
-      - name: Install zip
+      - name: Install zip (Windows)
         if: matrix.os == 'windows-latest'
         run: choco install zip -y
 
@@ -53,32 +54,43 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Package the binary for release
+      - name: Package the binary
         shell: bash
         run: |
           APP_NAME="ladex"
           VERSION_TAG=${{ github.ref_name }}
-          
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
             BINARY_NAME="${APP_NAME}.exe"
-            BINARY_PATH="./target/${{ matrix.target }}/release/${BINARY_NAME}"
             ARCHIVE_NAME="${APP_NAME}-${VERSION_TAG}-${{ matrix.archive_name_suffix }}.zip"
-            zip -j $ARCHIVE_NAME $BINARY_PATH
+            zip -j $ARCHIVE_NAME "./target/${{ matrix.target }}/release/${BINARY_NAME}"
           else
             BINARY_NAME="${APP_NAME}"
-            BINARY_PATH="./target/${{ matrix.target }}/release/${BINARY_NAME}"
             ARCHIVE_NAME="${APP_NAME}-${VERSION_TAG}-${{ matrix.archive_name_suffix }}.tar.gz"
-            tar -czf $ARCHIVE_NAME -C ./target/${{ matrix.target }}/release/ $BINARY_NAME
+            tar -czf $ARCHIVE_NAME -C "./target/${{ matrix.target }}/release" $BINARY_NAME
           fi
-          
           echo "ARCHIVE_NAME=${ARCHIVE_NAME}" >> $GITHUB_ENV
 
-      - name: Upload release assets
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARCHIVE_NAME }}
+          path: ${{ env.ARCHIVE_NAME }}
+
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+
+      - run: ls -R ./artifacts
+
+      - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ env.ARCHIVE_NAME }}
+          files: ./artifacts/**/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-permissions:
-  contents: write
