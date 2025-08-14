@@ -10,6 +10,7 @@ class LADEXApp {
         this.rtcConnections = new Map();
         this.messages = [];
         this.unreadCount = 0;
+        this.serverFiles = [];
         
         this.init();
     }
@@ -69,10 +70,14 @@ class LADEXApp {
         const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const wsUrl = `${wsProtocol}//${window.location.host}/ws`;
         
+        console.log('Attempting WebSocket connection to:', wsUrl);
+        console.log('User Agent:', navigator.userAgent);
+        
         this.ws = new WebSocket(wsUrl);
         
         this.ws.onopen = () => {
             console.log('Connected to LADEX server');
+            console.log('Connection successful from:', window.location.host);
             this.updateConnectionStatus(true);
             this.joinSession();
         };
@@ -82,14 +87,16 @@ class LADEXApp {
             this.handleServerMessage(message);
         };
         
-        this.ws.onclose = () => {
+        this.ws.onclose = (event) => {
             console.log('Disconnected from LADEX server');
+            console.log('Close code:', event.code, 'Close reason:', event.reason);
             this.updateConnectionStatus(false);
             setTimeout(() => this.connectWebSocket(), 3000);
         };
         
         this.ws.onerror = (error) => {
             console.error('WebSocket error:', error);
+            console.log('Failed to connect to:', wsUrl);
         };
     }
 
@@ -119,7 +126,8 @@ class LADEXApp {
                 this.handlePeerLeft(message);
                 break;
             case 'file_list_update':
-                this.updateFileList(message.files);
+                this.serverFiles = message.files || [];
+                this.updateFileList(this.serverFiles);
                 break;
             case 'download_request':
                 this.handleDownloadRequest(message);
@@ -157,6 +165,7 @@ class LADEXApp {
 
     updateConnectionStatus(connected) {
         const statusElement = document.getElementById('connection-status');
+        if (!statusElement) return;
         if (connected) {
             statusElement.textContent = 'Connected';
             statusElement.className = 'status-connected';
@@ -235,7 +244,7 @@ class LADEXApp {
                 this.hideMessageModal();
             }
         });
-
+        
         this.updateSendButton();
     }
 
@@ -679,29 +688,21 @@ class LADEXApp {
         }
     }
 
-    setupRTC() {
-        this.rtcConfig = {
-            iceServers: [
-                { urls: 'stun:stun.l.google.com:19302' }
-            ]
-        };
-    }
-
     showProgress(filename, percentage) {
         const modal = document.getElementById('progress-modal');
         const filenameEl = document.getElementById('progress-filename');
         const percentageEl = document.getElementById('progress-percentage');
         const fillEl = document.getElementById('progress-fill');
-        
+        if (!modal || !filenameEl || !percentageEl || !fillEl) return;
         filenameEl.textContent = filename;
         percentageEl.textContent = `${percentage}%`;
         fillEl.style.width = `${percentage}%`;
-        
         modal.style.display = 'block';
     }
 
     hideProgress() {
-        document.getElementById('progress-modal').style.display = 'none';
+        const modal = document.getElementById('progress-modal');
+        if (modal) modal.style.display = 'none';
     }
 
     cancelActiveTransfer() {
@@ -771,17 +772,14 @@ LADEXApp.prototype.sendTextMessage = function() {
 
 LADEXApp.prototype.handleTextMessage = function(message) {
     this.messages.push(message.message);
-    
-    const files = Array.from(this.files.values());
-    this.updateFileList(files);
+    this.updateFileList(this.serverFiles);
 };
-
+ 
 LADEXApp.prototype.handleMessageHistory = function(message) {
-    console.log('Received message history:', message.messages.length, 'messages');
-    
+     console.log('Received message history:', message.messages.length, 'messages');
+     
     this.messages = message.messages;
-    const files = Array.from(this.files.values());
-    this.updateFileList(files);
+    this.updateFileList(this.serverFiles);
 };
 
 LADEXApp.prototype.viewMessage = function(messageId) {

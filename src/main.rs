@@ -70,7 +70,7 @@ async fn main() {
         .with(cors);
 
     let addr: SocketAddr = ([0, 0, 0, 0], 8080).into();
-    println!("LADEX server starting on http://{}", addr);
+    println!("LADEX server starting on http://0.0.0.0:8080");
     println!("Access the interface at: http://localhost:8080");
     println!("Share with peers: http://{}:8080", get_local_ip().unwrap_or_else(|| "YOUR_IP".to_string()));
     
