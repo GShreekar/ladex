@@ -44,6 +44,10 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
 
+      - name: Install zip
+        if: matrix.os == 'windows-latest'
+        run: choco install zip -y
+
       - name: Build binary
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
