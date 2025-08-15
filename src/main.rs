@@ -35,9 +35,11 @@ async fn main() {
         tx,
     };
 
-    // Serve static files from static directory
+    // Serve static files
     let static_files = warp::path("static")
-        .and(warp::fs::dir("static"));
+        .and(warp::fs::dir("static/"));
+    
+    // Serve index.html at root
     let index = warp::path::end()
         .and(warp::fs::file("static/index.html"));
     
@@ -63,16 +65,18 @@ async fn main() {
         .allow_headers(vec!["content-type"])
         .allow_methods(vec!["GET", "POST", "PUT", "DELETE"]);
 
-    let routes = index
-        .or(static_files)
-        .or(websocket)
+    // IMPORTANT: More specific routes first
+    let routes = websocket
         .or(api)
+        .or(static_files)
+        .or(index)
         .with(cors);
 
     let addr: SocketAddr = ([0, 0, 0, 0], 8080).into();
-    println!("LADEX server starting on http://0.0.0.0:8080");
-    println!("Access the interface at: http://localhost:8080");
-    println!("Share with peers: http://{}:8080", get_local_ip().unwrap_or_else(|| "YOUR_IP".to_string()));
+    let local_ip = get_local_ip().unwrap_or_else(|| "YOUR_IP".to_string());
+    
+    println!("Access locally: http://localhost:8080");
+    println!("Access from network: http://{}:8080", local_ip);
     
     warp::serve(routes)
         .run(addr)
