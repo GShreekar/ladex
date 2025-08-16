@@ -9,6 +9,11 @@ mod websocket;
 mod handlers;
 
 use types::*;
+use include_dir::{include_dir, Dir};
+use mime_guess;
+
+// Embed the static directory at compile time
+static STATIC_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/static");
 
 type Peers = Arc<RwLock<HashMap<SessionId, PeerInfo>>>;
 type Files = Arc<RwLock<HashMap<String, FileMetadata>>>;
@@ -35,14 +40,41 @@ async fn main() {
         tx,
     };
 
-    // Serve static files
-    let static_files = warp::path("static")
-        .and(warp::fs::dir("static/"));
+    // Serve embedded static assets under /static/<path>
+    let static_route = warp::path("static")
+        .and(warp::path::tail())
+        .and_then(|tail: warp::filters::path::Tail| async move {
+            let lookup = tail.as_str().trim_start_matches('/').to_string();
+            let lookup = if lookup.is_empty() { "index.html".to_string() } else { lookup };
+            if let Some(file) = STATIC_DIR.get_file(&lookup) {
+                let mime = mime_guess::from_path(&lookup).first_or_octet_stream().to_string();
+                let bytes = file.contents().to_vec();
+                Ok::<_, warp::Rejection>(warp::reply::with_header(
+                    warp::reply::html(bytes),
+                    "content-type",
+                    mime,
+                ))
+            } else {
+                Err(warp::reject::not_found())
+            }
+        });
     
-    // Serve index.html at root
-    let index = warp::path::end()
-        .and(warp::fs::file("static/index.html"));
-    
+    // Serve embedded index.html at root
+    let index = warp::path::end().and_then(|| async move {
+        let lookup = "index.html".to_string();
+        if let Some(file) = STATIC_DIR.get_file(&lookup) {
+            let mime = mime_guess::from_path(&lookup).first_or_octet_stream().to_string();
+            let bytes = file.contents().to_vec();
+            Ok::<_, warp::Rejection>(warp::reply::with_header(
+                warp::reply::html(bytes),
+                "content-type",
+                mime,
+            ))
+        } else {
+            Err(warp::reject::not_found())
+        }
+    });
+
     // WebSocket endpoint
     let app_state_ws = app_state.clone();
     let websocket = warp::path("ws")
@@ -68,7 +100,7 @@ async fn main() {
     // IMPORTANT: More specific routes first
     let routes = websocket
         .or(api)
-        .or(static_files)
+        .or(static_route)
         .or(index)
         .with(cors);
 
