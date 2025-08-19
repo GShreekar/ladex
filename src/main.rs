@@ -12,7 +12,6 @@ mod handlers;
 
 use types::*;
 use include_dir::{include_dir, Dir};
-use mime_guess;
 
 // Embed the static directory at compile time
 static STATIC_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/static");
@@ -108,7 +107,7 @@ async fn main() {
     // Handle security code logic
     let security_code = if args.secure {
         let code = generate_random_code();
-        println!("Generated security code: {}", code);
+        println!("Generated security code: {code}");
         Some(code)
     } else if let Some(code) = args.code {
         if validate_code(&code) {
@@ -252,7 +251,7 @@ async fn main() {
     let local_ip = get_local_ip().unwrap_or_else(|| "YOUR_IP".to_string());
     
     println!("Access locally: http://localhost:8080");
-    println!("Access from network: http://{}:8080", local_ip);
+    println!("Access from network: http://{local_ip}:8080");
     
     warp::serve(routes)
         .run(addr)

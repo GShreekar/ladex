@@ -8,7 +8,7 @@ pub async fn check_auth_status(cookie: Option<String>, state: AppState) -> Resul
         Some(_) => {
             let expected_auth_value = format!("authenticated:{}", state.server_session_id);
             cookie.as_ref()
-                .map(|c| c.contains(&format!("auth={}", expected_auth_value)))
+                .map(|c| c.contains(&format!("auth={expected_auth_value}")))
                 .unwrap_or(false)
         }
     };
@@ -65,7 +65,7 @@ pub async fn authenticate(auth_req: AuthRequest, state: AppState) -> Result<Box<
     if response.success {
         let json_reply = warp::reply::json(&response);
         let cookie_value = format!("authenticated:{}", state.server_session_id);
-        let cookie_header = format!("auth={}; Path=/; Max-Age=86400; HttpOnly; SameSite=Strict", cookie_value);
+        let cookie_header = format!("auth={cookie_value}; Path=/; Max-Age=86400; HttpOnly; SameSite=Strict");
         let reply_with_cookie = warp::reply::with_header(
             json_reply,
             "Set-Cookie",
