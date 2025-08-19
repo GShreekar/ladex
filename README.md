@@ -1,9 +1,10 @@
 # LADEX - Local Area Data Exchange
 
-A fast and secure peer-to-peer file transfer tool built with Rust that enables seamless file sharing over local networks without requiring internet connectivity. LADEX provides a simple command-line interface for transferring files and folders between devices on the same network.
+A fast and secure peer-to-peer file transfer tool built with Rust that enables seamless file sharing over local networks without requiring internet connectivity. LADEX provides a beautiful web interface with optional authentication for secure transfers.
 
 ## Features
 
+- **Optional Authentication**: Secure access with generated or custom security codes
 - **Zero Configuration**: No complex setup required - just run and share
 - **Local Network Only**: All transfers happen over your local network, ensuring privacy and speed
 - **Real-time Transfer**: WebSocket-based communication for instant file transfers
@@ -12,7 +13,7 @@ A fast and secure peer-to-peer file transfer tool built with Rust that enables s
 - **Folder Support**: Transfer entire directories with automatic compression
 - **Cross-Platform**: Works on Linux, macOS, and Windows
 - **Web Interface**: Modern, responsive web UI accessible from any browser
-- **Secure**: All data stays within your local network boundary
+- **Session Security**: Server restart invalidates old authentication cookies
 
 ## Supported Platforms
 
@@ -43,22 +44,55 @@ Download the latest release from [GitHub Releases](https://github.com/GShreekar/
 
 ### Starting the Server
 
-Launch LADEX on the host machine:
-
+#### Basic Usage (No Authentication)
+Launch LADEX with open access:
 ```bash
 ladex
 ```
 
+#### With Authentication
+Launch LADEX with a custom 6-digit security code:
+```bash
+ladex 123456
+```
+
+Or generate a random security code automatically:
+```bash
+ladex -s
+# or
+ladex --secure
+```
+
+The server will display the generated code in the terminal.
+
 The server will start on `http://localhost:8080` by default. Other devices on your network can connect using your local IP address (e.g., `http://192.168.1.100:8080`).
+
+### Authentication Flow
+
+When authentication is enabled:
+1. **Server displays code**: The terminal shows the 6-digit security code
+2. **Users enter code**: First-time visitors must enter the code on the login page
+3. **Session management**: Authenticated users stay logged in until server restart
+4. **Logout option**: Users can manually logout using the logout button
 
 ### Basic Operations
 
 1. **Open your browser** and navigate to the server address
-2. **Connect peers** by opening the same URL on other devices
-3. **Send files** by dragging and dropping or using the file picker
-4. **Send folders** by selecting entire directories (automatically zipped)
-5. **Send messages** using the text input field
-6. **Monitor transfers** with the real-time progress indicators
+2. **Enter security code** (if authentication is enabled)
+3. **Connect peers** by sharing the URL and security code with other devices
+4. **Send files** by dragging and dropping or using the file picker
+5. **Send folders** by selecting entire directories (automatically zipped)
+6. **Send messages** using the text input field
+7. **Monitor transfers** with the real-time progress indicators
+8. **Logout** when finished (authentication mode only)
+
+## Command Line Options
+
+```bash
+ladex [SECURITY_CODE]  # Launch with custom 6-digit security code
+ladex -s, --secure     # Launch with auto-generated security code
+ladex                  # Launch without authentication (open access)
+```
 
 ## Build from Source
 
