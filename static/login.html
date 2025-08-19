@@ -4,6 +4,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>LADEX - Login</title>
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&display=swap" rel="stylesheet">
@@ -293,24 +296,31 @@
             loginBtn.disabled = true;
             
             try {
+                console.log('Attempting authentication with code:', code);
                 const response = await fetch('/auth', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
+                        'Cache-Control': 'no-cache'
                     },
+                    cache: 'no-cache',
                     body: JSON.stringify({ code: code }),
                 });
                 
+                console.log('Auth response status:', response.status);
                 const result = await response.json();
+                console.log('Auth result:', result);
                 
                 if (result.success) {
-                    document.cookie = 'auth=authenticated; path=/; max-age=86400';
+                    console.log('Authentication successful');
                     loadingDiv.textContent = '✓ Access Granted';
                     loadingDiv.style.color = 'rgba(120, 219, 226, 1)';
                     setTimeout(() => {
+                        console.log('Redirecting to main page');
                         window.location.href = '/';
                     }, 1000);
                 } else {
+                    console.log('Authentication failed:', result.message);
                     errorDiv.textContent = `⚠ ${result.message || 'Invalid security code'}`;
                     errorDiv.style.display = 'block';
                     loadingDiv.style.display = 'none';
@@ -322,6 +332,7 @@
                     }, 500);
                 }
             } catch (error) {
+                console.error('Authentication request failed:', error);
                 errorDiv.textContent = '⚠ Connection error. Please try again.';
                 errorDiv.style.display = 'block';
                 loadingDiv.style.display = 'none';

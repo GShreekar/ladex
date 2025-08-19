@@ -4,7 +4,10 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
     <title>LADEX</title>
-    <link rel="stylesheet" href="static/style.css">
+    <link rel="stylesheet" href="static/style.css?v=3">
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
     <script>
         // Force cache refresh on localhost
         if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
@@ -120,20 +123,46 @@
     </div>
 
     <script src="static/jszip.min.js"></script>
-    <script src="static/app.js?v=2"></script>
+    <script src="static/app.js?v=3"></script>
     <script>
         document.addEventListener('DOMContentLoaded', function() {
             const logoutBtn = document.getElementById('logout-btn');
             
-            const hasAuthCookie = document.cookie.split(';').some(c => c.trim().startsWith('auth='));
-            
-            if (hasAuthCookie) {
-                logoutBtn.style.display = 'block';
-                logoutBtn.addEventListener('click', function() {
-                    document.cookie = 'auth=; path=/; expires=Thu, 01 Jan 1970 00:00:01 GMT';
-                    window.location.href = '/login';
-                });
-            }
+            // More robust authentication check
+            console.log('Checking authentication status...');
+            fetch('/auth-status', { 
+                method: 'GET',
+                cache: 'no-cache',
+                headers: {
+                    'Cache-Control': 'no-cache'
+                }
+            })
+            .then(response => response.json())
+            .then(data => {
+                console.log('Auth check response:', data);
+                if (data.authenticated) {
+                    console.log('User is authenticated - showing logout button');
+                    logoutBtn.style.display = 'block';
+                    logoutBtn.addEventListener('click', function() {
+                        console.log('Logout button clicked');
+                        fetch('/logout', { 
+                            method: 'POST',
+                            cache: 'no-cache',
+                            headers: {
+                                'Cache-Control': 'no-cache'
+                            }
+                        }).finally(() => {
+                            console.log('Redirecting to login...');
+                            window.location.href = '/login';
+                        });
+                    });
+                } else {
+                    console.log('User not authenticated - logout button hidden');
+                }
+            })
+            .catch(error => {
+                console.log('Auth check failed:', error);
+            });
         });
     </script>
 </body>

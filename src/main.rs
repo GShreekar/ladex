@@ -37,6 +37,7 @@ pub struct AppState {
     pub messages: Messages,
     pub tx: broadcast::Sender<ServerMessage>,
     pub security_code: Option<String>,
+    pub server_session_id: String,
 }
 
 fn generate_random_code() -> String {
@@ -56,7 +57,14 @@ fn with_auth(state: AppState) -> impl Filter<Extract = (), Error = warp::Rejecti
             match state.security_code {
                 None => Ok(()),
                 Some(_) => match auth_cookie {
-                    Some(cookie) if cookie == "authenticated" => Ok(()),
+                    Some(cookie) => {
+                        let expected_cookie = format!("authenticated:{}", state.server_session_id);
+                        if cookie == expected_cookie {
+                            Ok(())
+                        } else {
+                            Err(warp::reject::custom(AuthenticationRequired))
+                        }
+                    },
                     _ => Err(warp::reject::custom(AuthenticationRequired)),
                 }
             }
@@ -115,12 +123,18 @@ async fn main() {
     
     let (tx, _rx) = broadcast::channel::<ServerMessage>(1000);
     
+    let server_session_id = {
+        let mut rng = rand::thread_rng();
+        format!("server_session_{}", rng.gen::<u64>())
+    };
+    
     let app_state = AppState {
         peers: Arc::new(RwLock::new(HashMap::new())),
         files: Arc::new(RwLock::new(HashMap::new())),
         messages: Arc::new(RwLock::new(Vec::new())),
         tx,
         security_code,
+        server_session_id,
     };
 
     // Login page route - not protected
@@ -145,6 +159,21 @@ async fn main() {
         .and(warp::body::json())
         .and(warp::any().map(move || app_state_auth.clone()))
         .and_then(handlers::authenticate);
+
+    // Logout endpoint - not protected
+    let logout_route = warp::path("logout")
+        .and(warp::post())
+        .and_then(handlers::logout);
+
+    // Auth status check endpoint - not protected
+    let auth_status_route = warp::path("auth-status")
+        .and(warp::get())
+        .and(warp::header::optional::<String>("cookie"))
+        .and(warp::any().map({
+            let app_state = app_state.clone();
+            move || app_state.clone()
+        }))
+        .and_then(handlers::check_auth_status);
 
     // Serve embedded static assets under /static/<path> - not protected
     let static_route = warp::path("static")
@@ -210,6 +239,8 @@ async fn main() {
     // IMPORTANT: More specific routes first, unprotected routes before protected ones
     let routes = login_route
         .or(auth_route)
+        .or(logout_route)
+        .or(auth_status_route)
         .or(static_route)
         .or(websocket)
         .or(api)
