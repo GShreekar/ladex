@@ -20,6 +20,11 @@
                 <span id="peer-status">Connected peers: 0</span>
                 <span id="peer-number">Peer: ---</span>
                 <span id="connection-status" class="status-disconnected">Disconnected</span>
+                <button id="logout-btn" class="icon-btn" title="Logout" style="display: none;">
+                    <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
+                        <path d="M17,7L15.59,8.41L18.17,11H8V13H18.17L15.59,15.59L17,17L22,12L17,7M4,5H12V3H4C2.89,3 2,3.89 2,5V19A2,2 0 0,0 4,21H12V19H4V5Z"/>
+                    </svg>
+                </button>
             </div>
         </header>
 
@@ -116,5 +121,20 @@
 
     <script src="static/jszip.min.js"></script>
     <script src="static/app.js?v=2"></script>
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            const logoutBtn = document.getElementById('logout-btn');
+            
+            const hasAuthCookie = document.cookie.split(';').some(c => c.trim().startsWith('auth='));
+            
+            if (hasAuthCookie) {
+                logoutBtn.style.display = 'block';
+                logoutBtn.addEventListener('click', function() {
+                    document.cookie = 'auth=; path=/; expires=Thu, 01 Jan 1970 00:00:01 GMT';
+                    window.location.href = '/login';
+                });
+            }
+        });
+    </script>
 </body>
 </html>

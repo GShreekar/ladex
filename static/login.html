@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LADEX - Login</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&display=swap" rel="stylesheet">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            background: linear-gradient(135deg, #0a0a0a 0%, #1a1a2e 50%, #16213e 100%);
+            font-family: 'Orbitron', monospace;
+            height: 100vh;
+            width: 100vw;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            position: relative;
+            overflow: hidden;
+        }
+
+        body::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: 
+                radial-gradient(circle at 20% 80%, rgba(120, 119, 198, 0.3) 0%, transparent 50%),
+                radial-gradient(circle at 80% 20%, rgba(255, 119, 198, 0.15) 0%, transparent 50%),
+                radial-gradient(circle at 40% 40%, rgba(120, 219, 226, 0.1) 0%, transparent 50%);
+            pointer-events: none;
+            z-index: 0;
+        }
+
+        .login-container {
+            position: relative;
+            z-index: 1;
+            background: rgba(0, 0, 0, 0.4);
+            backdrop-filter: blur(15px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 20px;
+            padding: 2.5rem;
+            max-width: 450px;
+            width: 90%;
+            box-shadow: 
+                0 8px 32px rgba(0, 0, 0, 0.3),
+                inset 0 1px 0 rgba(255, 255, 255, 0.1),
+                0 0 50px rgba(120, 119, 198, 0.1);
+            transition: all 0.3s ease;
+        }
+
+        .login-container:hover {
+            box-shadow: 
+                0 12px 48px rgba(0, 0, 0, 0.4),
+                inset 0 1px 0 rgba(255, 255, 255, 0.2),
+                0 0 80px rgba(120, 119, 198, 0.15);
+        }
+
+        .login-title {
+            text-align: center;
+            margin-bottom: 2.5rem;
+            color: #ffffff;
+            font-size: 2.5rem;
+            font-weight: 900;
+            text-shadow: 0 0 20px rgba(120, 119, 198, 0.5);
+            letter-spacing: 0.1em;
+        }
+
+        .login-form {
+            display: flex;
+            flex-direction: column;
+            gap: 1.5rem;
+        }
+
+        .input-group {
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+        }
+
+        label {
+            font-weight: 600;
+            color: rgba(255, 255, 255, 0.8);
+            font-size: 0.9rem;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+        }
+
+        input {
+            padding: 1rem;
+            background: rgba(0, 0, 0, 0.3);
+            border: 2px solid rgba(120, 119, 198, 0.3);
+            border-radius: 12px;
+            font-size: 1.1rem;
+            font-family: 'Orbitron', monospace;
+            color: #ffffff;
+            transition: all 0.3s ease;
+            text-align: center;
+            letter-spacing: 0.2em;
+            backdrop-filter: blur(10px);
+        }
+
+        input::placeholder {
+            color: rgba(255, 255, 255, 0.4);
+            letter-spacing: 0.05em;
+        }
+
+        input:focus {
+            outline: none;
+            border-color: rgba(120, 119, 198, 0.8);
+            box-shadow: 
+                0 0 20px rgba(120, 119, 198, 0.3),
+                inset 0 0 20px rgba(120, 119, 198, 0.1);
+            background: rgba(0, 0, 0, 0.5);
+        }
+
+        .login-btn {
+            background: linear-gradient(135deg, rgba(120, 119, 198, 0.8) 0%, rgba(255, 119, 198, 0.6) 100%);
+            color: white;
+            border: 2px solid rgba(120, 119, 198, 0.5);
+            padding: 1rem;
+            border-radius: 12px;
+            font-size: 1.1rem;
+            font-weight: 700;
+            font-family: 'Orbitron', monospace;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+            backdrop-filter: blur(10px);
+            position: relative;
+            overflow: hidden;
+        }
+
+        .login-btn::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.2), transparent);
+            transition: left 0.5s;
+        }
+
+        .login-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 
+                0 8px 25px rgba(120, 119, 198, 0.4),
+                0 0 30px rgba(255, 119, 198, 0.3);
+            border-color: rgba(120, 119, 198, 0.8);
+        }
+
+        .login-btn:hover::before {
+            left: 100%;
+        }
+
+        .login-btn:active {
+            transform: translateY(0);
+        }
+
+        .login-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+            box-shadow: none;
+        }
+
+        .login-btn:disabled::before {
+            left: -100%;
+        }
+
+        .error {
+            color: rgba(255, 119, 198, 1);
+            font-size: 0.875rem;
+            margin-top: 0.5rem;
+            text-align: center;
+            font-weight: 500;
+            text-shadow: 0 0 10px rgba(255, 119, 198, 0.3);
+        }
+
+        .loading {
+            display: none;
+            color: rgba(120, 219, 226, 1);
+            font-size: 0.875rem;
+            margin-top: 0.5rem;
+            text-align: center;
+            font-weight: 500;
+            text-shadow: 0 0 10px rgba(120, 219, 226, 0.3);
+        }
+
+        /* Animated background elements */
+        .bg-element {
+            position: absolute;
+            border-radius: 50%;
+            opacity: 0.1;
+            animation: float 6s ease-in-out infinite;
+        }
+
+        .bg-element:nth-child(1) {
+            top: 10%;
+            left: 10%;
+            width: 100px;
+            height: 100px;
+            background: rgba(120, 119, 198, 0.2);
+            animation-delay: 0s;
+        }
+
+        .bg-element:nth-child(2) {
+            top: 70%;
+            right: 15%;
+            width: 150px;
+            height: 150px;
+            background: rgba(255, 119, 198, 0.15);
+            animation-delay: 2s;
+        }
+
+        .bg-element:nth-child(3) {
+            bottom: 20%;
+            left: 20%;
+            width: 80px;
+            height: 80px;
+            background: rgba(120, 219, 226, 0.1);
+            animation-delay: 4s;
+        }
+
+        @keyframes float {
+            0%, 100% {
+                transform: translateY(0px) scale(1);
+                opacity: 0.1;
+            }
+            50% {
+                transform: translateY(-20px) scale(1.05);
+                opacity: 0.2;
+            }
+        }
+
+        /* Responsive design */
+        @media (max-width: 768px) {
+            .login-container {
+                padding: 2rem;
+                margin: 1rem;
+            }
+
+            .login-title {
+                font-size: 2rem;
+            }
+
+            input, .login-btn {
+                font-size: 1rem;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="bg-element"></div>
+    <div class="bg-element"></div>
+    <div class="bg-element"></div>
+    
+    <div class="login-container">
+        <h1 class="login-title">LADEX</h1>
+        <form class="login-form" onsubmit="handleLogin(event)">
+            <div class="input-group">
+                <label for="code">Security Code</label>
+                <input type="text" id="code" name="code" maxlength="6" pattern="[0-9]{6}" 
+                       placeholder="• • • • • •" required autocomplete="off">
+            </div>
+            <button type="submit" class="login-btn" id="login-btn">Access System</button>
+            <div id="loading" class="loading">◉ Authenticating...</div>
+            <div id="error" class="error" style="display: none;"></div>
+        </form>
+    </div>
+
+    <script>
+        async function handleLogin(event) {
+            event.preventDefault();
+            const code = document.getElementById('code').value;
+            const errorDiv = document.getElementById('error');
+            const loadingDiv = document.getElementById('loading');
+            const loginBtn = document.getElementById('login-btn');
+            
+            errorDiv.style.display = 'none';
+            loadingDiv.style.display = 'block';
+            loginBtn.disabled = true;
+            
+            try {
+                const response = await fetch('/auth', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ code: code }),
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    document.cookie = 'auth=authenticated; path=/; max-age=86400';
+                    loadingDiv.textContent = '✓ Access Granted';
+                    loadingDiv.style.color = 'rgba(120, 219, 226, 1)';
+                    setTimeout(() => {
+                        window.location.href = '/';
+                    }, 1000);
+                } else {
+                    errorDiv.textContent = `⚠ ${result.message || 'Invalid security code'}`;
+                    errorDiv.style.display = 'block';
+                    loadingDiv.style.display = 'none';
+                    loginBtn.disabled = false;
+                    
+                    document.querySelector('.login-container').style.animation = 'shake 0.5s ease-in-out';
+                    setTimeout(() => {
+                        document.querySelector('.login-container').style.animation = '';
+                    }, 500);
+                }
+            } catch (error) {
+                errorDiv.textContent = '⚠ Connection error. Please try again.';
+                errorDiv.style.display = 'block';
+                loadingDiv.style.display = 'none';
+                loginBtn.disabled = false;
+            }
+        }
+
+        document.getElementById('code').focus();
+        
+        document.getElementById('code').addEventListener('input', function(e) {
+            let value = e.target.value.replace(/[^0-9]/g, '');
+            
+            if (value.length > 0) {
+                e.target.style.letterSpacing = '0.3em';
+            } else {
+                e.target.style.letterSpacing = '0.2em';
+            }
+            
+            e.target.value = value;
+        });
+
+        document.getElementById('code').addEventListener('focus', function() {
+            this.parentElement.style.transform = 'scale(1.02)';
+            this.parentElement.style.transition = 'transform 0.3s ease';
+        });
+
+        document.getElementById('code').addEventListener('blur', function() {
+            this.parentElement.style.transform = 'scale(1)';
+        });
+
+        const style = document.createElement('style');
+        style.textContent = `
+            @keyframes shake {
+                0%, 100% { transform: translateX(0); }
+                10%, 30%, 50%, 70%, 90% { transform: translateX(-5px); }
+                20%, 40%, 60%, 80% { transform: translateX(5px); }
+            }
+        `;
+        document.head.appendChild(style);
+
+        function createMatrixRain() {
+            const canvas = document.createElement('canvas');
+            const ctx = canvas.getContext('2d');
+            canvas.style.position = 'fixed';
+            canvas.style.top = '0';
+            canvas.style.left = '0';
+            canvas.style.width = '100%';
+            canvas.style.height = '100%';
+            canvas.style.pointerEvents = 'none';
+            canvas.style.zIndex = '-1';
+            canvas.style.opacity = '0.1';
+            document.body.appendChild(canvas);
+
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+
+            const chars = '01';
+            const charSize = 14;
+            const columns = canvas.width / charSize;
+            const drops = Array(Math.floor(columns)).fill(1);
+
+            function draw() {
+                ctx.fillStyle = 'rgba(0, 0, 0, 0.05)';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+                ctx.fillStyle = 'rgba(120, 119, 198, 0.8)';
+                ctx.font = `${charSize}px 'Orbitron', monospace`;
+
+                for (let i = 0; i < drops.length; i++) {
+                    const text = chars[Math.floor(Math.random() * chars.length)];
+                    ctx.fillText(text, i * charSize, drops[i] * charSize);
+
+                    if (drops[i] * charSize > canvas.height && Math.random() > 0.975) {
+                        drops[i] = 0;
+                    }
+                    drops[i]++;
+                }
+            }
+
+            setInterval(draw, 100);
+        }
+
+        setTimeout(createMatrixRain, 500);
+    </script>
+</body>
+</html>

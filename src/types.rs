@@ -11,6 +11,17 @@ pub struct PeerInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthRequest {
+    pub code: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthResponse {
+    pub success: bool,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileMetadata {
     pub id: String,
     pub name: String,

@@ -139,6 +139,20 @@ h1::after {
     z-index: 1;
 }
 
+#logout-btn {
+    margin-left: 10px;
+    background: rgba(255, 119, 198, 0.1);
+    border: 1px solid rgba(255, 119, 198, 0.3);
+    color: rgba(255, 119, 198, 0.8);
+    transition: all 0.3s ease;
+}
+
+#logout-btn:hover {
+    background: rgba(255, 119, 198, 0.2);
+    color: rgba(255, 119, 198, 1);
+    border-color: rgba(255, 119, 198, 0.5);
+}
+
 #connection-status {
     flex: 1;
     text-align: right;
