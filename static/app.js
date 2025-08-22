@@ -239,6 +239,10 @@ class LADEXApp {
             this.hideMessageModal();
         });
 
+        document.getElementById('copy-message-btn').addEventListener('click', () => {
+            this.copyMessageContent();
+        });
+
         document.getElementById('messages-modal').addEventListener('click', (e) => {
             if (e.target.id === 'messages-modal') {
                 this.hideMessageModal();
@@ -799,6 +803,60 @@ LADEXApp.prototype.viewMessage = function(messageId) {
 
 LADEXApp.prototype.hideMessageModal = function() {
     document.getElementById('messages-modal').style.display = 'none';
+};
+
+LADEXApp.prototype.copyMessageContent = function() {
+    const messageText = document.getElementById('modal-message-text').textContent;
+    const senderText = document.getElementById('modal-sender').textContent;
+    const timeText = document.getElementById('modal-time').textContent;
+    
+    const formattedMessage = `${senderText} - ${timeText}\n${messageText}`;
+    
+    if (navigator.clipboard) {
+        navigator.clipboard.writeText(formattedMessage).then(() => {
+            this.showCopyFeedback();
+        }).catch(err => {
+            console.error('Failed to copy message: ', err);
+            this.fallbackCopyToClipboard(formattedMessage);
+        });
+    } else {
+        this.fallbackCopyToClipboard(formattedMessage);
+    }
+};
+
+LADEXApp.prototype.fallbackCopyToClipboard = function(text) {
+    const textArea = document.createElement("textarea");
+    textArea.value = text;
+    textArea.style.position = "fixed";
+    textArea.style.left = "-999999px";
+    textArea.style.top = "-999999px";
+    document.body.appendChild(textArea);
+    textArea.focus();
+    textArea.select();
+    
+    try {
+        document.execCommand('copy');
+        this.showCopyFeedback();
+    } catch (err) {
+        console.error('Fallback: Could not copy text: ', err);
+    }
+    
+    document.body.removeChild(textArea);
+};
+
+LADEXApp.prototype.showCopyFeedback = function() {
+    const copyBtn = document.getElementById('copy-message-btn');
+    const originalTitle = copyBtn.title;
+    
+    copyBtn.title = 'Copied!';
+    copyBtn.style.background = 'rgba(120, 219, 226, 0.3)';
+    copyBtn.style.borderColor = 'rgba(120, 219, 226, 0.6)';
+    
+    setTimeout(() => {
+        copyBtn.title = originalTitle;
+        copyBtn.style.background = '';
+        copyBtn.style.borderColor = '';
+    }, 1500);
 };
 
 LADEXApp.prototype.autoResizeTextarea = function(textarea) {

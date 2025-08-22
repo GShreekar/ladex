@@ -334,8 +334,13 @@ section {
     word-wrap: break-word;
     background: rgba(120, 119, 198, 0.05);
     padding: 15px;
+    padding-right: 45px; /* Make room for the copy button */
     border-radius: 8px;
     border-left: 3px solid #78dbe2;
+}
+
+.message-text-container {
+    position: relative;
 }
 
 .files-section {
@@ -687,6 +692,30 @@ th:nth-child(5), td:nth-child(5) { width: 15%; }
     padding: 20px 30px;
     border-bottom: 1px solid rgba(120, 119, 198, 0.2);
     background: rgba(0, 0, 0, 0.2);
+}
+
+.copy-btn {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    background: rgba(120, 219, 226, 0.1);
+    border: 1px solid rgba(120, 219, 226, 0.3);
+    color: rgba(120, 219, 226, 0.8);
+    padding: 6px;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: all 0.3s ease;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 10;
+}
+
+.copy-btn:hover {
+    background: rgba(120, 219, 226, 0.2);
+    color: rgba(120, 219, 226, 1);
+    border-color: rgba(120, 219, 226, 0.5);
+    transform: scale(1.05);
 }
 
 .close-btn {

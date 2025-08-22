@@ -116,7 +116,14 @@
                         <span class="message-sender">From: <span id="modal-sender"></span></span>
                         <span class="message-time">Sent: <span id="modal-time"></span></span>
                     </div>
-                    <div class="message-text" id="modal-message-text"></div>
+                    <div class="message-text-container">
+                        <div class="message-text" id="modal-message-text"></div>
+                        <button id="copy-message-btn" class="icon-btn copy-btn" title="Copy Message">
+                            <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
+                                <path d="M19,21H8V7H19M19,5H8A2,2 0 0,0 6,7V21A2,2 0 0,0 8,23H19A2,2 0 0,0 21,21V7A2,2 0 0,0 19,5M16,1H4A2,2 0 0,0 2,3V17H4V3H16V1Z"/>
+                            </svg>
+                        </button>
+                    </div>
                 </div>
             </div>
         </div>
