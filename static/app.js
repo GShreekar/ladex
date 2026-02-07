@@ -410,7 +410,17 @@ class LADEXApp {
     getRTCConfig() {
         // On a LAN, STUN is technically unnecessary, but it helps with
         // host-candidate gathering on some platforms.
-        return { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+        // For localhost testing, use a public TURN server (relay).
+        return {
+            iceServers: [
+                { urls: 'stun:stun.l.google.com:19302' },
+                {
+                    urls: 'turn:openrelay.metered.ca:80',
+                    username: 'openrelayproject',
+                    credential: 'openrelayproject',
+                },
+            ],
+        };
     }
 
     // ── Sender side (host) ──────────────────────────────────────────────
@@ -737,6 +747,7 @@ class LADEXApp {
         let chunks = [];
         let receivedBytes = 0;
         let startTime = Date.now();
+        let transferComplete = false;  // Flag to prevent onclose from firing after success
 
         dc.onmessage = (event) => {
             // First message is the JSON header (string)
@@ -766,6 +777,7 @@ class LADEXApp {
 
             // All chunks received?
             if (receivedBytes >= meta.fileSize) {
+                transferComplete = true;  // Mark as complete before finalize
                 this.finalizeReceivedFile(meta, chunks, fromPeerId);
             }
         };
@@ -774,7 +786,13 @@ class LADEXApp {
             console.log('DataChannel closed (receiver side)');
             // If we received all data before close, finalizeReceivedFile
             // already handled it.  If not, the transfer was interrupted.
-            if (meta && receivedBytes < meta.fileSize) {
+            // BUT: don't retry if user manually cancelled
+            const wasCancelled = this.cancelledTransfers.has(`cancelled:${meta?.fileId}`);
+            if (wasCancelled) {
+                this.cancelledTransfers.delete(`cancelled:${meta.fileId}`);
+                return; // User cancelled, don't retry
+            }
+            if (!transferComplete && meta && receivedBytes < meta.fileSize) {
                 this.hideProgress();
                 this.toast(`Transfer interrupted: ${meta.fileName} — retrying…`, 'warning');
                 this._retryDownload(meta.fileId);
@@ -783,10 +801,17 @@ class LADEXApp {
 
         dc.onerror = (err) => {
             console.error('DataChannel error (receiver):', err);
-            this.hideProgress();
-            if (meta) {
-                this.toast(`Transfer error: ${meta.fileName} — retrying…`, 'warning');
-                this._retryDownload(meta.fileId);
+            const wasCancelled = this.cancelledTransfers.has(`cancelled:${meta?.fileId}`);
+            if (wasCancelled) {
+                this.cancelledTransfers.delete(`cancelled:${meta.fileId}`);
+                return; // User cancelled, don't retry
+            }
+            if (!transferComplete) {
+                this.hideProgress();
+                if (meta) {
+                    this.toast(`Transfer error: ${meta.fileName} — retrying…`, 'warning');
+                    this._retryDownload(meta.fileId);
+                }
             }
         };
     }
@@ -1015,6 +1040,10 @@ class LADEXApp {
         // Mark all current transfers as cancelled so async loops break
         for (const [id] of this.activeTransfers) {
             this.cancelledTransfers.add(id);
+        }
+        // Mark all pending downloads as cancelled to prevent retry
+        for (const fileId of this.pendingDownloads) {
+            this.cancelledTransfers.add(`cancelled:${fileId}`);
         }
         // Close all active RTC connections to abort transfers
         for (const [peerId] of this.rtcConnections) {
