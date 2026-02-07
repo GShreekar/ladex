@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::RwLock;
 use warp::Filter;
 use clap::Parser;
 use rand::Rng;
@@ -34,7 +34,7 @@ pub struct AppState {
     pub peers: Peers,
     pub files: Files,
     pub messages: Messages,
-    pub tx: broadcast::Sender<ServerMessage>,
+    pub senders: types::PeerSenders,
     pub security_code: Option<String>,
     pub server_session_id: String,
 }
@@ -120,8 +120,6 @@ async fn main() {
         None
     };
     
-    let (tx, _rx) = broadcast::channel::<ServerMessage>(1000);
-    
     let server_session_id = {
         let mut rng = rand::thread_rng();
         format!("server_session_{}", rng.gen::<u64>())
@@ -131,7 +129,7 @@ async fn main() {
         peers: Arc::new(RwLock::new(HashMap::new())),
         files: Arc::new(RwLock::new(HashMap::new())),
         messages: Arc::new(RwLock::new(Vec::new())),
-        tx,
+        senders: Arc::new(RwLock::new(HashMap::new())),
         security_code,
         server_session_id,
     };

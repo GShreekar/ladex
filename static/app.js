@@ -11,12 +11,20 @@ class LADEXApp {
         this.messages = [];
         this.unreadCount = 0;
         this.serverFiles = [];
+        this.maxFileSize = 100 * 1024 * 1024;
         
         this.init();
     }
 
     generateSessionId() {
         return 'peer_' + Math.random().toString(36).substr(2, 9) + '_' + Date.now();
+    }
+
+    formatFileSize(bytes) {
+        const sizes = ['B', 'KB', 'MB', 'GB'];
+        if (bytes === 0) return '0 B';
+        const i = Math.floor(Math.log(bytes) / Math.log(1024));
+        return Math.round(bytes / Math.pow(1024, i) * 100) / 100 + ' ' + sizes[i];
     }
 
     getShortPeerId() {
@@ -294,6 +302,14 @@ class LADEXApp {
     }
 
     async uploadFile(file) {
+        if (file.size > this.maxFileSize) {
+            const fileSizeMB = (file.size / (1024 * 1024)).toFixed(1);
+            const limitMB = (this.maxFileSize / (1024 * 1024)).toFixed(1);
+            alert(`File "${file.name}" is too large (${fileSizeMB}MB). Maximum allowed size is ${limitMB}MB.`);
+            console.error(`File rejected: ${file.name} (${fileSizeMB}MB) exceeds limit of ${limitMB}MB`);
+            return;
+        }
+        
         const fileId = this.generateFileId();
         const fileMetadata = {
             id: fileId,
@@ -317,14 +333,19 @@ class LADEXApp {
         };
         
         this.sendMessage(message);
+        console.log(`File uploaded: ${file.name} (${this.formatFileSize(file.size)})`);
+    }
+
+    storeFile(fileId, file) {
+        this.files.set(fileId, file);
     }
 
     generateFileId() {
         return 'file_' + Math.random().toString(36).substr(2, 12) + '_' + Date.now();
     }
 
-    storeFile(fileId, file) {
-        this.files.set(fileId, file);
+    getFile(fileId) {
+        return this.files.get(fileId) || null;
     }
 
     updateFileList(files) {
@@ -412,10 +433,7 @@ class LADEXApp {
     }
 
     formatSize(bytes) {
-        const sizes = ['B', 'KB', 'MB', 'GB'];
-        if (bytes === 0) return '0 B';
-        const i = Math.floor(Math.log(bytes) / Math.log(1024));
-        return Math.round(bytes / Math.pow(1024, i) * 100) / 100 + ' ' + sizes[i];
+        return this.formatFileSize(bytes);
     }
 
     async downloadFile(fileId) {
@@ -465,7 +483,7 @@ class LADEXApp {
         
         // If we are the host being requested to send a file
         if (from_session_id === this.sessionId) {
-            const file = this.files.get(file_id);
+            const file = this.getFile(file_id);
             if (!file) {
                 console.error('Requested file not found:', file_id);
                 return;

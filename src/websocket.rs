@@ -1,23 +1,54 @@
 use crate::types::*;
 use crate::AppState;
 use futures_util::{SinkExt, StreamExt};
-use std::collections::HashSet;
-use warp::ws::{WebSocket, Ws, Message};
+use tokio::sync::mpsc;
+use warp::ws::{Message, WebSocket, Ws};
 use warp::{Rejection, Reply};
 
 pub async fn websocket_handler(ws: Ws, state: AppState) -> Result<impl Reply, Rejection> {
     Ok(ws.on_upgrade(move |socket| handle_websocket(socket, state)))
 }
 
+// ---------------------------------------------------------------------------
+// Helpers: broadcast to all peers / send to a single peer
+// ---------------------------------------------------------------------------
+
+/// Send a message to every connected peer.
+async fn broadcast(state: &AppState, msg: ServerMessage) {
+    let senders = state.senders.read().await;
+    for sender in senders.values() {
+        let _ = sender.send(msg.clone());
+    }
+}
+
+/// Send a message to a single peer identified by session id.
+async fn send_to(state: &AppState, target: &SessionId, msg: ServerMessage) {
+    let senders = state.senders.read().await;
+    if let Some(sender) = senders.get(target) {
+        let _ = sender.send(msg);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket lifecycle
+// ---------------------------------------------------------------------------
+
 pub async fn handle_websocket(ws: WebSocket, state: AppState) {
     let (mut ws_tx, mut ws_rx) = ws.split();
     let mut session_id: Option<SessionId> = None;
-    let mut rx = state.tx.subscribe();
 
-    // Spawn a task to handle outgoing messages
+    // Create a per-peer mpsc channel.  The sender half is registered in the
+    // shared map once we know the session_id (on Join).  The receiver half
+    // drives outgoing messages for THIS connection only.
+    let (peer_tx, mut peer_rx) = mpsc::unbounded_channel::<ServerMessage>();
+
+    // Spawn a task that drains the per-peer receiver and writes to the WS.
     let outgoing_task = tokio::spawn(async move {
-        while let Ok(msg) = rx.recv().await {
-            let json = serde_json::to_string(&msg).unwrap();
+        while let Some(msg) = peer_rx.recv().await {
+            let json = match serde_json::to_string(&msg) {
+                Ok(j) => j,
+                Err(_) => continue,
+            };
             if ws_tx.send(Message::text(json)).await.is_err() {
                 break;
             }
@@ -30,13 +61,20 @@ pub async fn handle_websocket(ws: WebSocket, state: AppState) {
             Ok(msg) => {
                 if let Ok(text) = msg.to_str() {
                     if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(text) {
-                        match handle_client_message(client_msg, &state, &mut session_id).await {
+                        match handle_client_message(
+                            client_msg,
+                            &state,
+                            &mut session_id,
+                            &peer_tx,
+                        )
+                        .await
+                        {
                             Ok(_) => {}
                             Err(e) => {
-                                let error_msg = ServerMessage::Error {
+                                // Send the error only to THIS peer, not everyone
+                                let _ = peer_tx.send(ServerMessage::Error {
                                     message: e.to_string(),
-                                };
-                                let _ = state.tx.send(error_msg);
+                                });
                             }
                         }
                     }
@@ -47,109 +85,143 @@ pub async fn handle_websocket(ws: WebSocket, state: AppState) {
     }
 
     // Cleanup when connection closes
-    if let Some(id) = session_id {
-        cleanup_peer(&state, &id).await;
+    if let Some(id) = &session_id {
+        // Remove sender from shared map first
+        {
+            let mut senders = state.senders.write().await;
+            senders.remove(id);
+        }
+        cleanup_peer(&state, id).await;
     }
 
     outgoing_task.abort();
 }
 
+// ---------------------------------------------------------------------------
+// Message handling
+// ---------------------------------------------------------------------------
+
 async fn handle_client_message(
     msg: ClientMessage,
     state: &AppState,
     session_id: &mut Option<SessionId>,
+    peer_tx: &PeerSender,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match msg {
+        // ── Join ─────────────────────────────────────────────────────────
         ClientMessage::Join {
             session_id: id,
             user_agent,
         } => {
             *session_id = Some(id.clone());
-            
+
+            // Register this peer's sender so others can route messages to it
+            {
+                let mut senders = state.senders.write().await;
+                senders.insert(id.clone(), peer_tx.clone());
+            }
+
             let peer = PeerInfo {
                 session_id: id.clone(),
                 connected_at: chrono::Utc::now(),
                 user_agent,
             };
 
-            // Add peer to the map
             let peers_count = {
                 let mut peers = state.peers.write().await;
                 peers.insert(id.clone(), peer.clone());
                 peers.len()
             };
 
-            // Send current file list to the new peer
-            let files = {
+            // Send current file catalog only to the newly joined peer
+            let files: Vec<FileMetadata> = {
                 let files = state.files.read().await;
                 files.values().cloned().collect()
             };
-            
-            let _ = state.tx.send(ServerMessage::FileListUpdate { files });
-            
-            // Send message history to the new peer
+            let _ = peer_tx.send(ServerMessage::FileListUpdate { files });
+
+            // Send message history only to the newly joined peer
             let messages = {
                 let messages = state.messages.read().await;
                 messages.clone()
             };
-            
             if !messages.is_empty() {
-                let _ = state.tx.send(ServerMessage::MessageHistory { messages });
+                let _ = peer_tx.send(ServerMessage::MessageHistory { messages });
             }
 
-            // Notify all peers about new peer
-            let _ = state.tx.send(ServerMessage::PeerJoined {
-                peer,
-                total_peers: peers_count,
-            });
+            // Notify ALL peers about the new peer
+            broadcast(
+                state,
+                ServerMessage::PeerJoined {
+                    peer,
+                    total_peers: peers_count,
+                },
+            )
+            .await;
         }
-        ClientMessage::FileUpload { session_id: _, file } => {
-            // Add file to the registry
+
+        // ── File catalog ─────────────────────────────────────────────────
+        ClientMessage::FileUpload {
+            session_id: _,
+            file,
+        } => {
             {
                 let mut files = state.files.write().await;
-                files.insert(file.id.clone(), file.clone());
+                files.insert(file.id.clone(), file);
             }
 
-            // Send updated file list instead of individual file added message
-            let files = {
+            let files: Vec<FileMetadata> = {
                 let files = state.files.read().await;
                 files.values().cloned().collect()
             };
-            
-            let _ = state.tx.send(ServerMessage::FileListUpdate { files });
+            broadcast(state, ServerMessage::FileListUpdate { files }).await;
         }
+
+        // ── Download request → pick a host and tell it ───────────────────
         ClientMessage::RequestDownload {
             session_id: requester_id,
             file_id,
         } => {
-            // Find a host for this file
             let file_hosts = {
                 let files = state.files.read().await;
-                if let Some(file) = files.get(&file_id) {
-                    file.hosts.clone()
-                } else {
-                    HashSet::new()
-                }
+                files.get(&file_id).map(|f| f.hosts.clone()).unwrap_or_default()
             };
 
-            // Pick the first available host (could be improved with load balancing)
-            if let Some(host_id) = file_hosts.iter().next() {
-                let _ = state.tx.send(ServerMessage::DownloadRequest {
-                    from_session_id: host_id.clone(),
-                    file_id,
-                    requester_session_id: requester_id,
-                });
+            // Don't pick the requester as host for its own file
+            let available: Vec<&SessionId> = file_hosts
+                .iter()
+                .filter(|h| **h != requester_id)
+                .collect();
+
+            if let Some(host_id) = available.first() {
+                // Tell only the chosen host to initiate a WebRTC connection
+                send_to(
+                    state,
+                    host_id,
+                    ServerMessage::DownloadRequest {
+                        file_id,
+                        requester_session_id: requester_id,
+                    },
+                )
+                .await;
             } else {
-                let _ = state.tx.send(ServerMessage::Error {
-                    message: "No hosts available for this file".to_string(),
-                });
+                // If this peer is the only host, they already have the file
+                send_to(
+                    state,
+                    &requester_id,
+                    ServerMessage::Error {
+                        message: "No hosts available for this file".to_string(),
+                    },
+                )
+                .await;
             }
         }
+
+        // ── File downloaded → register new host ──────────────────────────
         ClientMessage::FileDownloaded {
             session_id: downloader_id,
             file_id,
         } => {
-            // Add downloader as a new host
             {
                 let mut files = state.files.write().await;
                 if let Some(file) = files.get_mut(&file_id) {
@@ -157,63 +229,82 @@ async fn handle_client_message(
                 }
             }
 
-            // Send updated file list
-            let files = {
+            let files: Vec<FileMetadata> = {
                 let files = state.files.read().await;
                 files.values().cloned().collect()
             };
-            
-            let _ = state.tx.send(ServerMessage::FileListUpdate { files });
+            broadcast(state, ServerMessage::FileListUpdate { files }).await;
         }
+
+        // ── WebRTC signaling: Offer ──────────────────────────────────────
+        ClientMessage::WebRTCOffer {
+            session_id: from,
+            target_session_id,
+            sdp,
+        } => {
+            send_to(
+                state,
+                &target_session_id,
+                ServerMessage::WebRTCOffer {
+                    from_session_id: from,
+                    sdp,
+                },
+            )
+            .await;
+        }
+
+        // ── WebRTC signaling: Answer ─────────────────────────────────────
+        ClientMessage::WebRTCAnswer {
+            session_id: from,
+            target_session_id,
+            sdp,
+        } => {
+            send_to(
+                state,
+                &target_session_id,
+                ServerMessage::WebRTCAnswer {
+                    from_session_id: from,
+                    sdp,
+                },
+            )
+            .await;
+        }
+
+        // ── WebRTC signaling: ICE Candidate ──────────────────────────────
+        ClientMessage::ICECandidate {
+            session_id: from,
+            target_session_id,
+            candidate,
+        } => {
+            send_to(
+                state,
+                &target_session_id,
+                ServerMessage::ICECandidate {
+                    from_session_id: from,
+                    candidate,
+                },
+            )
+            .await;
+        }
+
+        // ── Ping / Pong ──────────────────────────────────────────────────
         ClientMessage::Ping { session_id: _ } => {
-            let _ = state.tx.send(ServerMessage::Pong);
+            let _ = peer_tx.send(ServerMessage::Pong);
         }
-        ClientMessage::FileChunk {
-            session_id: _,
-            file_id,
-            chunk_index,
-            total_chunks,
-            data,
-            target_session_id,
-        } => {
-            // Forward the file chunk to the target session
-            let _ = state.tx.send(ServerMessage::FileChunk {
-                file_id,
-                chunk_index,
-                total_chunks,
-                data,
-                from_session_id: session_id.clone().unwrap_or_default(),
-                target_session_id,
-            });
-        }
-        ClientMessage::FileMetadata {
-            session_id: _,
-            file_id,
-            file_name,
-            file_size,
-            mime_type,
-            total_chunks,
-            target_session_id,
-        } => {
-            // Forward the file metadata to the target session
-            let _ = state.tx.send(ServerMessage::FileMetadata {
-                file_id,
-                file_name,
-                file_size,
-                mime_type,
-                total_chunks,
-                from_session_id: session_id.clone().unwrap_or_default(),
-                target_session_id,
-            });
-        }
+
+        // ── Text messaging ───────────────────────────────────────────────
         ClientMessage::TextMessage {
             session_id: sender_id,
             content,
         } => {
             let message = TextMessage {
-                id: format!("msg_{}_{}", sender_id, chrono::Utc::now().timestamp_millis()),
+                id: format!(
+                    "msg_{}_{}",
+                    sender_id,
+                    chrono::Utc::now().timestamp_millis()
+                ),
                 content,
-                sender_id: sender_id.clone(),
+                sender_id,
                 sender_name: None,
                 timestamp: chrono::Utc::now(),
             };
@@ -221,56 +312,53 @@ async fn handle_client_message(
                 let mut messages = state.messages.write().await;
                 messages.push(message.clone());
             }
-            
-            let _ = state.tx.send(ServerMessage::TextMessage { message });
+            broadcast(state, ServerMessage::TextMessage { message }).await;
         }
     }
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Cleanup
+// ---------------------------------------------------------------------------
+
 async fn cleanup_peer(state: &AppState, session_id: &SessionId) {
-    // Remove peer from peers map
     let peers_count = {
         let mut peers = state.peers.write().await;
         peers.remove(session_id);
         peers.len()
     };
 
-    // Remove peer from file hosts and clean up files with no hosts
-    let files_to_remove = {
+    // Remove peer from file hosts; drop files with zero remaining hosts
+    {
         let mut files = state.files.write().await;
         let mut to_remove = Vec::new();
-        
+
         for (file_id, file) in files.iter_mut() {
             file.hosts.remove(session_id);
             if file.hosts.is_empty() {
                 to_remove.push(file_id.clone());
             }
         }
-        
+
         for file_id in &to_remove {
             files.remove(file_id);
         }
-        
-        to_remove
-    };
-
-    // Notify about peer leaving
-    let _ = state.tx.send(ServerMessage::PeerLeft {
-        session_id: session_id.clone(),
-        total_peers: peers_count,
-    });
-
-    // Notify about removed files
-    for file_id in files_to_remove {
-        let _ = state.tx.send(ServerMessage::FileRemoved { file_id });
     }
 
-    // Send updated file list
-    let files = {
+    // Broadcast peer departure + updated catalog
+    broadcast(
+        state,
+        ServerMessage::PeerLeft {
+            session_id: session_id.clone(),
+            total_peers: peers_count,
+        },
+    )
+    .await;
+
+    let files: Vec<FileMetadata> = {
         let files = state.files.read().await;
         files.values().cloned().collect()
     };
-    
-    let _ = state.tx.send(ServerMessage::FileListUpdate { files });
+    broadcast(state, ServerMessage::FileListUpdate { files }).await;
 }
