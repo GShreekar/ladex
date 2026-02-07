@@ -29,6 +29,18 @@ class LADEXApp {
 
         this.RTC_CHUNK_SIZE = 64 * 1024; // 64 KB per DataChannel message
 
+        // ── Retry / resilience ──────────────────────────────────────────
+        this.MAX_RETRIES = 3;
+        this.RETRY_BASE_DELAY = 1000; // ms — exponential back-off base
+        this.ICE_TIMEOUT = 15000;     // ms — give up if no ICE connection
+        // Downloads currently in-flight (prevents double-click issues)
+        this.pendingDownloads = new Set();
+        // Cancelled transfer ids (so async loops can bail out)
+        this.cancelledTransfers = new Set();
+
+        // ── Toast queue ─────────────────────────────────────────────────
+        this._toastContainer = null;
+
         this.init();
     }
 
@@ -66,6 +78,7 @@ class LADEXApp {
         this.initializePeerDisplay();
         this.connectWebSocket();
         this.setupEventListeners();
+        this.setupDragAndDrop();
     }
 
     initializePeerDisplay() {
@@ -75,6 +88,41 @@ class LADEXApp {
             return false;
         };
         if (!update()) setTimeout(() => { if (!update()) setTimeout(update, 1000); }, 100);
+    }
+
+    // =====================================================================
+    //  TOAST NOTIFICATIONS (replaces alert())
+    // =====================================================================
+
+    _ensureToastContainer() {
+        if (this._toastContainer) return;
+        this._toastContainer = document.createElement('div');
+        this._toastContainer.id = 'toast-container';
+        document.body.appendChild(this._toastContainer);
+    }
+
+    /**
+     * Show a small toast notification.
+     * @param {string} message
+     * @param {'info'|'success'|'error'|'warning'} type
+     * @param {number} durationMs — auto-dismiss after this many ms
+     */
+    toast(message, type = 'info', durationMs = 4000) {
+        this._ensureToastContainer();
+        const el = document.createElement('div');
+        el.className = `toast toast-${type}`;
+        const icons = { info: 'ℹ️', success: '✅', error: '❌', warning: '⚠️' };
+        el.innerHTML = `<span class="toast-icon">${icons[type] || ''}</span><span class="toast-msg">${this.escapeHtml(message)}</span>`;
+        this._toastContainer.appendChild(el);
+        // Trigger CSS enter animation
+        requestAnimationFrame(() => el.classList.add('toast-visible'));
+        setTimeout(() => {
+            el.classList.remove('toast-visible');
+            el.classList.add('toast-exit');
+            el.addEventListener('transitionend', () => el.remove());
+            // Fallback if transitionend doesn't fire
+            setTimeout(() => el.remove(), 500);
+        }, durationMs);
     }
 
     // =====================================================================
@@ -90,9 +138,32 @@ class LADEXApp {
             console.log('WS connected');
             this.updateConnectionStatus(true);
             this.sendWS({ type: 'join', session_id: this.sessionId, user_agent: navigator.userAgent });
+            // Re-register locally-hosted files after reconnect so the
+            // catalog is accurate.
+            for (const [fileId, file] of this.files.entries()) {
+                this.sendWS({
+                    type: 'file_upload',
+                    session_id: this.sessionId,
+                    file: {
+                        id: fileId,
+                        name: file.name,
+                        size: file.size,
+                        mime_type: file.type || 'application/octet-stream',
+                        uploader_id: this.sessionId,
+                        hosts: [this.sessionId],
+                        uploaded_at: new Date().toISOString(),
+                    }
+                });
+            }
         };
 
-        this.ws.onmessage = (e) => this.handleServerMessage(JSON.parse(e.data));
+        this.ws.onmessage = (e) => {
+            try {
+                this.handleServerMessage(JSON.parse(e.data));
+            } catch (err) {
+                console.error('Failed to parse WS message:', err);
+            }
+        };
 
         this.ws.onclose = () => {
             console.log('WS disconnected — reconnecting in 3 s');
@@ -154,7 +225,7 @@ class LADEXApp {
 
             // ── misc ────────────────────────────────────────────────────
             case 'error':
-                this.showError(msg.message);
+                this.toast(msg.message, 'error', 6000);
                 break;
             case 'pong':
                 break;
@@ -179,14 +250,16 @@ class LADEXApp {
             } else {
                 for (const file of files) await this.uploadFile(file);
             }
+            const count = isFolder ? 1 : files.length;
+            this.toast(`${count} file${count > 1 ? 's' : ''} shared`, 'success');
         } catch (err) {
-            this.showError(`Upload failed: ${err.message}`);
+            this.toast(`Upload failed: ${err.message}`, 'error');
         }
     }
 
     async handleFolderUpload(files) {
         if (typeof JSZip === 'undefined') {
-            this.showError('JSZip library not loaded.');
+            this.toast('JSZip library not loaded.', 'error');
             return;
         }
         const zip = new JSZip();
@@ -219,19 +292,100 @@ class LADEXApp {
     }
 
     // =====================================================================
-    //  DOWNLOAD REQUEST
+    //  DRAG-AND-DROP
+    // =====================================================================
+
+    setupDragAndDrop() {
+        const body = document.body;
+        let dragDepth = 0;
+
+        body.addEventListener('dragenter', (e) => {
+            e.preventDefault();
+            dragDepth++;
+            body.classList.add('drag-over');
+        });
+
+        body.addEventListener('dragleave', (e) => {
+            e.preventDefault();
+            dragDepth--;
+            if (dragDepth <= 0) {
+                dragDepth = 0;
+                body.classList.remove('drag-over');
+            }
+        });
+
+        body.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            e.dataTransfer.dropEffect = 'copy';
+        });
+
+        body.addEventListener('drop', (e) => {
+            e.preventDefault();
+            dragDepth = 0;
+            body.classList.remove('drag-over');
+            const files = e.dataTransfer.files;
+            if (files && files.length > 0) {
+                this.handleFileUpload(files, false);
+            }
+        });
+    }
+
+    // =====================================================================
+    //  DOWNLOAD REQUEST — with retry
     // =====================================================================
 
     /** User clicks "Download" — tell the server we want this file. */
     downloadFile(fileId) {
+        // Prevent double-clicks / concurrent downloads of the same file
+        if (this.pendingDownloads.has(fileId)) {
+            this.toast('Download already in progress', 'warning');
+            return;
+        }
         // Check: if WE already have the file locally, just save it.
         const localFile = this.getFile(fileId);
         if (localFile) {
             this.saveFileToDisk(localFile, localFile.name);
+            this.toast(`Saved ${localFile.name}`, 'success');
             return;
         }
-        console.log(`Requesting download for ${fileId}`);
+        this.pendingDownloads.add(fileId);
+        this._requestDownloadWithRetry(fileId, 0);
+    }
+
+    _requestDownloadWithRetry(fileId, attempt) {
+        if (attempt >= this.MAX_RETRIES) {
+            this.pendingDownloads.delete(fileId);
+            this.toast(`Download failed after ${this.MAX_RETRIES} attempts`, 'error', 6000);
+            this.hideProgress();
+            return;
+        }
+        if (attempt > 0) {
+            const name = this._fileNameFromCatalog(fileId) || fileId.slice(-8);
+            this.toast(`Retrying download of ${name} (attempt ${attempt + 1}/${this.MAX_RETRIES})…`, 'warning');
+        }
+        console.log(`Requesting download for ${fileId} (attempt ${attempt + 1})`);
+        // Store attempt info so the receiver side can retry on failure
+        this.activeTransfers.set(`retry:${fileId}`, { attempt, fileId });
         this.sendWS({ type: 'request_download', session_id: this.sessionId, file_id: fileId });
+    }
+
+    /** Look up a file's display name from the server catalog. */
+    _fileNameFromCatalog(fileId) {
+        const f = this.serverFiles.find(f => f.id === fileId);
+        return f ? f.name : null;
+    }
+
+    /**
+     * Called when an incoming transfer fails (RTC/DC error).
+     * Retries with exponential back-off.
+     */
+    _retryDownload(fileId) {
+        const retryInfo = this.activeTransfers.get(`retry:${fileId}`);
+        const attempt = retryInfo ? retryInfo.attempt + 1 : 1;
+        this.activeTransfers.delete(`retry:${fileId}`);
+
+        const delay = this.RETRY_BASE_DELAY * Math.pow(2, attempt - 1);
+        setTimeout(() => this._requestDownloadWithRetry(fileId, attempt), delay);
     }
 
     /**
@@ -262,8 +416,19 @@ class LADEXApp {
     // ── Sender side (host) ──────────────────────────────────────────────
 
     async initiateWebRTCSend(targetSessionId, fileId, file) {
+        // Clean up any previous connection to this peer
+        this.closeRTC(targetSessionId);
+
         const pc = new RTCPeerConnection(this.getRTCConfig());
         this.rtcConnections.set(targetSessionId, pc);
+
+        // ICE timeout — if we never connect, abort
+        const iceTimer = setTimeout(() => {
+            if (pc.connectionState !== 'connected') {
+                console.warn('ICE timeout (sender) — aborting');
+                this.closeRTC(targetSessionId);
+            }
+        }, this.ICE_TIMEOUT);
 
         // Create a DataChannel labelled with the fileId
         const dc = pc.createDataChannel(`file:${fileId}`, {
@@ -271,13 +436,22 @@ class LADEXApp {
         });
         dc.binaryType = 'arraybuffer';
 
+        const transferId = `send:${fileId}:${targetSessionId}`;
+
         dc.onopen = () => {
+            clearTimeout(iceTimer);
             console.log(`DataChannel open → streaming ${file.name}`);
             this.streamFileOverDC(dc, fileId, file, targetSessionId);
         };
 
         dc.onclose = () => {
             console.log('DataChannel closed (sender side)');
+        };
+
+        dc.onerror = (err) => {
+            clearTimeout(iceTimer);
+            console.error('DataChannel error (sender):', err);
+            this.activeTransfers.delete(transferId);
         };
 
         // ICE candidates → relay via server
@@ -293,15 +467,27 @@ class LADEXApp {
         };
 
         pc.onconnectionstatechange = () => {
+            if (pc.connectionState === 'connected') {
+                clearTimeout(iceTimer);
+            }
             if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+                clearTimeout(iceTimer);
                 console.warn('RTC connection failed/disconnected (sender)');
+                this.activeTransfers.delete(transferId);
                 this.closeRTC(targetSessionId);
             }
         };
 
         // Create offer
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
+        try {
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+        } catch (err) {
+            clearTimeout(iceTimer);
+            console.error('Failed to create offer:', err);
+            this.closeRTC(targetSessionId);
+            return;
+        }
 
         this.sendWS({
             type: 'webrtc_offer',
@@ -325,33 +511,73 @@ class LADEXApp {
      */
     async streamFileOverDC(dc, fileId, file, targetSessionId) {
         const totalChunks = Math.ceil(file.size / this.RTC_CHUNK_SIZE);
+        const transferId = `send:${fileId}:${targetSessionId}`;
 
         // 1. Send metadata header as a text message
-        dc.send(JSON.stringify({
-            fileId,
-            fileName: file.name,
-            fileSize: file.size,
-            mimeType: file.type || 'application/octet-stream',
-            totalChunks,
-        }));
+        try {
+            dc.send(JSON.stringify({
+                fileId,
+                fileName: file.name,
+                fileSize: file.size,
+                mimeType: file.type || 'application/octet-stream',
+                totalChunks,
+            }));
+        } catch (err) {
+            console.error('Failed to send file header:', err);
+            this.closeRTC(targetSessionId);
+            return;
+        }
 
-        const transferId = `send:${fileId}:${targetSessionId}`;
         this.activeTransfers.set(transferId, { startTime: Date.now(), bytesSent: 0, totalBytes: file.size });
         this.showProgress(`Sending ${file.name}`, 0);
 
         // 2. Stream binary chunks using file.slice() (disk → DataChannel)
         for (let i = 0; i < totalChunks; i++) {
+            // Check if this transfer was cancelled
+            if (this.cancelledTransfers.has(transferId)) {
+                this.cancelledTransfers.delete(transferId);
+                this.activeTransfers.delete(transferId);
+                console.log('Transfer cancelled (sender):', file.name);
+                this.closeRTC(targetSessionId);
+                return;
+            }
+            // Check DC is still open
+            if (dc.readyState !== 'open') {
+                console.warn('DataChannel closed mid-transfer (sender)');
+                this.activeTransfers.delete(transferId);
+                this.hideProgress();
+                return;
+            }
+
             const start = i * this.RTC_CHUNK_SIZE;
             const end   = Math.min(start + this.RTC_CHUNK_SIZE, file.size);
             const blob  = file.slice(start, end);
             const buf   = await blob.arrayBuffer();
 
             // Back-pressure: wait if the DC buffer is getting full
+            let bpAttempts = 0;
             while (dc.bufferedAmount > 4 * 1024 * 1024) {
                 await new Promise(r => setTimeout(r, 20));
+                bpAttempts++;
+                // Safety valve — if we're stuck for > 10 s something is wrong
+                if (bpAttempts > 500) {
+                    console.warn('Back-pressure timeout (sender)');
+                    this.activeTransfers.delete(transferId);
+                    this.hideProgress();
+                    this.closeRTC(targetSessionId);
+                    return;
+                }
             }
 
-            dc.send(buf);
+            try {
+                dc.send(buf);
+            } catch (err) {
+                console.error('DC send error:', err);
+                this.activeTransfers.delete(transferId);
+                this.hideProgress();
+                this.closeRTC(targetSessionId);
+                return;
+            }
 
             // Progress
             const transfer = this.activeTransfers.get(transferId);
@@ -367,6 +593,7 @@ class LADEXApp {
 
         this.activeTransfers.delete(transferId);
         this.hideProgress();
+        this.toast(`Sent ${file.name}`, 'success');
         console.log(`File ${file.name} sent to ${targetSessionId.slice(-6)}`);
 
         // Keep the connection open briefly so the last chunk flushes, then close
@@ -378,10 +605,27 @@ class LADEXApp {
     /** Server relays an SDP offer from a host that will send us a file. */
     async handleWebRTCOffer(msg) {
         const { from_session_id, sdp } = msg;
-        const remoteDesc = JSON.parse(sdp);
+        let remoteDesc;
+        try {
+            remoteDesc = JSON.parse(sdp);
+        } catch (err) {
+            console.error('Invalid SDP offer:', err);
+            return;
+        }
+
+        // Clean up any previous connection to this peer
+        this.closeRTC(from_session_id);
 
         const pc = new RTCPeerConnection(this.getRTCConfig());
         this.rtcConnections.set(from_session_id, pc);
+
+        // ICE timeout
+        const iceTimer = setTimeout(() => {
+            if (pc.connectionState !== 'connected') {
+                console.warn('ICE timeout (receiver) — aborting');
+                this.closeRTC(from_session_id);
+            }
+        }, this.ICE_TIMEOUT);
 
         pc.onicecandidate = (e) => {
             if (e.candidate) {
@@ -395,7 +639,11 @@ class LADEXApp {
         };
 
         pc.onconnectionstatechange = () => {
+            if (pc.connectionState === 'connected') {
+                clearTimeout(iceTimer);
+            }
             if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+                clearTimeout(iceTimer);
                 console.warn('RTC connection failed/disconnected (receiver)');
                 this.closeRTC(from_session_id);
             }
@@ -408,13 +656,19 @@ class LADEXApp {
             this.setupReceiverDC(dc, from_session_id);
         };
 
-        await pc.setRemoteDescription(new RTCSessionDescription(remoteDesc));
+        try {
+            await pc.setRemoteDescription(new RTCSessionDescription(remoteDesc));
+            // Flush any ICE candidates that arrived before the remote description
+            this.flushPendingCandidates(from_session_id, pc);
 
-        // Flush any ICE candidates that arrived before the remote description
-        this.flushPendingCandidates(from_session_id, pc);
-
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+        } catch (err) {
+            clearTimeout(iceTimer);
+            console.error('Failed to handle offer:', err);
+            this.closeRTC(from_session_id);
+            return;
+        }
 
         this.sendWS({
             type: 'webrtc_answer',
@@ -429,18 +683,33 @@ class LADEXApp {
         const { from_session_id, sdp } = msg;
         const pc = this.rtcConnections.get(from_session_id);
         if (!pc) { console.warn('Answer for unknown peer', from_session_id); return; }
-        await pc.setRemoteDescription(new RTCSessionDescription(JSON.parse(sdp)));
-        this.flushPendingCandidates(from_session_id, pc);
+        try {
+            await pc.setRemoteDescription(new RTCSessionDescription(JSON.parse(sdp)));
+            this.flushPendingCandidates(from_session_id, pc);
+        } catch (err) {
+            console.error('Failed to set remote answer:', err);
+            this.closeRTC(from_session_id);
+        }
     }
 
     /** Server relays an ICE candidate. */
     async handleICECandidate(msg) {
         const { from_session_id, candidate } = msg;
         const pc = this.rtcConnections.get(from_session_id);
-        const iceCandidate = new RTCIceCandidate(JSON.parse(candidate));
+        let iceCandidate;
+        try {
+            iceCandidate = new RTCIceCandidate(JSON.parse(candidate));
+        } catch (err) {
+            console.warn('Invalid ICE candidate:', err);
+            return;
+        }
 
         if (pc && pc.remoteDescription) {
-            await pc.addIceCandidate(iceCandidate);
+            try {
+                await pc.addIceCandidate(iceCandidate);
+            } catch (err) {
+                console.warn('ICE add failed:', err);
+            }
         } else {
             // Queue it — the remote description hasn't been set yet
             if (!this.pendingCandidates.has(from_session_id)) {
@@ -472,7 +741,13 @@ class LADEXApp {
         dc.onmessage = (event) => {
             // First message is the JSON header (string)
             if (!meta) {
-                meta = JSON.parse(event.data);
+                try {
+                    meta = JSON.parse(event.data);
+                } catch (err) {
+                    console.error('Invalid file header:', err);
+                    this.closeRTC(fromPeerId);
+                    return;
+                }
                 console.log(`Receiving ${meta.fileName} (${this.formatFileSize(meta.fileSize)}) from ${fromPeerId.slice(-6)}`);
                 this.showProgress(`Downloading ${meta.fileName}`, 0);
                 return;
@@ -501,13 +776,18 @@ class LADEXApp {
             // already handled it.  If not, the transfer was interrupted.
             if (meta && receivedBytes < meta.fileSize) {
                 this.hideProgress();
-                this.showError(`Transfer interrupted: ${meta.fileName}`);
+                this.toast(`Transfer interrupted: ${meta.fileName} — retrying…`, 'warning');
+                this._retryDownload(meta.fileId);
             }
         };
 
         dc.onerror = (err) => {
             console.error('DataChannel error (receiver):', err);
             this.hideProgress();
+            if (meta) {
+                this.toast(`Transfer error: ${meta.fileName} — retrying…`, 'warning');
+                this._retryDownload(meta.fileId);
+            }
         };
     }
 
@@ -523,6 +803,9 @@ class LADEXApp {
         this.saveFileToDisk(file, meta.fileName);
 
         this.hideProgress();
+        this.pendingDownloads.delete(meta.fileId);
+        this.activeTransfers.delete(`retry:${meta.fileId}`);
+        this.toast(`Downloaded ${meta.fileName} (${this.formatFileSize(meta.fileSize)})`, 'success', 5000);
         console.log(`Download complete: ${meta.fileName}`);
 
         // Notify server we now also host this file
@@ -549,7 +832,7 @@ class LADEXApp {
     closeRTC(peerId) {
         const pc = this.rtcConnections.get(peerId);
         if (pc) {
-            pc.close();
+            try { pc.close(); } catch (_) { /* already closed */ }
             this.rtcConnections.delete(peerId);
         }
         this.pendingCandidates.delete(peerId);
@@ -634,6 +917,7 @@ class LADEXApp {
             if (item.type === 'file') {
                 const f = item.data;
                 const hosts = Array.isArray(f.hosts) ? f.hosts : Array.from(f.hosts || []);
+                const isDownloading = this.pendingDownloads.has(f.id);
                 return `
                     <tr class="file-row">
                         <td class="file-name">📄 ${this.escapeHtml(f.name)}</td>
@@ -649,7 +933,7 @@ class LADEXApp {
                         </td>
                         <td class="file-actions">
                             ${hosts.length > 0
-                                ? `<button class="btn download" onclick="app.downloadFile('${f.id}')">⬇️ Download</button>`
+                                ? `<button class="btn download${isDownloading ? ' downloading' : ''}" onclick="app.downloadFile('${f.id}')" ${isDownloading ? 'disabled' : ''}>${isDownloading ? '⏳ Downloading…' : '⬇️ Download'}</button>`
                                 : '<span style="color:#a0aec0;">No hosts</span>'}
                         </td>
                     </tr>`;
@@ -680,6 +964,7 @@ class LADEXApp {
         const fillEl     = document.getElementById('progress-fill');
         const speedEl    = document.getElementById('progress-speed');
         const etaEl      = document.getElementById('progress-eta');
+        const bytesEl    = document.getElementById('progress-bytes');
         if (!modal) return;
 
         if (filenameEl) filenameEl.textContent = filename;
@@ -694,10 +979,28 @@ class LADEXApp {
         if (etaEl) {
             if (etaSeconds != null && isFinite(etaSeconds)) {
                 const s = Math.round(etaSeconds);
-                etaEl.textContent = s < 60 ? `${s}s left` : `${Math.floor(s/60)}m ${s%60}s left`;
+                if (s < 60) etaEl.textContent = `${s}s left`;
+                else if (s < 3600) etaEl.textContent = `${Math.floor(s/60)}m ${s%60}s left`;
+                else etaEl.textContent = `${Math.floor(s/3600)}h ${Math.floor((s%3600)/60)}m left`;
             } else {
                 etaEl.textContent = 'Calculating…';
             }
+        }
+
+        // Show transferred / total bytes
+        if (bytesEl) {
+            // Determine total from an active transfer
+            let transferred = 0, total = 0;
+            for (const [, t] of this.activeTransfers) {
+                if (t.totalBytes) {
+                    transferred = t.bytesSent || 0;
+                    total = t.totalBytes;
+                    break;
+                }
+            }
+            bytesEl.textContent = total > 0
+                ? `${this.formatFileSize(transferred)} / ${this.formatFileSize(total)}`
+                : '';
         }
 
         modal.style.display = 'block';
@@ -709,17 +1012,23 @@ class LADEXApp {
     }
 
     cancelActiveTransfer() {
+        // Mark all current transfers as cancelled so async loops break
+        for (const [id] of this.activeTransfers) {
+            this.cancelledTransfers.add(id);
+        }
         // Close all active RTC connections to abort transfers
         for (const [peerId] of this.rtcConnections) {
             this.closeRTC(peerId);
         }
         this.activeTransfers.clear();
+        this.pendingDownloads.clear();
         this.hideProgress();
+        this.toast('Transfer cancelled', 'info');
     }
 
     showError(message) {
         console.error(message);
-        alert(`Error: ${message}`);
+        this.toast(message, 'error', 6000);
     }
 }
 

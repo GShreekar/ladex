@@ -670,6 +670,14 @@ th:nth-child(5), td:nth-child(5) { width: 15%; }
     justify-content: space-between;
     font-size: 0.9em;
     color: rgba(120, 219, 226, 0.7);
+    margin-bottom: 8px;
+    font-family: 'Orbitron', monospace;
+}
+
+.progress-bytes {
+    text-align: center;
+    font-size: 0.85em;
+    color: rgba(120, 219, 226, 0.5);
     margin-bottom: 20px;
     font-family: 'Orbitron', monospace;
 }
@@ -978,4 +986,92 @@ progress::-webkit-progress-bar {
 progress::-webkit-progress-value {
     background: linear-gradient(90deg, #7877c6, #78dbe2);
     border-radius: 4px;
+}
+
+/* ── Toast notifications ──────────────────────────────────────────────── */
+#toast-container {
+    position: fixed;
+    bottom: 24px;
+    right: 24px;
+    z-index: 9999;
+    display: flex;
+    flex-direction: column-reverse;
+    gap: 10px;
+    pointer-events: none;
+    max-width: 380px;
+}
+
+.toast {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 18px;
+    border-radius: 10px;
+    font-family: 'Orbitron', monospace;
+    font-size: 0.82em;
+    color: #e0e0e0;
+    pointer-events: auto;
+    opacity: 0;
+    transform: translateY(16px) scale(0.96);
+    transition: opacity 0.3s ease, transform 0.3s ease;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+    border: 1px solid rgba(120, 119, 198, 0.25);
+    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+    word-break: break-word;
+}
+
+.toast-visible {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+}
+
+.toast-exit {
+    opacity: 0;
+    transform: translateY(-8px) scale(0.96);
+}
+
+.toast-icon { font-size: 1.2em; flex-shrink: 0; }
+.toast-msg  { flex: 1; }
+
+.toast-info    { border-left: 3px solid #78dbe2; }
+.toast-success { border-left: 3px solid #6bde8a; }
+.toast-error   { border-left: 3px solid #ff6b6b; }
+.toast-warning { border-left: 3px solid #f0c040; }
+
+/* ── Drag-and-drop overlay ────────────────────────────────────────────── */
+body.drag-over::after {
+    content: '📂  Drop files to share';
+    position: fixed;
+    inset: 0;
+    z-index: 8000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: 'Orbitron', monospace;
+    font-size: 1.4em;
+    color: #78dbe2;
+    background: rgba(0, 0, 0, 0.7);
+    border: 3px dashed rgba(120, 219, 226, 0.6);
+    border-radius: 16px;
+    margin: 16px;
+    pointer-events: none;
+    backdrop-filter: blur(4px);
+}
+
+/* ── Downloading button state ─────────────────────────────────────────── */
+.btn.download.downloading {
+    opacity: 0.6;
+    cursor: not-allowed;
+    pointer-events: none;
+    animation: pulse-btn 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse-btn {
+    0%, 100% { opacity: 0.6; }
+    50%      { opacity: 0.35; }
+}
+
+/* ── Progress bar animation ───────────────────────────────────────────── */
+.progress-bar #progress-fill {
+    transition: width 0.25s ease;
 }

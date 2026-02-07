@@ -177,7 +177,7 @@ async fn handle_client_message(
             broadcast(state, ServerMessage::FileListUpdate { files }).await;
         }
 
-        // ── Download request → pick a host and tell it ───────────────────
+        // ── Download request → pick a host (round-robin) ───────────────────
         ClientMessage::RequestDownload {
             session_id: requester_id,
             file_id,
@@ -188,29 +188,37 @@ async fn handle_client_message(
             };
 
             // Don't pick the requester as host for its own file
-            let available: Vec<&SessionId> = file_hosts
-                .iter()
-                .filter(|h| **h != requester_id)
+            let mut available: Vec<SessionId> = file_hosts
+                .into_iter()
+                .filter(|h| *h != requester_id)
                 .collect();
 
-            if let Some(host_id) = available.first() {
-                // Tell only the chosen host to initiate a WebRTC connection
+            if available.is_empty() {
+                send_to(
+                    state,
+                    &requester_id,
+                    ServerMessage::Error {
+                        message: "No hosts available for this file".to_string(),
+                    },
+                )
+                .await;
+            } else {
+                // Round-robin: sort by session_id for determinism, then
+                // rotate based on a simple counter derived from the file_id
+                // hash so different files spread across different hosts.
+                available.sort();
+                let idx = file_id
+                    .bytes()
+                    .fold(0usize, |acc, b| acc.wrapping_add(b as usize))
+                    % available.len();
+                let host_id = &available[idx];
+
                 send_to(
                     state,
                     host_id,
                     ServerMessage::DownloadRequest {
                         file_id,
                         requester_session_id: requester_id,
-                    },
-                )
-                .await;
-            } else {
-                // If this peer is the only host, they already have the file
-                send_to(
-                    state,
-                    &requester_id,
-                    ServerMessage::Error {
-                        message: "No hosts available for this file".to_string(),
                     },
                 )
                 .await;
