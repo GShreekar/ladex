@@ -10,7 +10,8 @@ serde_json = "1.0"
 tokio = { version = "1.47.1", features = ["full"] }
 tokio-tungstenite = "0.20"          # Phase 3: outbound mesh WS connections
 anyhow = "1.0"                      # Phase 3: ergonomic errors in mesh.rs
-tracing = "0.1"                     # structured logging macros (tracing-subscriber provides the backend)
+tracing = "0.1"                     # structured logging macros
+socket2 = { version = "0.5", features = ["all"] }  # Phase 2: SO_REUSEADDR/SO_REUSEPORT on multicast socket
 chrono = { version = "0.4", features = ["serde"] }
 tracing-subscriber = "0.3"
 futures-util = "0.3"

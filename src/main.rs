@@ -10,6 +10,8 @@ mod types;
 mod websocket;
 mod handlers;
 mod mesh;
+mod discovery;
+mod state;
 
 use types::*;
 use include_dir::{include_dir, Dir};
@@ -261,7 +263,7 @@ async fn main() {
                     let addr_clone = addr;
                     tokio::spawn(async move {
                         // Small delay so our own HTTP server is up first.
-                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                         if let Err(e) = mesh::connect_to_peer(addr_clone.ip(), addr_clone.port(), state_clone).await {
                             tracing::warn!("Manual peer connect to {addr_clone} failed: {e}");
                         }
@@ -272,6 +274,63 @@ async fn main() {
                 }
             }
         }
+    }
+
+    // ── Phase 2: UDP multicast discovery ────────────────────────────────
+    // Start announce + listen loops unless --no-discovery was passed.
+    // Discovery is skipped gracefully (with a warning) if the multicast
+    // socket fails to bind (e.g. on systems without a viable NIC at startup).
+    if !args.no_discovery {
+        let announce_packet = discovery::build_announce(&state, args.port);
+        let discovery_port  = args.discovery_port;
+        let state_disc      = state.clone();
+        let passphrase_hash = state.passphrase_hash.clone().unwrap_or_default();
+
+        tokio::spawn(async move {
+            match discovery::DiscoveryService::bind(discovery_port).await {
+                Err(e) => {
+                    tracing::warn!("Discovery: failed to bind multicast socket on port {discovery_port}: {e}");
+                    tracing::warn!("Discovery: running without automatic peer discovery — use --peer <ip:port> to connect manually");
+                }
+                Ok(svc) => {
+                    let svc = std::sync::Arc::new(svc);
+                    let svc_listen = svc.clone();
+                    let state_listen = state_disc.clone();
+                    // Announce loop
+                    tokio::spawn(async move {
+                        if let Err(e) = svc.announce_loop(announce_packet).await {
+                            tracing::error!("Discovery announce loop error: {e}");
+                        }
+                    });
+                    // Listen loop
+                    if let Err(e) = svc_listen.listen_loop(state_listen, passphrase_hash).await {
+                        tracing::error!("Discovery listen loop error: {e}");
+                    }
+                }
+            }
+        });
+    } else {
+        tracing::info!("Discovery: disabled via --no-discovery");
+    }
+
+    // ── Phase 4: periodic tombstone pruner ──────────────────────────────
+    // Cleans up old tombstoned file entries (>60s old) from the in-memory
+    // catalog so it doesn't grow unboundedly.
+    {
+        let state_prune = state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                let mut files = state_prune.files.write().await;
+                let before = files.len();
+                state::prune_tombstones(&mut files);
+                let pruned = before - files.len();
+                if pruned > 0 {
+                    tracing::info!("State: pruned {pruned} stale tombstone(s) from file catalog");
+                }
+            }
+        });
     }
 
     // ── Routes ───────────────────────────────────────────────────────────

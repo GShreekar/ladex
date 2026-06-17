@@ -1,3 +1,19 @@
+// ============================================================================
+// LADEX — Browser-tab WebSocket handler (/ws)
+//
+// Handles messages from THIS node's own browser tab(s).
+// For node-to-node mesh messages, see mesh.rs.
+//
+// Phase 4 additions:
+//   • On FileUpload → push incremental CatalogSync to all mesh peers
+//   • On FileDownloaded (new host registered) → push updated file entry to mesh
+//   • On TextMessage → push ChatMessage to all mesh peers
+//   • On Join → push PeerInfo to all mesh peers
+//   • On cleanup (disconnect) → tombstone file entries whose sole host was
+//     this session, propagate tombstones to mesh
+// ============================================================================
+
+use crate::state;
 use crate::types::*;
 use crate::NodeState;
 use futures_util::{SinkExt, StreamExt};
@@ -37,12 +53,10 @@ pub async fn handle_websocket(ws: WebSocket, state: NodeState) {
     let (mut ws_tx, mut ws_rx) = ws.split();
     let mut session_id: Option<SessionId> = None;
 
-    // Create a per-peer mpsc channel.  The sender half is registered in the
-    // shared map once we know the session_id (on Join).  The receiver half
-    // drives outgoing messages for THIS connection only.
+    // Per-peer mpsc channel — sender stored in local_senders on Join.
     let (peer_tx, mut peer_rx) = mpsc::unbounded_channel::<ServerMessage>();
 
-    // Spawn a task that drains the per-peer receiver and writes to the WS.
+    // Write task: drain mpsc → WS.
     let outgoing_task = tokio::spawn(async move {
         while let Some(msg) = peer_rx.recv().await {
             let json = match serde_json::to_string(&msg) {
@@ -55,27 +69,19 @@ pub async fn handle_websocket(ws: WebSocket, state: NodeState) {
         }
     });
 
-    // Handle incoming messages
+    // Read loop: WS → dispatch.
     while let Some(result) = ws_rx.next().await {
         match result {
             Ok(msg) => {
                 if let Ok(text) = msg.to_str() {
                     if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(text) {
-                        match handle_client_message(
-                            client_msg,
-                            &state,
-                            &mut session_id,
-                            &peer_tx,
-                        )
-                        .await
+                        if let Err(e) =
+                            handle_client_message(client_msg, &state, &mut session_id, &peer_tx)
+                                .await
                         {
-                            Ok(_) => {}
-                            Err(e) => {
-                                // Send the error only to THIS peer, not everyone
-                                let _ = peer_tx.send(ServerMessage::Error {
-                                    message: e.to_string(),
-                                });
-                            }
+                            let _ = peer_tx.send(ServerMessage::Error {
+                                message: e.to_string(),
+                            });
                         }
                     }
                 }
@@ -84,9 +90,8 @@ pub async fn handle_websocket(ws: WebSocket, state: NodeState) {
         }
     }
 
-    // Cleanup when connection closes
+    // Cleanup on disconnect.
     if let Some(id) = &session_id {
-        // Remove sender from shared map first
         {
             let mut senders = state.local_senders.write().await;
             senders.remove(id);
@@ -115,7 +120,6 @@ async fn handle_client_message(
         } => {
             *session_id = Some(id.clone());
 
-            // Register this peer's sender so others can route messages to it
             {
                 let mut senders = state.local_senders.write().await;
                 senders.insert(id.clone(), peer_tx.clone());
@@ -125,9 +129,8 @@ async fn handle_client_message(
                 session_id: id.clone(),
                 connected_at: chrono::Utc::now(),
                 user_agent,
-                // Phase 1: tag this browser session with the hosting node_id
-                // so Phase 5 (decentralized signaling) can route WebRTC signals
-                // to the correct node without a central server.
+                // Phase 1/Phase 4: tag session with this node so mesh peers can
+                // look up which node hosts it (used by Phase 5 signaling relay).
                 hosting_node_id: Some(state.node_id.clone()),
             };
 
@@ -137,14 +140,14 @@ async fn handle_client_message(
                 peers.len()
             };
 
-            // Send current file catalog only to the newly joined peer
+            // Send merged catalog (includes files from remote nodes via Phase 4 sync)
             let files: Vec<FileMetadata> = {
                 let files = state.files.read().await;
-                files.values().cloned().collect()
+                files.values().filter(|f| !f.deleted).cloned().collect()
             };
             let _ = peer_tx.send(ServerMessage::FileListUpdate { files });
 
-            // Send message history only to the newly joined peer
+            // Send full chat history
             let messages = {
                 let messages = state.messages.read().await;
                 messages.clone()
@@ -153,15 +156,18 @@ async fn handle_client_message(
                 let _ = peer_tx.send(ServerMessage::MessageHistory { messages });
             }
 
-            // Notify ALL local browser tabs about the new peer
+            // Notify all local tabs
             broadcast(
                 state,
                 ServerMessage::PeerJoined {
-                    peer,
+                    peer: peer.clone(),
                     total_peers: peers_count,
                 },
             )
             .await;
+
+            // Phase 4: push this new peer to all mesh nodes (incremental PeerSync)
+            state::push_peer_to_mesh(&state.mesh_peers, peer).await;
         }
 
         // ── File catalog ─────────────────────────────────────────────────
@@ -169,33 +175,47 @@ async fn handle_client_message(
             session_id: _,
             mut file,
         } => {
-            // Phase 1: populate created_at for future LWW merge (Phase 4)
+            // Ensure LWW timestamp is populated
             if file.created_at == 0 {
                 file.created_at = chrono::Utc::now().timestamp_millis() as u64;
             }
+            // Clear tombstone fields (fresh upload is always live)
+            file.deleted = false;
+            file.deleted_at = 0;
+
+            let file_for_mesh = file.clone();
             {
                 let mut files = state.files.write().await;
                 files.insert(file.id.clone(), file);
             }
 
+            // Broadcast updated catalog to local tabs (non-deleted only)
             let files: Vec<FileMetadata> = {
                 let files = state.files.read().await;
-                files.values().cloned().collect()
+                files.values().filter(|f| !f.deleted).cloned().collect()
             };
             broadcast(state, ServerMessage::FileListUpdate { files }).await;
+
+            // Phase 4: push single new entry to mesh peers (not the full catalog)
+            state::push_file_to_mesh(&state.mesh_peers, file_for_mesh).await;
         }
 
-        // ── Download request → pick a host (round-robin) ─────────────────
+        // ── Download request → pick a host (round-robin for now) ─────────
+        // Phase 6 will move this selection to the client side; for now the node
+        // still picks, but only from hosts known locally (merged state).
         ClientMessage::RequestDownload {
             session_id: requester_id,
             file_id,
         } => {
             let file_hosts = {
                 let files = state.files.read().await;
-                files.get(&file_id).map(|f| f.hosts.clone()).unwrap_or_default()
+                files
+                    .get(&file_id)
+                    .filter(|f| !f.deleted)
+                    .map(|f| f.hosts.clone())
+                    .unwrap_or_default()
             };
 
-            // Don't pick the requester as host for its own file
             let mut available: Vec<SessionId> = file_hosts
                 .into_iter()
                 .filter(|h| *h != requester_id)
@@ -211,9 +231,6 @@ async fn handle_client_message(
                 )
                 .await;
             } else {
-                // Round-robin: sort by session_id for determinism, then
-                // rotate based on a simple counter derived from the file_id
-                // hash so different files spread across different hosts.
                 available.sort();
                 let idx = file_id
                     .bytes()
@@ -238,21 +255,32 @@ async fn handle_client_message(
             session_id: downloader_id,
             file_id,
         } => {
-            {
+            let updated_file = {
                 let mut files = state.files.write().await;
                 if let Some(file) = files.get_mut(&file_id) {
                     file.hosts.insert(downloader_id);
+                    Some(file.clone())
+                } else {
+                    None
                 }
-            }
+            };
 
+            // Local broadcast
             let files: Vec<FileMetadata> = {
                 let files = state.files.read().await;
-                files.values().cloned().collect()
+                files.values().filter(|f| !f.deleted).cloned().collect()
             };
             broadcast(state, ServerMessage::FileListUpdate { files }).await;
+
+            // Phase 4: push updated file (with new host) to mesh peers
+            if let Some(f) = updated_file {
+                state::push_file_to_mesh(&state.mesh_peers, f).await;
+            }
         }
 
         // ── WebRTC signaling: Offer ───────────────────────────────────────
+        // Phase 5 will intercept these for cross-node routing via SignalRelay.
+        // For now (mesh_mode=false or same-node), deliver locally.
         ClientMessage::WebRTCOffer {
             session_id: from,
             target_session_id,
@@ -320,20 +348,26 @@ async fn handle_client_message(
                 sender_id,
                 sender_name: None,
                 timestamp: chrono::Utc::now(),
-                created_at: now_ms, // Phase 1: for LWW merge (Phase 4)
+                created_at: now_ms,
             };
             {
                 let mut messages = state.messages.write().await;
                 messages.push(message.clone());
+                messages.sort_by_key(|m| m.created_at);
             }
-            broadcast(state, ServerMessage::TextMessage { message }).await;
+
+            // Local broadcast
+            broadcast(state, ServerMessage::TextMessage { message: message.clone() }).await;
+
+            // Phase 4: push to mesh peers so all nodes see the message
+            state::push_message_to_mesh(&state.mesh_peers, message).await;
         }
     }
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// Cleanup
+// Cleanup on browser tab disconnect
 // ---------------------------------------------------------------------------
 
 async fn cleanup_peer(state: &NodeState, session_id: &SessionId) {
@@ -343,24 +377,30 @@ async fn cleanup_peer(state: &NodeState, session_id: &SessionId) {
         peers.len()
     };
 
-    // Remove peer from file hosts; drop files with zero remaining hosts
+    // For every file this session was the sole host of:
+    //   - Set tombstone (deleted=true, deleted_at=now_ms)
+    //   - Propagate to mesh peers (Phase 4)
+    // For files with remaining hosts: just remove this session from the host set.
+    let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+    let mut tombstoned_files: Vec<FileMetadata> = Vec::new();
+
     {
         let mut files = state.files.write().await;
-        let mut to_remove = Vec::new();
-
-        for (file_id, file) in files.iter_mut() {
-            file.hosts.remove(session_id);
-            if file.hosts.is_empty() {
-                to_remove.push(file_id.clone());
+        for file in files.values_mut() {
+            if !file.hosts.contains(session_id) {
+                continue;
             }
-        }
-
-        for file_id in &to_remove {
-            files.remove(file_id);
+            file.hosts.remove(session_id);
+            if file.hosts.is_empty() && !file.deleted {
+                // Tombstone: this node was the only host
+                file.deleted = true;
+                file.deleted_at = now_ms;
+                tombstoned_files.push(file.clone());
+            }
         }
     }
 
-    // Broadcast peer departure + updated catalog
+    // Broadcast peer departure to local tabs
     broadcast(
         state,
         ServerMessage::PeerLeft {
@@ -370,9 +410,18 @@ async fn cleanup_peer(state: &NodeState, session_id: &SessionId) {
     )
     .await;
 
+    // Broadcast updated catalog (without deleted files) to local tabs
     let files: Vec<FileMetadata> = {
         let files = state.files.read().await;
-        files.values().cloned().collect()
+        files.values().filter(|f| !f.deleted).cloned().collect()
     };
     broadcast(state, ServerMessage::FileListUpdate { files }).await;
+
+    // Phase 4: push tombstones to mesh peers
+    for tombstone in tombstoned_files {
+        state::push_file_to_mesh(&state.mesh_peers, tombstone).await;
+    }
+
+    // Phase 4: push peer departure to mesh peers
+    state::push_peer_left_to_mesh(&state.mesh_peers, session_id.clone()).await;
 }

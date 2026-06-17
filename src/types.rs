@@ -63,6 +63,17 @@ pub struct FileMetadata {
     /// Populated on file upload; preserved across catalog sync.
     #[serde(default)]
     pub created_at: u64,
+
+    // ── Phase 4: tombstone support ─────────────────────────────────────────
+    /// True when this file has been deleted.  Tombstones propagate across the
+    /// mesh so all nodes stop advertising the file.  The entry is pruned from
+    /// memory after `deleted_at` is 60+ seconds old (see `state::prune_tombstones`).
+    #[serde(default)]
+    pub deleted: bool,
+    /// Unix-millisecond timestamp of deletion.  Used as the LWW key for
+    /// tombstones (always > `created_at` for the same file).
+    #[serde(default)]
+    pub deleted_at: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
