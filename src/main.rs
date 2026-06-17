@@ -9,6 +9,7 @@ use rand::Rng;
 mod types;
 mod websocket;
 mod handlers;
+mod mesh;
 
 use types::*;
 use include_dir::{include_dir, Dir};
@@ -16,27 +17,56 @@ use include_dir::{include_dir, Dir};
 // Embed the static directory at compile time
 static STATIC_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/static");
 
-type Peers = Arc<RwLock<HashMap<SessionId, PeerInfo>>>;
-type Files = Arc<RwLock<HashMap<String, FileMetadata>>>;
-type Messages = Arc<RwLock<Vec<types::TextMessage>>>;
+// ---------------------------------------------------------------------------
+// Shared type aliases (kept short for use throughout the crate)
+// ---------------------------------------------------------------------------
+
+type LocalPeers = Arc<RwLock<HashMap<SessionId, PeerInfo>>>;
+type Files      = Arc<RwLock<HashMap<String, FileMetadata>>>;
+type Messages   = Arc<RwLock<Vec<types::TextMessage>>>;
+
+// ---------------------------------------------------------------------------
+// Phase 1 — CLI arguments
+//
+// Defines the full CLI surface upfront.  Arguments used by later phases
+// (discovery, manual peers) are parsed now so the surface is stable and
+// callers don't need to change when those phases land.
+// ---------------------------------------------------------------------------
 
 #[derive(Parser)]
 #[command(name = "ladex")]
 #[command(about = "LADEX - Local Area Data Exchange", long_about = None)]
 struct Args {
-    code: Option<String>,
+    /// Optional shared passphrase for joining the mesh.
+    /// Replaces the old numeric security_code.  If omitted, no auth is required.
+    passphrase: Option<String>,
+
+    /// Auto-generate a random passphrase and print it (replaces --secure).
+    /// Equivalent to the old --secure flag for backward compat.
     #[arg(short = 's', long = "secure")]
     secure: bool,
-}
 
-#[derive(Clone)]
-pub struct AppState {
-    pub peers: Peers,
-    pub files: Files,
-    pub messages: Messages,
-    pub senders: types::PeerSenders,
-    pub security_code: Option<String>,
-    pub server_session_id: String,
+    /// Local HTTP/WS port for this node's own browser tab.
+    #[arg(long, default_value = "8080")]
+    port: u16,
+
+    /// UDP multicast discovery port (Phase 2 — not yet used, parsed now for
+    /// CLI stability so callers don't break when Phase 2 lands).
+    #[arg(long, default_value = "7878")]
+    discovery_port: u16,
+
+    /// Disable UDP multicast discovery.
+    /// Useful when testing two nodes on localhost or on networks that block
+    /// multicast.  Combine with --peer to connect manually.
+    #[arg(long)]
+    no_discovery: bool,
+
+    /// Manually specify a peer node to connect to, bypassing multicast
+    /// discovery.  Format: "<ip>:<http_port>" e.g. "192.168.1.5:8080".
+    /// Repeatable: --peer 192.168.1.5:8080 --peer 192.168.1.6:8080
+    /// (Phase 3 — consumed by mesh::connect_to_peer)
+    #[arg(long = "peer")]
+    manual_peers: Vec<String>,
 }
 
 fn generate_random_code() -> String {
@@ -48,16 +78,85 @@ fn validate_code(code: &str) -> bool {
     code.len() == 6 && code.chars().all(|c| c.is_ascii_digit())
 }
 
-fn with_auth(state: AppState) -> impl Filter<Extract = (), Error = warp::Rejection> + Clone {
+// ---------------------------------------------------------------------------
+// Phase 1 — NodeState
+//
+// Replaces AppState.  The conceptual split is:
+//
+//   local_peers / local_senders  — THIS node's own browser tab(s).
+//                                  Usually just one, but the design tolerates
+//                                  more without breaking.
+//
+//   files / messages             — Distributed/merged state.  In the current
+//                                  phase (MESH_MODE=false) this node is the
+//                                  sole source of truth.  Phase 4 adds
+//                                  last-write-wins merge across all nodes.
+//
+//   node_id                      — Identity of THIS node (machine) on the
+//                                  mesh.  Distinct from a browser session_id.
+//                                  Generated once at startup.
+//
+//   mesh_peers                   — Other nodes (machines) on the LAN mesh.
+//                                  Populated in Phase 3; empty until then.
+//
+//   passphrase_hash              — Replaces security_code in Phase 7.
+//                                  Until then, security_code_legacy carries
+//                                  the old numeric code so auth still works.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+pub struct NodeState {
+    // ── local browser tab connections (unchanged from legacy AppState) ───
+    pub local_peers:   LocalPeers,
+    pub local_senders: types::PeerSenders,
+
+    // ── distributed/merged state ─────────────────────────────────────────
+    pub files:    Files,
+    pub messages: Messages,
+
+    // ── mesh identity & membership ───────────────────────────────────────
+    /// Unique identifier for this node (machine).  Stable across browser
+    /// reconnects — it lives in the Rust process, not the browser tab.
+    pub node_id: NodeId,
+
+    /// Connected mesh peer handles keyed by node_id.
+    /// Empty until Phase 3 (Mesh WebSocket Layer) is implemented.
+    pub mesh_peers: mesh::MeshPeers,
+
+    // ── auth ─────────────────────────────────────────────────────────────
+    /// Legacy numeric security code (Phase 0 / pre-Phase-7 auth).
+    /// Kept alongside passphrase_hash so auth continues to work before
+    /// Phase 7 replaces the whole auth system.
+    pub security_code_legacy: Option<String>,
+
+    /// Phase 7 passphrase hash (PBKDF2-SHA256 hex).
+    /// None until Phase 7 is implemented.
+    pub passphrase_hash: Option<String>,
+}
+
+// Convenience accessor — keeps the auth middleware readable.
+impl NodeState {
+    /// Returns the cookie-auth session token string.
+    /// During the pre-Phase-7 period this is the node_id (was server_session_id).
+    pub fn session_token(&self) -> &str {
+        &self.node_id
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Auth middleware
+// ---------------------------------------------------------------------------
+
+fn with_auth(state: NodeState) -> impl Filter<Extract = (), Error = warp::Rejection> + Clone {
     warp::any()
         .and(warp::cookie::optional("auth"))
         .and(warp::any().map(move || state.clone()))
-        .and_then(|auth_cookie: Option<String>, state: AppState| async move {
-            match state.security_code {
+        .and_then(|auth_cookie: Option<String>, state: NodeState| async move {
+            match &state.security_code_legacy {
                 None => Ok(()),
                 Some(_) => match auth_cookie {
                     Some(cookie) => {
-                        let expected_cookie = format!("authenticated:{}", state.server_session_id);
+                        let expected_cookie = format!("authenticated:{}", state.session_token());
                         if cookie == expected_cookie {
                             Ok(())
                         } else {
@@ -98,81 +197,123 @@ async fn serve_login_page() -> Result<Box<dyn warp::Reply>, warp::Rejection> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
-    
+
     let args = Args::parse();
-    
-    // Handle security code logic
-    let security_code = if args.secure {
+
+    // ── passphrase / security code ───────────────────────────────────────
+    // Backward-compat: accept the old 6-digit numeric code on positional arg.
+    // Phase 7 will replace this with proper PBKDF2 hashing; for now we keep
+    // the same cookie-auth behaviour as before.
+    let security_code_legacy = if args.secure {
         let code = generate_random_code();
         println!("Generated security code: {code}");
         Some(code)
-    } else if let Some(code) = args.code {
-        if validate_code(&code) {
-            Some(code)
+    } else if let Some(ref p) = args.passphrase {
+        // If it looks like the old 6-digit code, accept it as-is.
+        if validate_code(p) {
+            Some(p.clone())
         } else {
-            eprintln!("Error: Security code must be exactly 6 digits");
-            std::process::exit(1);
+            // Non-numeric passphrase: store for Phase 7 hash; no legacy cookie auth.
+            // Until Phase 7 lands, just print a warning and skip auth.
+            eprintln!("Note: non-numeric passphrase provided — mesh auth will be enforced in Phase 7.  Running without HTTP auth for now.");
+            None
         }
     } else {
         None
     };
-    
-    let server_session_id = {
+
+    // ── node identity ────────────────────────────────────────────────────
+    // node_id identifies THIS machine on the mesh.  Different from a browser
+    // tab's session_id.  Generated once per process lifetime.
+    let node_id: NodeId = {
         let mut rng = rand::thread_rng();
-        format!("server_session_{}", rng.gen::<u64>())
-    };
-    
-    let app_state = AppState {
-        peers: Arc::new(RwLock::new(HashMap::new())),
-        files: Arc::new(RwLock::new(HashMap::new())),
-        messages: Arc::new(RwLock::new(Vec::new())),
-        senders: Arc::new(RwLock::new(HashMap::new())),
-        security_code,
-        server_session_id,
+        format!("node_{:016x}", rng.gen::<u64>())
     };
 
-    // Login page route - not protected
-    let app_state_login = app_state.clone();
+    tracing::info!("Node ID: {node_id}");
+
+    let state = NodeState {
+        local_peers:          Arc::new(RwLock::new(HashMap::new())),
+        local_senders:        Arc::new(RwLock::new(HashMap::new())),
+        files:                Arc::new(RwLock::new(HashMap::new())),
+        messages:             Arc::new(RwLock::new(Vec::new())),
+        node_id:              node_id.clone(),
+        mesh_peers:           Arc::new(RwLock::new(HashMap::new())),
+        security_code_legacy,
+        passphrase_hash:      None, // Phase 7
+    };
+
+    // ── Phase 3: connect to manually-specified peers ─────────────────────
+    // These are processed before the HTTP server starts so the mesh is
+    // partially formed by the time the browser tab connects.
+    if !args.manual_peers.is_empty() {
+        for peer_addr_str in &args.manual_peers {
+            match peer_addr_str.parse::<SocketAddr>() {
+                Ok(addr) => {
+                    let state_clone = state.clone();
+                    let addr_clone = addr;
+                    tokio::spawn(async move {
+                        // Small delay so our own HTTP server is up first.
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        if let Err(e) = mesh::connect_to_peer(addr_clone.ip(), addr_clone.port(), state_clone).await {
+                            tracing::warn!("Manual peer connect to {addr_clone} failed: {e}");
+                        }
+                    });
+                }
+                Err(_) => {
+                    eprintln!("Warning: invalid --peer address '{peer_addr_str}' — expected format: <ip>:<port>");
+                }
+            }
+        }
+    }
+
+    // ── Routes ───────────────────────────────────────────────────────────
+
+    // Login page — not protected
+    let app_state_login = state.clone();
     let login_route = warp::path("login")
         .and(warp::get())
         .and(warp::any().map(move || app_state_login.clone()))
-        .and_then(|state: AppState| async move {
-            if state.security_code.is_some() {
+        .and_then(|s: NodeState| async move {
+            if s.security_code_legacy.is_some() {
                 serve_login_page().await
             } else {
-                // No auth required, redirect to main page
                 let redirect = warp::redirect::temporary(warp::http::Uri::from_static("/"));
                 Ok::<_, warp::Rejection>(Box::new(redirect) as Box<dyn warp::Reply>)
             }
         });
 
-    // Auth endpoint
-    let app_state_auth = app_state.clone();
+    // Auth endpoint — not protected
+    let app_state_auth = state.clone();
     let auth_route = warp::path("auth")
         .and(warp::post())
         .and(warp::body::json())
         .and(warp::any().map(move || app_state_auth.clone()))
         .and_then(handlers::authenticate);
 
-    // Logout endpoint - not protected
+    // Logout — not protected
     let logout_route = warp::path("logout")
         .and(warp::post())
         .and_then(handlers::logout);
 
-    // Auth status check endpoint - not protected
+    // Auth-status check — not protected
     let auth_status_route = warp::path("auth-status")
         .and(warp::get())
         .and(warp::header::optional::<String>("cookie"))
         .and(warp::any().map({
-            let app_state = app_state.clone();
-            move || app_state.clone()
+            let s = state.clone();
+            move || s.clone()
         }))
         .and_then(handlers::check_auth_status);
 
-    // Serve embedded static assets under /static/<path> - not protected
+    // Static assets — not protected
     let static_route = warp::path("static")
         .and(warp::path::tail())
         .and_then(|tail: warp::filters::path::Tail| async move {
@@ -190,10 +331,38 @@ async fn main() {
                 Err(warp::reject::not_found())
             }
         });
-    
-    // Serve embedded index.html at root - protected
+
+    // Phase 3 — Mesh WebSocket endpoint /mesh (node-to-node, not browser-facing).
+    // Separate from /ws intentionally: mesh peers and browser tabs have
+    // different message protocols and different lifecycle semantics.
+    let mesh_state = state.clone();
+    let mesh_route = warp::path("mesh")
+        .and(warp::ws())
+        .and(warp::any().map(move || mesh_state.clone()))
+        .and_then(mesh::mesh_ws_handler);
+
+    // Browser-tab WebSocket /ws — protected
+    let app_state_ws = state.clone();
+    let websocket_route = warp::path("ws")
+        .and(with_auth(state.clone()))
+        .and(warp::ws())
+        .and(warp::any().map(move || app_state_ws.clone()))
+        .and_then(websocket::websocket_handler);
+
+    // API — protected
+    let app_state_api = state.clone();
+    let api = warp::path("api")
+        .and(with_auth(state.clone()))
+        .and(
+            warp::path("peers")
+                .and(warp::get())
+                .and(warp::any().map(move || app_state_api.clone()))
+                .and_then(handlers::get_peers)
+        );
+
+    // Root — protected
     let index = warp::path::end()
-        .and(with_auth(app_state.clone()))
+        .and(with_auth(state.clone()))
         .and_then(|| async move {
             let lookup = "index.html".to_string();
             if let Some(file) = STATIC_DIR.get_file(&lookup) {
@@ -209,51 +378,32 @@ async fn main() {
             }
         });
 
-    // WebSocket endpoint - protected
-    let app_state_ws = app_state.clone();
-    let websocket = warp::path("ws")
-        .and(with_auth(app_state.clone()))
-        .and(warp::ws())
-        .and(warp::any().map(move || app_state_ws.clone()))
-        .and_then(websocket::websocket_handler);
-
-    // API endpoints - protected
-    let app_state_api = app_state.clone();
-    let api = warp::path("api")
-        .and(with_auth(app_state.clone()))
-        .and(
-            warp::path("peers")
-                .and(warp::get())
-                .and(warp::any().map(move || app_state_api.clone()))
-                .and_then(handlers::get_peers)
-        );
-
     let cors = warp::cors()
         .allow_any_origin()
         .allow_headers(vec!["content-type"])
         .allow_methods(vec!["GET", "POST", "PUT", "DELETE"]);
 
-    // IMPORTANT: More specific routes first, unprotected routes before protected ones
+    // Important: more specific routes first; unprotected before protected.
+    // /mesh must come before /ws so the path pattern doesn't shadow it.
     let routes = login_route
         .or(auth_route)
         .or(logout_route)
         .or(auth_status_route)
         .or(static_route)
-        .or(websocket)
+        .or(mesh_route)
+        .or(websocket_route)
         .or(api)
         .or(index)
         .with(cors)
         .recover(handle_rejection);
 
-    let addr: SocketAddr = ([0, 0, 0, 0], 8080).into();
+    let addr: SocketAddr = ([0, 0, 0, 0], args.port).into();
     let local_ip = get_local_ip().unwrap_or_else(|| "YOUR_IP".to_string());
-    
-    println!("Access locally: http://localhost:8080");
-    println!("Access from network: http://{local_ip}:8080");
-    
-    warp::serve(routes)
-        .run(addr)
-        .await;
+
+    println!("Access locally: http://localhost:{}", args.port);
+    println!("Access from network: http://{local_ip}:{}", args.port);
+
+    warp::serve(routes).run(addr).await;
 }
 
 fn get_local_ip() -> Option<String> {

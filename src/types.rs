@@ -10,11 +10,33 @@ pub type SessionId = String;
 pub type PeerSender = mpsc::UnboundedSender<ServerMessage>;
 pub type PeerSenders = Arc<RwLock<HashMap<SessionId, PeerSender>>>;
 
+// ---------------------------------------------------------------------------
+// Phase 1 — node identity
+// ---------------------------------------------------------------------------
+
+/// Identifies this node (machine) on the mesh.  Distinct from a browser tab's
+/// `session_id` — every node generates one `node_id` on startup, regardless
+/// of how many browser tabs connect to it locally.
+///
+/// In the current single-server phase (MESH_MODE=false) this is only used for
+/// cookie auth invalidation; the mesh layer (Phase 3) uses it to route messages.
+pub type NodeId = String;
+
+// ---------------------------------------------------------------------------
+// Peer / file / message data
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerInfo {
     pub session_id: SessionId,
     pub connected_at: chrono::DateTime<chrono::Utc>,
     pub user_agent: Option<String>,
+    /// Which node (machine) hosts this browser session.
+    /// Set to the local node_id when registering a local peer.
+    /// Used in Phase 5 (decentralized signaling) to route WebRTC signals
+    /// to the correct node without a central server.
+    #[serde(default)]
+    pub hosting_node_id: Option<NodeId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +59,10 @@ pub struct FileMetadata {
     pub uploader_id: SessionId,
     pub hosts: HashSet<SessionId>,
     pub uploaded_at: chrono::DateTime<chrono::Utc>,
+    /// Unix-millisecond timestamp used for last-write-wins merge (Phase 4).
+    /// Populated on file upload; preserved across catalog sync.
+    #[serde(default)]
+    pub created_at: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,6 +72,9 @@ pub struct TextMessage {
     pub sender_id: SessionId,
     pub sender_name: Option<String>,
     pub timestamp: chrono::DateTime<chrono::Utc>,
+    /// Unix-millisecond timestamp for LWW merge (Phase 4).
+    #[serde(default)]
+    pub created_at: u64,
 }
 
 // ---------------------------------------------------------------------------

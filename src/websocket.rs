@@ -1,11 +1,11 @@
 use crate::types::*;
-use crate::AppState;
+use crate::NodeState;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use warp::ws::{Message, WebSocket, Ws};
 use warp::{Rejection, Reply};
 
-pub async fn websocket_handler(ws: Ws, state: AppState) -> Result<impl Reply, Rejection> {
+pub async fn websocket_handler(ws: Ws, state: NodeState) -> Result<impl Reply, Rejection> {
     Ok(ws.on_upgrade(move |socket| handle_websocket(socket, state)))
 }
 
@@ -13,17 +13,17 @@ pub async fn websocket_handler(ws: Ws, state: AppState) -> Result<impl Reply, Re
 // Helpers: broadcast to all peers / send to a single peer
 // ---------------------------------------------------------------------------
 
-/// Send a message to every connected peer.
-async fn broadcast(state: &AppState, msg: ServerMessage) {
-    let senders = state.senders.read().await;
+/// Send a message to every connected browser tab on THIS node.
+pub async fn broadcast(state: &NodeState, msg: ServerMessage) {
+    let senders = state.local_senders.read().await;
     for sender in senders.values() {
         let _ = sender.send(msg.clone());
     }
 }
 
-/// Send a message to a single peer identified by session id.
-async fn send_to(state: &AppState, target: &SessionId, msg: ServerMessage) {
-    let senders = state.senders.read().await;
+/// Send a message to a single browser tab identified by session id.
+pub async fn send_to(state: &NodeState, target: &SessionId, msg: ServerMessage) {
+    let senders = state.local_senders.read().await;
     if let Some(sender) = senders.get(target) {
         let _ = sender.send(msg);
     }
@@ -33,7 +33,7 @@ async fn send_to(state: &AppState, target: &SessionId, msg: ServerMessage) {
 // WebSocket lifecycle
 // ---------------------------------------------------------------------------
 
-pub async fn handle_websocket(ws: WebSocket, state: AppState) {
+pub async fn handle_websocket(ws: WebSocket, state: NodeState) {
     let (mut ws_tx, mut ws_rx) = ws.split();
     let mut session_id: Option<SessionId> = None;
 
@@ -88,7 +88,7 @@ pub async fn handle_websocket(ws: WebSocket, state: AppState) {
     if let Some(id) = &session_id {
         // Remove sender from shared map first
         {
-            let mut senders = state.senders.write().await;
+            let mut senders = state.local_senders.write().await;
             senders.remove(id);
         }
         cleanup_peer(&state, id).await;
@@ -103,7 +103,7 @@ pub async fn handle_websocket(ws: WebSocket, state: AppState) {
 
 async fn handle_client_message(
     msg: ClientMessage,
-    state: &AppState,
+    state: &NodeState,
     session_id: &mut Option<SessionId>,
     peer_tx: &PeerSender,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -117,7 +117,7 @@ async fn handle_client_message(
 
             // Register this peer's sender so others can route messages to it
             {
-                let mut senders = state.senders.write().await;
+                let mut senders = state.local_senders.write().await;
                 senders.insert(id.clone(), peer_tx.clone());
             }
 
@@ -125,10 +125,14 @@ async fn handle_client_message(
                 session_id: id.clone(),
                 connected_at: chrono::Utc::now(),
                 user_agent,
+                // Phase 1: tag this browser session with the hosting node_id
+                // so Phase 5 (decentralized signaling) can route WebRTC signals
+                // to the correct node without a central server.
+                hosting_node_id: Some(state.node_id.clone()),
             };
 
             let peers_count = {
-                let mut peers = state.peers.write().await;
+                let mut peers = state.local_peers.write().await;
                 peers.insert(id.clone(), peer.clone());
                 peers.len()
             };
@@ -149,7 +153,7 @@ async fn handle_client_message(
                 let _ = peer_tx.send(ServerMessage::MessageHistory { messages });
             }
 
-            // Notify ALL peers about the new peer
+            // Notify ALL local browser tabs about the new peer
             broadcast(
                 state,
                 ServerMessage::PeerJoined {
@@ -163,8 +167,12 @@ async fn handle_client_message(
         // ── File catalog ─────────────────────────────────────────────────
         ClientMessage::FileUpload {
             session_id: _,
-            file,
+            mut file,
         } => {
+            // Phase 1: populate created_at for future LWW merge (Phase 4)
+            if file.created_at == 0 {
+                file.created_at = chrono::Utc::now().timestamp_millis() as u64;
+            }
             {
                 let mut files = state.files.write().await;
                 files.insert(file.id.clone(), file);
@@ -177,7 +185,7 @@ async fn handle_client_message(
             broadcast(state, ServerMessage::FileListUpdate { files }).await;
         }
 
-        // ── Download request → pick a host (round-robin) ───────────────────
+        // ── Download request → pick a host (round-robin) ─────────────────
         ClientMessage::RequestDownload {
             session_id: requester_id,
             file_id,
@@ -244,7 +252,7 @@ async fn handle_client_message(
             broadcast(state, ServerMessage::FileListUpdate { files }).await;
         }
 
-        // ── WebRTC signaling: Offer ──────────────────────────────────────
+        // ── WebRTC signaling: Offer ───────────────────────────────────────
         ClientMessage::WebRTCOffer {
             session_id: from,
             target_session_id,
@@ -261,7 +269,7 @@ async fn handle_client_message(
             .await;
         }
 
-        // ── WebRTC signaling: Answer ─────────────────────────────────────
+        // ── WebRTC signaling: Answer ──────────────────────────────────────
         ClientMessage::WebRTCAnswer {
             session_id: from,
             target_session_id,
@@ -295,26 +303,24 @@ async fn handle_client_message(
             .await;
         }
 
-        // ── Ping / Pong ──────────────────────────────────────────────────
+        // ── Ping / Pong ───────────────────────────────────────────────────
         ClientMessage::Ping { session_id: _ } => {
             let _ = peer_tx.send(ServerMessage::Pong);
         }
 
-        // ── Text messaging ───────────────────────────────────────────────
+        // ── Text messaging ────────────────────────────────────────────────
         ClientMessage::TextMessage {
             session_id: sender_id,
             content,
         } => {
+            let now_ms = chrono::Utc::now().timestamp_millis() as u64;
             let message = TextMessage {
-                id: format!(
-                    "msg_{}_{}",
-                    sender_id,
-                    chrono::Utc::now().timestamp_millis()
-                ),
+                id: format!("msg_{}_{}", sender_id, now_ms),
                 content,
                 sender_id,
                 sender_name: None,
                 timestamp: chrono::Utc::now(),
+                created_at: now_ms, // Phase 1: for LWW merge (Phase 4)
             };
             {
                 let mut messages = state.messages.write().await;
@@ -330,9 +336,9 @@ async fn handle_client_message(
 // Cleanup
 // ---------------------------------------------------------------------------
 
-async fn cleanup_peer(state: &AppState, session_id: &SessionId) {
+async fn cleanup_peer(state: &NodeState, session_id: &SessionId) {
     let peers_count = {
-        let mut peers = state.peers.write().await;
+        let mut peers = state.local_peers.write().await;
         peers.remove(session_id);
         peers.len()
     };

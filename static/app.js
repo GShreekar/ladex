@@ -408,18 +408,20 @@ class LADEXApp {
     // =====================================================================
 
     getRTCConfig() {
-        // On a LAN, STUN is technically unnecessary, but it helps with
-        // host-candidate gathering on some platforms.
-        // For localhost testing, use a public TURN server (relay).
+        // Phase 0 (LAN-only): STUN/TURN removed.
+        //
+        // On a single Wi-Fi/hotspot subnet, all peers are L2-adjacent —
+        // ICE resolves to "typ host" local-IP candidates directly.
+        // STUN adds an unnecessary external round-trip; TURN is dead weight
+        // (we don't have NAT traversal problems on a LAN).
+        //
+        // If connection establishment fails in testing, the first step is to
+        // confirm both devices are on the same subnet.  Do NOT re-add STUN
+        // as a workaround without first ruling out AP/client isolation
+        // (see ROADMAP.md §1.4).
         return {
-            iceServers: [
-                { urls: 'stun:stun.l.google.com:19302' },
-                {
-                    urls: 'turn:openrelay.metered.ca:80',
-                    username: 'openrelayproject',
-                    credential: 'openrelayproject',
-                },
-            ],
+            iceServers: [],         // LAN-only: host candidates suffice
+            iceCandidatePoolSize: 0,
         };
     }
 
