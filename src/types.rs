@@ -37,6 +37,12 @@ pub struct PeerInfo {
     /// to the correct node without a central server.
     #[serde(default)]
     pub hosting_node_id: Option<NodeId>,
+    /// Round-trip latency (ms) from THIS node to the node hosting this peer.
+    /// Populated / updated by the Phase 6 Ping/Pong loop.
+    /// `None` until at least one Pong is received.
+    /// Exposed to browser tabs via PeerSync so clients can pick the fastest host.
+    #[serde(default)]
+    pub node_rtt_ms: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,7 +154,25 @@ pub enum ClientMessage {
         candidate: String,
     },
 
-    // ── Misc ─────────────────────────────────────────────────────────────
+    /// Phase 6: Requester explicitly names the host it chose (client-side selection).
+    /// The node honors this choice without override.  Returns an error if the
+    /// named peer is unreachable rather than silently rerouting.
+    #[serde(rename = "request_download_from")]
+    RequestDownloadFrom {
+        session_id: SessionId,
+        file_id: String,
+        /// The specific peer session ID the client chose as host.
+        host_peer_id: SessionId,
+    },
+
+    /// Phase 5: Receiver signals it does not want the incoming file.
+    /// Causes the sender to surface a rejection toast instead of stalling.
+    #[serde(rename = "transfer_declined")]
+    TransferDeclined {
+        session_id: SessionId,
+        file_id: String,
+    },
+
     #[serde(rename = "ping")]
     Ping {
         session_id: SessionId,
@@ -191,6 +215,13 @@ pub enum ServerMessage {
     #[serde(rename = "file_removed")]
     FileRemoved {
         file_id: String,
+    },
+
+    /// Phase 6: Incremental peer list update (e.g. RTT change).
+    /// Browser tab merges these into its local peer map for host selection.
+    #[serde(rename = "peer_sync")]
+    PeerSync {
+        peers: Vec<PeerInfo>,
     },
 
     /// Server tells a host: "peer X wants file Y — initiate WebRTC to them"
@@ -239,6 +270,22 @@ pub enum ServerMessage {
     #[serde(rename = "message_history")]
     MessageHistory {
         messages: Vec<TextMessage>,
+    },
+
+    /// Phase 5: Receiver declined the incoming file transfer.
+    /// Delivered to the sender so it can toast the user instead of stalling.
+    #[serde(rename = "transfer_declined")]
+    TransferDeclined {
+        file_id: String,
+        from_session_id: SessionId,
+    },
+
+    /// Phase 6: The explicitly named host peer was not found / not reachable.
+    /// Client should retry with a different host selection.
+    #[serde(rename = "host_unreachable")]
+    HostUnreachable {
+        file_id: String,
+        host_peer_id: SessionId,
     },
 }
 

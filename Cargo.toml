@@ -19,4 +19,6 @@ include_dir = "0.7"
 mime_guess = "2.0"
 rand = "0.8"
 clap = { version = "4.0", features = ["derive"] }
+ring = "0.17"                       # Phase 7: PBKDF2-SHA256 passphrase hashing
+hex = "0.4"                         # Phase 7: hex-encode the derived key
 

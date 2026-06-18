@@ -18,6 +18,8 @@ class LADEXApp {
         this.peers = new Map();
         this.messages = [];
         this.serverFiles = [];
+        // Phase 6: RTT-aware peer map (same data as this.peers but refreshed via peer_sync)
+        // node_rtt_ms is stored on each PeerInfo when received from the server.
 
         // ── WebRTC state ────────────────────────────────────────────────
         // Active RTCPeerConnections keyed by remote sessionId.
@@ -198,6 +200,21 @@ class LADEXApp {
                 // Clean up any RTC connection to that peer
                 this.closeRTC(msg.session_id);
                 break;
+            // Phase 6: incremental peer list update (RTT changes)
+            case 'peer_sync':
+                if (msg.peers) {
+                    for (const peer of msg.peers) {
+                        if (peer.hosting_node_id == null) {
+                            // Departure tombstone
+                            this.peers.delete(peer.session_id);
+                        } else {
+                            // Merge: update RTT without overwriting other fields
+                            const existing = this.peers.get(peer.session_id) || {};
+                            this.peers.set(peer.session_id, { ...existing, ...peer });
+                        }
+                    }
+                }
+                break;
 
             // ── file catalog ────────────────────────────────────────────
             case 'file_list_update':
@@ -206,10 +223,24 @@ class LADEXApp {
                 break;
 
             // ── download orchestration ──────────────────────────────────
-            // Server tells US (a host) to send a file to a requester.
-            // We are the host → create an RTC offer and stream the file.
             case 'download_request':
                 this.handleDownloadRequest(msg);
+                break;
+
+            // Phase 6: host not reachable — let client retry with different host
+            case 'host_unreachable':
+                this.pendingDownloads.delete(msg.file_id);
+                this.toast(
+                    `Host ${msg.host_peer_id.slice(-6)} unreachable — choose another or retry`,
+                    'warning', 5000
+                );
+                this.hideProgress();
+                break;
+
+            // Phase 5: remote receiver declined the file
+            case 'transfer_declined':
+                this.toast(`Receiver declined the file transfer`, 'warning', 5000);
+                this.hideProgress();
                 break;
 
             // ── WebRTC signaling ────────────────────────────────────────
@@ -334,14 +365,13 @@ class LADEXApp {
     //  DOWNLOAD REQUEST — with retry
     // =====================================================================
 
-    /** User clicks "Download" — tell the server we want this file. */
+    /** User clicks "Download" — Phase 6: client selects host, sends request_download_from. */
     downloadFile(fileId) {
-        // Prevent double-clicks / concurrent downloads of the same file
         if (this.pendingDownloads.has(fileId)) {
             this.toast('Download already in progress', 'warning');
             return;
         }
-        // Check: if WE already have the file locally, just save it.
+        // If WE already have the file locally, just save it.
         const localFile = this.getFile(fileId);
         if (localFile) {
             this.saveFileToDisk(localFile, localFile.name);
@@ -350,6 +380,35 @@ class LADEXApp {
         }
         this.pendingDownloads.add(fileId);
         this._requestDownloadWithRetry(fileId, 0);
+    }
+
+    /**
+     * Phase 6: Pick the best host from the merged peer list using RTT.
+     * Falls back to random if RTT data isn't available yet.
+     * Returns null if no suitable host is found.
+     */
+    _pickBestHost(fileId) {
+        const fileMeta = this.serverFiles.find(f => f.id === fileId);
+        if (!fileMeta) return null;
+
+        const hosts = Array.isArray(fileMeta.hosts)
+            ? fileMeta.hosts
+            : Array.from(fileMeta.hosts || []);
+
+        // Exclude ourselves (we don't have it locally or we'd have returned early)
+        const candidates = hosts.filter(h => h !== this.sessionId);
+        if (candidates.length === 0) return null;
+
+        // Sort by RTT: peers with known RTT first (ascending), then unknown.
+        candidates.sort((a, b) => {
+            const peerA = this.peers.get(a);
+            const peerB = this.peers.get(b);
+            const rttA = peerA?.node_rtt_ms ?? Infinity;
+            const rttB = peerB?.node_rtt_ms ?? Infinity;
+            return rttA - rttB;
+        });
+
+        return candidates[0]; // Best known host
     }
 
     _requestDownloadWithRetry(fileId, attempt) {
@@ -363,10 +422,23 @@ class LADEXApp {
             const name = this._fileNameFromCatalog(fileId) || fileId.slice(-8);
             this.toast(`Retrying download of ${name} (attempt ${attempt + 1}/${this.MAX_RETRIES})…`, 'warning');
         }
-        console.log(`Requesting download for ${fileId} (attempt ${attempt + 1})`);
-        // Store attempt info so the receiver side can retry on failure
+
+        // Phase 6: client picks the host explicitly
+        const chosenHost = this._pickBestHost(fileId);
+        if (!chosenHost) {
+            // No eligible host known yet — fall back to server-side selection
+            this.sendWS({ type: 'request_download', session_id: this.sessionId, file_id: fileId });
+            return;
+        }
+
+        console.log(`Requesting ${fileId} from host ${chosenHost.slice(-6)} (attempt ${attempt + 1}, Phase 6 client selection)`);
         this.activeTransfers.set(`retry:${fileId}`, { attempt, fileId });
-        this.sendWS({ type: 'request_download', session_id: this.sessionId, file_id: fileId });
+        this.sendWS({
+            type: 'request_download_from',
+            session_id: this.sessionId,
+            file_id: fileId,
+            host_peer_id: chosenHost,
+        });
     }
 
     /** Look up a file's display name from the server catalog. */

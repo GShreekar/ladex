@@ -153,26 +153,22 @@ pub async fn apply_catalog_sync(state: &NodeState, incoming: Vec<FileMetadata>) 
     websocket::broadcast(state, ServerMessage::FileListUpdate { files: updated }).await;
 }
 
-/// Apply an incoming peer sync and fan out the updated peer count to local tabs.
+/// Apply an incoming peer sync and fan out the updated peer list to local tabs.
 pub async fn apply_peer_sync(state: &NodeState, incoming: Vec<PeerInfo>) {
-    let total = {
+    let updated_peers: Vec<PeerInfo> = {
         let mut peers = state.local_peers.write().await;
-        merge_peers(&mut peers, incoming);
-        peers.len()
+        for peer in &incoming {
+            merge_peers(&mut peers, vec![peer.clone()]);
+        }
+        incoming
     };
-    // The browser uses PeerJoined/PeerLeft events for incremental updates;
-    // a full re-sync is represented as a sequence of PeerJoined messages.
-    // For simplicity in Phase 4, we send a full list as PeerJoined messages
-    // only for entries the tab hasn't seen yet (identified by no existing
-    // entry in local_senders — i.e. remote peers).
-    //
-    // In practice, the browser tab's peer count display is driven by
-    // `total_peers` in PeerJoined/PeerLeft.  We update it via a synthetic
-    // PeerLeft + PeerJoined cycle only when truly necessary.
-    // For now, just update the count display via an aggregate message.
-    // (Phase 6 will refine this when RTT data is added.)
-    let _ = total; // count not used further; tabs see peers through their PeerJoined events
+    // Phase 6: broadcast incremental PeerSync to browser tabs so client-side
+    // host selection can incorporate RTT data from remote nodes.
+    if !updated_peers.is_empty() {
+        websocket::broadcast(state, ServerMessage::PeerSync { peers: updated_peers }).await;
+    }
 }
+
 
 /// Apply an incoming chat sync and fan out the full history to local tabs.
 pub async fn apply_chat_sync(state: &NodeState, incoming: Vec<TextMessage>) {
@@ -251,6 +247,7 @@ pub async fn push_peer_left_to_mesh(mesh_peers: &MeshPeers, session_id: SessionI
         connected_at: chrono::DateTime::<chrono::Utc>::MIN_UTC,
         user_agent: None,
         hosting_node_id: None, // None = departed / offline
+        node_rtt_ms: None,
     };
     push_peer_to_mesh(mesh_peers, departed).await;
 }

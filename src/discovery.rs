@@ -44,6 +44,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
 
 use crate::mesh;
+use crate::auth;
 use crate::NodeState;
 
 // ---------------------------------------------------------------------------
@@ -211,11 +212,16 @@ impl DiscoveryService {
                 continue;
             }
 
-            // Phase 7: passphrase pre-filter (skip when no passphrase configured)
-            if !passphrase_hash.is_empty()
-                && !packet.passphrase_hash.is_empty()
-                && packet.passphrase_hash != passphrase_hash
-            {
+            // Phase 7: passphrase pre-filter (check 1 of 3).
+            // Enforces that secured and unsecured meshes never mix:
+            //   - If our hash is empty and packet's is not (or vice versa) → skip.
+            //   - If both are empty → no-passphrase mesh, allow.
+            //   - If both non-empty but different → skip.
+            // The Hello/HelloAck check (check 2) enforces this again in the TCP handshake.
+            if !auth::hashes_match(
+                &passphrase_hash,
+                &packet.passphrase_hash,
+            ) {
                 tracing::debug!(
                     "Discovery: ignoring {} — passphrase mismatch",
                     packet.node_id

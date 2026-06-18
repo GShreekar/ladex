@@ -11,9 +11,10 @@
 // ============================================================================
 
 export const FEATURES = {
-    // Phase 1-7: symmetric node mesh instead of central server.
-    // Keep false until Phase 7 is fully validated on real hardware.
-    MESH_MODE: false,
+    // Phases 1-7: symmetric node mesh + decentralized signaling + passphrase auth.
+    // Phase 5 (SignalRelay), Phase 6 (client-side RTT host selection), and
+    // Phase 7 (PBKDF2-SHA256 passphrase enforcement) are complete. Flag is now true.
+    MESH_MODE: true,
 
     // Phase 8: stream received chunks straight to disk via the File System
     // Access API (showSaveFilePicker + createWritable).  Defaults true

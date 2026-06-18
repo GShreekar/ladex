@@ -12,6 +12,7 @@ mod handlers;
 mod mesh;
 mod discovery;
 mod state;
+mod auth;
 
 use types::*;
 use include_dir::{include_dir, Dir};
@@ -241,6 +242,18 @@ async fn main() {
 
     tracing::info!("Node ID: {node_id}");
 
+    // ── Phase 7: passphrase hash ─────────────────────────────────────────
+    // Compute PBKDF2-SHA256 hash now so it can be placed in AnnouncePacket
+    // and MeshMessage::Hello.  This replaces the old plain-text comparison.
+    // Empty passphrase produces an empty hash → no-passphrase mesh nodes
+    // only connect to other no-passphrase nodes.
+    let passphrase_for_hash: Option<&str> = args.passphrase.as_deref()
+        .filter(|p| !validate_code(p)); // non-numeric = new-style passphrase
+    let passphrase_hash_value = auth::derive_hash(passphrase_for_hash);
+    if !passphrase_hash_value.is_empty() {
+        tracing::info!("Phase 7: passphrase hash computed (PBKDF2-SHA256)");
+    }
+
     let state = NodeState {
         local_peers:          Arc::new(RwLock::new(HashMap::new())),
         local_senders:        Arc::new(RwLock::new(HashMap::new())),
@@ -249,7 +262,7 @@ async fn main() {
         node_id:              node_id.clone(),
         mesh_peers:           Arc::new(RwLock::new(HashMap::new())),
         security_code_legacy,
-        passphrase_hash:      None, // Phase 7
+        passphrase_hash:      Some(passphrase_hash_value),
     };
 
     // ── Phase 3: connect to manually-specified peers ─────────────────────
