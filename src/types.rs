@@ -43,6 +43,26 @@ pub struct PeerInfo {
     /// Exposed to browser tabs via PeerSync so clients can pick the fastest host.
     #[serde(default)]
     pub node_rtt_ms: Option<u32>,
+
+    // ── BUG-08 fix: explicit departure tombstone ─────────────────────────
+    // Mirrors FileMetadata's deleted/deleted_at (see below). Departure used
+    // to be signalled by a PeerInfo with `hosting_node_id: None` and
+    // `connected_at` set to `DateTime::MIN_UTC`, on the theory that a
+    // "sentinel" PeerInfo would merge in like any other update — but
+    // `merge_peers`'s LWW rule was `incoming.connected_at >
+    // existing.connected_at`, and MIN_UTC can never be greater than a real
+    // connection time. The departure marker silently lost that comparison
+    // on every other mesh node forever, so those nodes kept treating a
+    // long-gone browser tab as a live, routable peer (ghost peers).
+    /// True when this peer has disconnected. Tombstones propagate across
+    /// the mesh so all nodes stop treating this session as routable.
+    #[serde(default)]
+    pub left: bool,
+    /// When `left` was set, used as the LWW key for departures instead of
+    /// `connected_at` (always newer than the `connected_at` it's replacing,
+    /// so it actually wins the merge).
+    #[serde(default)]
+    pub left_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +100,14 @@ pub struct FileMetadata {
     /// tombstones (always > `created_at` for the same file).
     #[serde(default)]
     pub deleted_at: u64,
+
+    // ── Phase 11: integrity checksum ───────────────────────────────────────
+    /// SHA-256 hex digest of the original file bytes, computed on the sender
+    /// side in a Web Worker.  `None` if the sender didn't compute it (e.g.
+    /// very old client or a file shared before the field was introduced).
+    /// Receivers compare against this value after transfer and surface ✓/✗ UI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -182,6 +210,16 @@ pub enum ClientMessage {
     TextMessage {
         session_id: SessionId,
         content: String,
+    },
+
+    /// Phase 11.3: Browser sends this after the SHA-256 Web Worker finishes
+    /// hashing the shared file.  The server patches the existing FileMetadata
+    /// entry with the hash and re-syncs to the mesh.
+    #[serde(rename = "file_checksum_update")]
+    FileChecksumUpdate {
+        session_id: SessionId,
+        file_id: String,
+        sha256: String,
     },
 }
 
@@ -287,10 +325,18 @@ pub enum ServerMessage {
         file_id: String,
         host_peer_id: SessionId,
     },
+
+    /// Phase 10 §10.4: AP isolation diagnostic — no mesh peers found after 10s.
+    /// Browser tab surfaces a non-dismissible warning banner.
+    #[serde(rename = "no_peers_warning")]
+    NoPeersWarning {
+        message: String,
+    },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PeerStats {
-    pub total_peers: usize,
-    pub peers: Vec<PeerInfo>,
+/// System hostname, or a fallback label if it can't be read.
+pub fn hostname() -> String {
+    gethostname::gethostname()
+        .into_string()
+        .unwrap_or_else(|_| "LADEX Node".to_string())
 }

@@ -21,4 +21,8 @@ rand = "0.8"
 clap = { version = "4.0", features = ["derive"] }
 ring = "0.17"                       # Phase 7: PBKDF2-SHA256 passphrase hashing
 hex = "0.4"                         # Phase 7: hex-encode the derived key
+rcgen = "0.13"                      # BUG-03 fix: self-signed TLS cert generation
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] } # BUG-03 fix
+if-addrs = "0.15"                   # BUG-03 fix: enumerate local IPv4s for cert SANs
+gethostname = "0.5"                 # BUG-14 fix: read hostname without shelling out
 

@@ -4,7 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
     <title>LADEX</title>
-    <link rel="stylesheet" href="static/style.css?v=4">
+    <link rel="icon" type="image/svg+xml" href="static/favicon.svg">
+    <link rel="stylesheet" href="static/style.css?v=5">
     <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
     <meta http-equiv="Pragma" content="no-cache">
     <meta http-equiv="Expires" content="0">
@@ -86,25 +87,16 @@
         </main>
     </div>
 
-    <div id="progress-modal" class="modal">
-        <div class="modal-content">
-            <h3>File Transfer</h3>
-            <div class="progress-info">
-                <span id="progress-filename">Downloading file...</span>
-                <span id="progress-percentage">0%</span>
-            </div>
-            <div class="progress-bar">
-                <div id="progress-fill"></div>
-            </div>
-            <div class="progress-stats">
-                <span id="progress-speed">0 MB/s</span>
-                <span id="progress-eta">Calculating...</span>
-            </div>
-            <div class="progress-bytes">
-                <span id="progress-bytes"></span>
-            </div>
-            <button id="cancel-transfer" class="btn secondary">Cancel</button>
+    <!-- BUG-12 fix: a docked panel of per-transfer cards (built by
+         showProgress()/hideProgress() in app.js) instead of one shared
+         full-screen modal, so concurrent transfers don't overwrite or
+         hide each other. -->
+    <div id="progress-panel" class="progress-panel">
+        <div class="progress-panel-header">
+            <h3>File Transfers</h3>
+            <button id="cancel-all-transfers" class="btn secondary">Cancel all</button>
         </div>
+        <div id="progress-list"></div>
     </div>
 
     <div id="messages-modal" class="modal">
@@ -133,7 +125,7 @@
     </div>
 
     <script src="static/jszip.min.js"></script>
-    <script src="static/app.js?v=7"></script>
+    <script src="static/app.js?v=10"></script>
     <script>
         document.addEventListener('DOMContentLoaded', function() {
             const logoutBtn = document.getElementById('logout-btn');

@@ -1,11 +1,12 @@
 // ============================================================================
-// LADEX — Phases 3/4/5/6/7: Mesh WebSocket Layer
+// LADEX — Phases 3/4/5/6/7/10: Mesh WebSocket Layer
 //
-// Phase 5: SignalRelay routing — deliver to local tab or forward one-hop.
-// Phase 6: RTT tracking via Pong timestamps; update PeerInfo.node_rtt_ms
-//           and push incremental PeerSync so browser tabs can rank hosts.
-// Phase 7: Passphrase enforcement in Hello/HelloAck (second check after the
-//           Phase 2 pre-filter).  Mismatched hashes → HelloAck { accepted:false }.
+// Phase 5:  SignalRelay routing — deliver to local tab or forward one-hop.
+// Phase 6:  RTT tracking via Pong timestamps; push PeerSync to browser tabs.
+// Phase 7:  Passphrase enforcement in Hello/HelloAck.
+// Phase 10: Heartbeat Ping/Pong (5s interval, 15s dead-peer timeout),
+//           exponential reconnect backoff (2/4/8/30s, give-up at 10 min),
+//           graceful Goodbye on shutdown, state cleanup on departure.
 // ============================================================================
 
 use crate::types::*;
@@ -16,12 +17,17 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
 use warp::ws::{Message, WebSocket, Ws};
 use warp::{Rejection, Reply};
 
 pub const PROTOCOL_VERSION: u32 = 1;
+
+// Phase 10 timing constants
+const HEARTBEAT_INTERVAL:  Duration = Duration::from_secs(5);
+const HEARTBEAT_TIMEOUT:   Duration = Duration::from_secs(15);
+const RECONNECT_GIVE_UP:   Duration = Duration::from_secs(600); // 10 min
 
 // ---------------------------------------------------------------------------
 // MeshPeerHandle
@@ -55,6 +61,25 @@ pub enum MeshMessage {
         protocol_version: u32,
         /// PBKDF2-SHA256 hex (Phase 7).  Empty string = no passphrase.
         passphrase_hash:  String,
+        /// BUG-10 fix: the sender's own HTTP/mesh listening port. An
+        /// inbound connection only reveals the *ephemeral* source port of
+        /// the TCP connection the peer dialed with — not the port its own
+        /// server listens on — so without this, the accepting side has no
+        /// address to reconnect to if the connection later drops, and
+        /// spent up to RECONNECT_GIVE_UP retrying 0.0.0.0:0.
+        /// `#[serde(default)]` so an old peer that predates this field
+        /// degrades to the previous (broken) behavior instead of failing
+        /// the handshake outright.
+        #[serde(default)]
+        http_port: u16,
+        /// BUG-10 fix: the sender's own best-guess LAN IPv4 (empty string
+        /// if unknown), self-reported for the same reason as `http_port`
+        /// — and, with TLS enabled, for the additional reason that the
+        /// accepting side only ever sees connections arriving from our own
+        /// local TLS-terminating proxy (127.0.0.1), never the real peer,
+        /// so the TCP-level remote address can't be trusted here either.
+        #[serde(default)]
+        ip: String,
     },
     HelloAck {
         accepted:  bool,
@@ -89,14 +114,196 @@ pub enum MeshMessage {
 // Public helpers
 // ---------------------------------------------------------------------------
 
+/// Remove a peer from mesh_peers and run Phase 10 state cleanup.
 pub async fn remove_mesh_peer(state: &NodeState, peer_node_id: &NodeId) {
     let removed = {
         let mut peers = state.mesh_peers.write().await;
         peers.remove(peer_node_id).is_some()
     };
     if removed {
-        tracing::info!("Mesh: peer disconnected/stale: {peer_node_id}");
+        tracing::info!("Mesh: peer disconnected: {peer_node_id}");
+        peer_departed_cleanup(state, peer_node_id).await;
     }
+}
+
+/// Phase 10 §10.2 — mark hosted peers offline and tombstone their files.
+/// Does NOT delete catalog entries; marks them unavailable so the UI shows
+/// "[offline]" rather than silently hiding the file.
+async fn peer_departed_cleanup(state: &NodeState, departed_node_id: &NodeId) {
+    // Mark browser peers hosted by the departed node as offline.
+    // BUG-08 fix: also set left/left_at, not just hosting_node_id = None —
+    // this list gets pushed to the rest of the mesh below, and without an
+    // LWW timestamp newer than the connected_at these peers joined with,
+    // merge_peers on every other node would just discard the update (same
+    // "MIN_UTC never wins" class of bug that push_peer_left_to_mesh had).
+    let departed_peers: Vec<PeerInfo> = {
+        let mut local = state.local_peers.write().await;
+        let mut changed = Vec::new();
+        let now = chrono::Utc::now();
+        for peer in local.values_mut() {
+            if peer.hosting_node_id.as_deref() == Some(departed_node_id) {
+                peer.hosting_node_id = None; // None = offline
+                peer.node_rtt_ms = None;
+                peer.left = true;
+                peer.left_at = Some(now);
+                changed.push(peer.clone());
+            }
+        }
+        changed
+    };
+    if !departed_peers.is_empty() {
+        crate::websocket::broadcast(
+            state,
+            ServerMessage::PeerSync { peers: departed_peers.clone() },
+        ).await;
+        // Propagate to the rest of the mesh too — otherwise a third node
+        // only ever learns about this departure if it happens to be the
+        // one that detects the disconnect itself.
+        for peer in departed_peers {
+            state::push_peer_to_mesh(&state.mesh_peers, peer).await;
+        }
+    }
+
+    // Tombstone files whose only remaining host session belongs to the departed node.
+    // We can't perfectly know which sessions belonged to which node here (sessions
+    // are purged on WS disconnect), but we mark files whose host set is now empty.
+    let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+    let tombstoned: Vec<FileMetadata> = {
+        let mut files = state.files.write().await;
+        let mut ts = Vec::new();
+        for file in files.values_mut() {
+            if file.deleted { continue; }
+            // If every host session is now gone from local_peers, tombstone.
+            // (In a real multi-node scenario sessions for the departed node
+            //  were already cleaned up by cleanup_peer in websocket.rs.)
+            if file.hosts.is_empty() {
+                file.deleted = true;
+                file.deleted_at = now_ms;
+                ts.push(file.clone());
+            }
+        }
+        ts
+    };
+    for ts_file in tombstoned {
+        state::push_file_to_mesh(&state.mesh_peers, ts_file).await;
+    }
+
+    // Refresh local tab file list
+    let files: Vec<FileMetadata> = {
+        let files = state.files.read().await;
+        files.values().filter(|f| !f.deleted).cloned().collect()
+    };
+    crate::websocket::broadcast(state, ServerMessage::FileListUpdate { files }).await;
+}
+
+/// Phase 10 §10.3 — Reconnect with exponential backoff.
+/// Attempts: 2s, 4s, 8s, 30s, 30s, … until RECONNECT_GIVE_UP (10 min).
+/// Stops early if multicast discovery already re-established the connection.
+///
+/// BUG-10 fix: guard against the residual case where `addr`/`http_port`
+/// couldn't be determined at all (see handle_inbound's fallback) — dialing
+/// 0.0.0.0:0 can never succeed, so don't burn the whole 10-minute give-up
+/// window finding that out.
+pub fn spawn_reconnect(addr: IpAddr, http_port: u16, state: NodeState, peer_node_id: NodeId) {
+    if addr.is_unspecified() || http_port == 0 {
+        tracing::debug!("Reconnect: no dialable address for {peer_node_id} — not attempting");
+        return;
+    }
+    tokio::spawn(async move {
+        let started = Instant::now();
+        let delays_secs = [2u64, 4, 8, 30];
+        let mut attempt = 0usize;
+        loop {
+            if started.elapsed() > RECONNECT_GIVE_UP {
+                tracing::info!("Reconnect: giving up on {peer_node_id} after 10 min");
+                return;
+            }
+            // Stop if already reconnected (discovery may have beaten us)
+            if state.mesh_peers.read().await.contains_key(&peer_node_id) {
+                return;
+            }
+            let delay_secs = if attempt < delays_secs.len() {
+                delays_secs[attempt]
+            } else {
+                30
+            };
+            tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+            attempt += 1;
+            if state.mesh_peers.read().await.contains_key(&peer_node_id) {
+                return;
+            }
+            tracing::info!("Reconnect: attempt {attempt} to {addr}:{http_port} ({peer_node_id})");
+            match connect_to_peer(addr, http_port, state.clone()).await {
+                Ok(()) => { tracing::info!("Reconnect: success to {peer_node_id}"); return; }
+                Err(e) => tracing::warn!("Reconnect: failed: {e}"),
+            }
+        }
+    });
+}
+
+/// Phase 10 §10.5 — Graceful shutdown: send Goodbye to all mesh peers.
+pub async fn broadcast_goodbye(state: &NodeState) {
+    let peers = state.mesh_peers.read().await;
+    let goodbye = MeshMessage::Goodbye { node_id: state.node_id.clone() };
+    for handle in peers.values() {
+        let _ = handle.sender.send(goodbye.clone());
+    }
+    // Brief yield so write tasks can flush before the process exits
+    drop(peers);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+}
+
+/// Phase 10 §10.1 — Spawn a heartbeat task for one peer connection.
+/// Sends Ping every HEARTBEAT_INTERVAL; if no Pong for HEARTBEAT_TIMEOUT,
+/// removes the peer and optionally spawns reconnect.
+pub fn spawn_heartbeat(
+    state: NodeState,
+    peer_node_id: NodeId,
+    peer_addr: IpAddr,
+    http_port: u16,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
+        // the loop body sleeps longer than one interval period; avoid firing
+        // the missed ticks back-to-back once it catches up
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        interval.tick().await; // skip first immediate tick
+        loop {
+            interval.tick().await;
+            // Check if this peer is still in mesh_peers
+            let still_connected = {
+                let peers = state.mesh_peers.read().await;
+                peers.contains_key(&peer_node_id)
+            };
+            if !still_connected { return; }
+
+            // Send Ping
+            let ts = chrono::Utc::now().timestamp_millis() as u64;
+            {
+                let peers = state.mesh_peers.read().await;
+                if let Some(h) = peers.get(&peer_node_id) {
+                    let _ = h.sender.send(MeshMessage::Ping { ts });
+                }
+            }
+
+            // Wait for up to HEARTBEAT_TIMEOUT for a Pong (last_seen update)
+            tokio::time::sleep(HEARTBEAT_TIMEOUT).await;
+
+            let timed_out = {
+                let peers = state.mesh_peers.read().await;
+                peers.get(&peer_node_id)
+                    .map(|h| h.last_seen.elapsed() > HEARTBEAT_TIMEOUT)
+                    .unwrap_or(false)
+            };
+            if timed_out {
+                tracing::warn!("Heartbeat: peer {peer_node_id} timed out — removing");
+                remove_mesh_peer(&state, &peer_node_id).await;
+                // Attempt to reconnect
+                spawn_reconnect(peer_addr, http_port, state.clone(), peer_node_id.clone());
+                return;
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -108,9 +315,7 @@ pub async fn mesh_ws_handler(ws: Ws, state: NodeState) -> Result<impl Reply, Rej
 }
 
 async fn handle_inbound(ws: WebSocket, state: NodeState) {
-    let (ws_tx, ws_rx) = ws.split();
-    let ws_tx = Arc::new(tokio::sync::Mutex::new(ws_tx));
-    let mut ws_rx = ws_rx;
+    let (mut ws_tx, mut ws_rx) = ws.split();
 
     // Wait for Hello
     let raw_hello = loop {
@@ -129,79 +334,127 @@ async fn handle_inbound(ws: WebSocket, state: NodeState) {
         }
     };
 
-    let (peer_node_id, peer_node_name, peer_protocol_version, peer_passphrase_hash) =
+    let (peer_node_id, peer_node_name, peer_protocol_version, peer_passphrase_hash, peer_http_port, peer_ip) =
         match serde_json::from_str::<MeshMessage>(raw_hello.to_str().unwrap_or("")) {
-            Ok(MeshMessage::Hello { node_id, node_name, protocol_version, passphrase_hash }) =>
-                (node_id, node_name, protocol_version, passphrase_hash),
+            Ok(MeshMessage::Hello { node_id, node_name, protocol_version, passphrase_hash, http_port, ip }) =>
+                (node_id, node_name, protocol_version, passphrase_hash, http_port, ip),
             _ => return,
         };
 
-    // Build send-ack closure
-    let send_ack = |accepted: bool, reason: Option<String>| {
-        let tx = ws_tx.clone();
-        let node_id = state.node_id.clone();
-        let node_name = hostname();
-        async move {
-            let ack = MeshMessage::HelloAck { accepted, reason, node_id, node_name };
-            let json = serde_json::to_string(&ack).unwrap_or_default();
-            let _ = tx.lock().await.send(Message::text(json)).await;
-        }
-    };
+    // Acks are sent one at a time on this straight-line path, so a plain
+    // &mut borrow of ws_tx is enough — no need to share it behind an
+    // Arc<Mutex<_>>.
+    let our_node_name = hostname();
+    async fn send_ack(
+        ws_tx: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+        accepted: bool,
+        reason: Option<String>,
+        node_id: NodeId,
+        node_name: String,
+    ) {
+        let ack = MeshMessage::HelloAck { accepted, reason, node_id, node_name };
+        let json = serde_json::to_string(&ack).unwrap_or_default();
+        let _ = ws_tx.send(Message::text(json)).await;
+    }
 
     // Validate
     if peer_node_id == state.node_id {
-        send_ack(false, Some("self-connection rejected".into())).await;
+        send_ack(&mut ws_tx, false, Some("self-connection rejected".into()), state.node_id.clone(), our_node_name).await;
         return;
     }
     if peer_protocol_version != PROTOCOL_VERSION {
-        send_ack(false, Some(format!(
+        send_ack(&mut ws_tx, false, Some(format!(
             "protocol version mismatch: expected {PROTOCOL_VERSION}, got {peer_protocol_version}"
-        ))).await;
+        )), state.node_id.clone(), our_node_name).await;
         return;
     }
     // Phase 7 check 2: passphrase enforcement
     let our_hash = state.passphrase_hash.as_deref().unwrap_or("");
     if !auth::hashes_match(our_hash, &peer_passphrase_hash) {
-        send_ack(false, Some("wrong passphrase".into())).await;
+        send_ack(&mut ws_tx, false, Some("wrong passphrase".into()), state.node_id.clone(), our_node_name).await;
         tracing::warn!("Mesh inbound: passphrase mismatch from {peer_node_id} — rejected");
         return;
     }
     if state.mesh_peers.read().await.contains_key(&peer_node_id) {
-        send_ack(false, Some("duplicate".into())).await;
+        send_ack(&mut ws_tx, false, Some("duplicate".into()), state.node_id.clone(), our_node_name).await;
         return;
     }
 
-    send_ack(true, None).await;
+    send_ack(&mut ws_tx, true, None, state.node_id.clone(), our_node_name).await;
     tracing::info!("Mesh: inbound handshake OK — peer {peer_node_id} ({peer_node_name})");
 
-    let placeholder_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
-    let ws_tx_inner = Arc::try_unwrap(ws_tx)
-        .unwrap_or_else(|_| panic!("BUG: extra ws_tx holders"))
-        .into_inner();
-
-    run_connection(ws_tx_inner, ws_rx, peer_node_id, peer_node_name, placeholder_addr, 0, state).await;
+    // BUG-10 fix: build a real, dialable address for this peer from its
+    // self-reported ip/http_port (Hello), so that if the connection later
+    // drops, the heartbeat's reconnect attempt has somewhere real to dial
+    // instead of the old "0.0.0.0:0" placeholder (which burned the whole
+    // 10-minute give-up window failing to connect). warp 0.4.1 exposes no
+    // way to read the TCP-level remote address at all (see the route
+    // definition in main.rs), so self-reporting is the only option here —
+    // conveniently, it's also the only thing that works once TLS is
+    // enabled, since every inbound connection warp sees then actually
+    // comes from our own local TLS-terminating proxy at 127.0.0.1, not the
+    // real peer.
+    let addr: SocketAddr = match (peer_ip.parse::<IpAddr>().ok(), peer_http_port) {
+        (Some(ip), port) if port > 0 => SocketAddr::new(ip, port),
+        _ => {
+            tracing::warn!(
+                "Mesh inbound: no usable address for {peer_node_id} \
+                 (peer_ip={peer_ip:?}, peer_http_port={peer_http_port}) — \
+                 reconnect after disconnect will not be possible for this peer"
+            );
+            "0.0.0.0:0".parse().unwrap()
+        }
+    };
+    run_connection(ws_tx, ws_rx, peer_node_id, peer_node_name, addr, peer_http_port, state).await;
 }
 
 // ---------------------------------------------------------------------------
 // Outbound — dial another node
 // ---------------------------------------------------------------------------
 
+// BUG-03 fix: the public HTTP port speaks TLS-only once TLS is enabled (see
+// src/tls.rs), so dialing a peer must go over wss:// in that case. The two
+// paths (plain ws:// via tokio-tungstenite's own TCP connect, vs wss:// over
+// our own rustls handshake) produce different concrete `WebSocketStream<S>`
+// types, so both are boxed into the same trait objects here — the rest of
+// this function only needs Sink<Message>/Stream<Item = Result<Message, _>>.
+type MeshSink = std::pin::Pin<Box<dyn futures_util::Sink<
+    tokio_tungstenite::tungstenite::Message,
+    Error = tokio_tungstenite::tungstenite::Error,
+> + Send>>;
+type MeshSource = std::pin::Pin<Box<dyn futures_util::Stream<
+    Item = Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>,
+> + Send>>;
+
 pub async fn connect_to_peer(addr: IpAddr, http_port: u16, state: NodeState) -> anyhow::Result<()> {
-    let url = format!("ws://{addr}:{http_port}/mesh");
+    let tls_client_config = state.tls_client_config.clone();
+    let url = format!("{}://{addr}:{http_port}/mesh", if tls_client_config.is_some() { "wss" } else { "ws" });
     tracing::info!("Mesh: dialing {url}");
 
-    let (ws_stream, _) = tokio_tungstenite::connect_async(&url)
-        .await
-        .map_err(|e| anyhow::anyhow!("WS connect to {url} failed: {e}"))?;
+    let (mut tt_tx, mut tt_rx): (MeshSink, MeshSource) = if let Some(client_config) = tls_client_config {
+        let (ws_stream, _) = crate::tls::connect_wss(addr, http_port, "/mesh", client_config)
+            .await
+            .map_err(|e| anyhow::anyhow!("WSS connect to {url} failed: {e}"))?;
+        let (tx, rx) = ws_stream.split();
+        (Box::pin(tx), Box::pin(rx))
+    } else {
+        let (ws_stream, _) = tokio_tungstenite::connect_async(&url)
+            .await
+            .map_err(|e| anyhow::anyhow!("WS connect to {url} failed: {e}"))?;
+        let (tx, rx) = ws_stream.split();
+        (Box::pin(tx), Box::pin(rx))
+    };
 
-    let (mut tt_tx, mut tt_rx) = ws_stream.split();
-
-    // Phase 7: include passphrase_hash in Hello
+    // Phase 7: include passphrase_hash in Hello; BUG-10 fix: include our
+    // own http_port so the peer can reconnect to us if this connection
+    // later drops (see MeshMessage::Hello's doc comment).
     let hello = MeshMessage::Hello {
         node_id:          state.node_id.clone(),
         node_name:        hostname(),
         protocol_version: PROTOCOL_VERSION,
         passphrase_hash:  state.passphrase_hash.clone().unwrap_or_default(),
+        http_port:        state.http_port,
+        ip:               state.local_ip.map(|ip| ip.to_string()).unwrap_or_default(),
     };
     tt_tx.send(tokio_tungstenite::tungstenite::Message::Text(serde_json::to_string(&hello)?)).await?;
 
@@ -253,6 +506,9 @@ pub async fn connect_to_peer(addr: IpAddr, http_port: u16, state: NodeState) -> 
 
     post_handshake_sync(&peer_tx, &state).await;
 
+    // Phase 10: start heartbeat for this connection
+    spawn_heartbeat(state.clone(), peer_node_id.clone(), addr, http_port);
+
     let write_task = tokio::spawn(async move {
         while let Some(msg) = peer_rx.recv().await {
             let json = match serde_json::to_string(&msg) { Ok(j) => j, Err(_) => continue };
@@ -260,9 +516,9 @@ pub async fn connect_to_peer(addr: IpAddr, http_port: u16, state: NodeState) -> 
         }
     });
 
-    let state_rd  = state.clone();
+    let state_rd   = state.clone();
     let peer_id_rd = peer_node_id.clone();
-    let read_task = tokio::spawn(async move {
+    let read_task  = tokio::spawn(async move {
         while let Some(result) = tt_rx.next().await {
             match result {
                 Ok(msg) if msg.is_text() => {
@@ -277,7 +533,15 @@ pub async fn connect_to_peer(addr: IpAddr, http_port: u16, state: NodeState) -> 
                 _ => {}
             }
         }
-        remove_mesh_peer(&state_rd, &peer_id_rd).await;
+        // Phase 10: only run cleanup if not already done by heartbeat
+        let still_present = state_rd.mesh_peers.read().await.contains_key(&peer_id_rd);
+        if still_present {
+            remove_mesh_peer(&state_rd, &peer_id_rd).await;
+            // Reconnect backoff — we know the addr/port from the handle stored before we lost it,
+            // but the handle is now gone. The heartbeat task handles reconnect for timeout cases;
+            // this branch handles clean-close cases where heartbeat didn't fire.
+            spawn_reconnect(addr, http_port, state_rd.clone(), peer_id_rd.clone());
+        }
     });
 
     tokio::spawn(async move { tokio::select! { _ = write_task => {} _ = read_task => {} } });
@@ -314,6 +578,12 @@ async fn run_connection(
 
     post_handshake_sync(&peer_tx, &state).await;
 
+    // Phase 10: heartbeat for this connection. BUG-10 fix: `addr`/`http_port`
+    // are now the peer's real, dialable address (see handle_inbound), so a
+    // reconnect *attempt* — whichever path below ends up making one — has
+    // somewhere real to dial for inbound connections too, not just outbound.
+    spawn_heartbeat(state.clone(), peer_node_id.clone(), addr.ip(), http_port);
+
     let write_task = tokio::spawn(async move {
         while let Some(msg) = peer_rx.recv().await {
             let json = match serde_json::to_string(&msg) { Ok(j) => j, Err(_) => continue };
@@ -337,7 +607,19 @@ async fn run_connection(
     }
 
     write_task.abort();
-    remove_mesh_peer(&state, &peer_node_id).await;
+    // BUG-10 fix: this branch handles a connection that errors/closes
+    // immediately (e.g. the peer process was killed — a TCP reset arrives
+    // as a WS read error right away) — well before the heartbeat's own
+    // ~15-20s timeout window would notice anything wrong. Previously only
+    // the heartbeat's timeout path attempted a reconnect, so this faster,
+    // far more common disconnect shape left inbound connections with no
+    // reconnect attempt at all, silently, regardless of the address fix
+    // above. Mirrors the equivalent cleanup in connect_to_peer's read_task.
+    let still_present = state.mesh_peers.read().await.contains_key(&peer_node_id);
+    if still_present {
+        remove_mesh_peer(&state, &peer_node_id).await;
+        spawn_reconnect(addr.ip(), http_port, state.clone(), peer_node_id.clone());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -566,14 +848,3 @@ pub async fn route_signal(
 // Utility
 // ---------------------------------------------------------------------------
 
-fn hostname() -> String {
-    std::env::var("HOSTNAME")
-        .or_else(|_| {
-            use std::process::Command;
-            Command::new("hostname")
-                .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                .map_err(|_| std::env::VarError::NotPresent)
-        })
-        .unwrap_or_else(|_| "LADEX Node".to_string())
-}

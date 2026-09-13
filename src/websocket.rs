@@ -32,6 +32,11 @@ pub async fn broadcast(state: &NodeState, msg: ServerMessage) {
     }
 }
 
+/// Alias for broadcast — used by Phase 10 AP isolation diagnostic.
+pub async fn broadcast_all(state: &NodeState, msg: ServerMessage) {
+    broadcast(state, msg).await;
+}
+
 pub async fn send_to(state: &NodeState, target: &SessionId, msg: ServerMessage) {
     let senders = state.local_senders.read().await;
     if let Some(sender) = senders.get(target) {
@@ -99,6 +104,8 @@ async fn handle_client_message(
                 user_agent,
                 hosting_node_id: Some(state.node_id.clone()),
                 node_rtt_ms: None,
+                left: false,
+                left_at: None,
             };
 
             let peers_count = {
@@ -125,12 +132,41 @@ async fn handle_client_message(
         }
 
         // ── File upload ───────────────────────────────────────────────────
+        // BUG-07 fix: a browser tab resends file_upload for every
+        // locally-held file after every WS reconnect (see app.js
+        // connectWebSocket()), always with `hosts: [own session_id]` since
+        // the tab only knows about itself. Treating that as a fresh upload
+        // — as a blind `files.insert()` did — replaced the whole catalog
+        // entry and wiped out every OTHER peer that had since become a
+        // host via file_downloaded, plus any sha256 computed after the
+        // original upload. If an id we already know about comes back in,
+        // this is a re-registration of the same file, not a new one: merge
+        // hosts and sha256 into the existing entry instead of replacing it.
         ClientMessage::FileUpload { session_id: _, mut file } => {
-            if file.created_at == 0 { file.created_at = chrono::Utc::now().timestamp_millis() as u64; }
-            file.deleted = false;
-            file.deleted_at = 0;
-            let file_for_mesh = file.clone();
-            { let mut files = state.files.write().await; files.insert(file.id.clone(), file); }
+            let file_for_mesh = {
+                let mut files = state.files.write().await;
+                if let Some(existing) = files.get_mut(&file.id) {
+                    existing.hosts.extend(file.hosts.drain());
+                    if file.sha256.is_some() {
+                        existing.sha256 = file.sha256.take();
+                    }
+                    // A file id is only ever reused by the peer that
+                    // originally minted it re-registering it — never
+                    // treat that as resurrecting a deletion made by
+                    // someone else in the meantime.
+                    if existing.deleted {
+                        existing.deleted = false;
+                        existing.deleted_at = 0;
+                    }
+                    existing.clone()
+                } else {
+                    if file.created_at == 0 { file.created_at = chrono::Utc::now().timestamp_millis() as u64; }
+                    file.deleted = false;
+                    file.deleted_at = 0;
+                    files.insert(file.id.clone(), file.clone());
+                    file
+                }
+            };
 
             let files: Vec<FileMetadata> = {
                 let files = state.files.read().await;
@@ -157,10 +193,13 @@ async fn handle_client_message(
                 return Ok(());
             }
 
-            // Check the chosen host is reachable (present in merged peer list)
+            // Check the chosen host is reachable (present in the merged peer
+            // list, and — BUG-08 fix — not a departure tombstone: a
+            // departed peer is still a key in the map, just marked `left`,
+            // so `contains_key` alone would keep routing to ghosts).
             let host_known = {
                 let peers = state.local_peers.read().await;
-                peers.contains_key(&host_peer_id)
+                peers.get(&host_peer_id).map(|p| !p.left).unwrap_or(false)
             };
             if !host_known {
                 // Phase 6: do NOT silently reroute — let client retry
@@ -291,9 +330,37 @@ async fn handle_client_message(
                 let mut messages = state.messages.write().await;
                 messages.push(message.clone());
                 messages.sort_by_key(|m| m.created_at);
+                state::prune_messages(&mut messages); // BUG-13 fix
             }
             broadcast(state, ServerMessage::TextMessage { message: message.clone() }).await;
             state::push_message_to_mesh(&state.mesh_peers, message).await;
+        }
+
+        // ── Phase 11.3: checksum update ───────────────────────────────────
+        ClientMessage::FileChecksumUpdate { session_id: _, file_id, sha256 } => {
+            // Patch the sha256 field on the existing catalog entry.
+            let patched: Option<FileMetadata> = {
+                let mut files = state.files.write().await;
+                if let Some(file) = files.get_mut(&file_id) {
+                    file.sha256 = Some(sha256.clone());
+                    Some(file.clone())
+                } else {
+                    None
+                }
+            };
+            if let Some(file) = patched {
+                tracing::info!("Checksum: {file_id} → sha256={sha256:.16}…");
+                // Re-broadcast updated file list to local tabs
+                let files: Vec<FileMetadata> = {
+                    let files = state.files.read().await;
+                    files.values().filter(|f| !f.deleted).cloned().collect()
+                };
+                broadcast(state, ServerMessage::FileListUpdate { files }).await;
+                // Propagate updated FileMetadata to mesh peers
+                state::push_file_to_mesh(&state.mesh_peers, file).await;
+            } else {
+                tracing::warn!("FileChecksumUpdate: unknown file_id {file_id}");
+            }
         }
     }
     Ok(())

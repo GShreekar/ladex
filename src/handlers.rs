@@ -2,14 +2,16 @@ use crate::types::*;
 use crate::NodeState;
 use warp::{Rejection, Reply};
 
-pub async fn check_auth_status(cookie: Option<String>, state: NodeState) -> Result<impl Reply, Rejection> {
+pub async fn check_auth_status(auth_cookie: Option<String>, state: NodeState) -> Result<impl Reply, Rejection> {
     let is_authenticated = match &state.security_code_legacy {
         None => true, // No auth required
         Some(_) => {
-            let expected_auth_value = format!("authenticated:{}", state.session_token());
-            cookie.as_ref()
-                .map(|c| c.contains(&format!("auth={expected_auth_value}")))
-                .unwrap_or(false)
+            // Exact match against just the `auth` cookie's value — not a
+            // substring check against the whole Cookie header, which could
+            // be fooled by an unrelated cookie whose value happens to
+            // contain this one's expected value as a substring.
+            let expected_cookie = format!("authenticated:{}", state.session_token());
+            auth_cookie.as_deref() == Some(expected_cookie.as_str())
         }
     };
 
@@ -25,20 +27,6 @@ pub async fn check_auth_status(cookie: Option<String>, state: NodeState) -> Resu
     };
 
     Ok(warp::reply::json(&response))
-}
-
-pub async fn get_peers(state: NodeState) -> Result<impl Reply, Rejection> {
-    let peers = {
-        let peers = state.local_peers.read().await;
-        peers.values().cloned().collect::<Vec<_>>()
-    };
-
-    let stats = PeerStats {
-        total_peers: peers.len(),
-        peers,
-    };
-
-    Ok(warp::reply::json(&stats))
 }
 
 pub async fn authenticate(auth_req: AuthRequest, state: NodeState) -> Result<Box<dyn Reply>, Rejection> {

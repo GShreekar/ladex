@@ -5,6 +5,13 @@
 // data ever touch the server.
 // ============================================================================
 
+// Above this size we skip client-side hashing entirely — reading the whole
+// file into RAM just to hash it would defeat the O(1)-memory streaming
+// design (see streamFileOverDC). The receiver still gets the transfer; it
+// just has no sha256 to verify against (sha256 is sent as null and checked
+// lazily — see the wire protocol comment on streamFileOverDC).
+const HASH_SIZE_LIMIT = 200 * 1024 * 1024; // 200 MB
+
 class LADEXApp {
     constructor() {
         this.ws = null;
@@ -28,8 +35,12 @@ class LADEXApp {
         this.pendingCandidates = new Map();
         // Track ongoing sends/receives for progress UI.
         this.activeTransfers = new Map();
+        // BUG-12 fix: one progress-panel card, and one known RTC peer, per
+        // transferId — see the "PROGRESS PANEL" section below.
+        this._progressCards = new Map();
+        this._transferPeers = new Map();
 
-        this.RTC_CHUNK_SIZE = 64 * 1024; // 64 KB per DataChannel message
+        this.RTC_CHUNK_SIZE = 256 * 1024; // Phase 9: 256 KB (up from 64 KB)
 
         // ── Retry / resilience ──────────────────────────────────────────
         this.MAX_RETRIES = 3;
@@ -42,6 +53,15 @@ class LADEXApp {
 
         // ── Toast queue ─────────────────────────────────────────────────
         this._toastContainer = null;
+
+        // ── Phase 11.3: SHA-256 integrity worker ────────────────────────
+        // One persistent worker — reused for all hash requests.
+        // Map from fileId → resolve/reject callbacks for pending hash ops.
+        this._hashWorker = null;
+        this._hashPending = new Map(); // fileId → { resolve, reject }
+        // sha256 values we've computed for our own shared files
+        // (also embedded in the DC header for immediate receiver-side check)
+        this._localSha256 = new Map(); // fileId → hex string
 
         this.init();
     }
@@ -81,6 +101,12 @@ class LADEXApp {
         this.connectWebSocket();
         this.setupEventListeners();
         this.setupDragAndDrop();
+        // Phase 8: warn non-FSAA browsers once on load
+        if (!window.showSaveFilePicker) {
+            this._showFsaaBanner();
+        }
+        // Phase 11.3: start SHA-256 Web Worker
+        this._initHashWorker();
     }
 
     initializePeerDisplay() {
@@ -90,6 +116,78 @@ class LADEXApp {
             return false;
         };
         if (!update()) setTimeout(() => { if (!update()) setTimeout(update, 1000); }, 100);
+    }
+
+    // =====================================================================
+    //  PHASE 11.3: SHA-256 INTEGRITY WORKER  (BUG-01 fix)
+    //  These two methods were called from the constructor/init() and
+    //  uploadFile() but never defined — every `new LADEXApp()` threw a
+    //  ReferenceError before `window.app` could be assigned, so every
+    //  inline onclick="app.…" handler in the DOM threw too. The whole UI
+    //  was non-functional as a result.
+    // =====================================================================
+
+    _initHashWorker() {
+        try {
+            this._hashWorker = new Worker('static/sha256-worker.js');
+        } catch (err) {
+            console.warn('SHA-256 worker unavailable — integrity checks disabled:', err);
+            this._hashWorker = null;
+            return;
+        }
+
+        this._hashWorker.onmessage = (event) => {
+            const { cmd, fileId, sha256, error } = event.data;
+            const pending = this._hashPending.get(fileId);
+            if (!pending) return; // already resolved, or an unknown/stale fileId
+            this._hashPending.delete(fileId);
+            if (cmd === 'hash_result') {
+                pending.resolve(sha256);
+            } else {
+                pending.reject(new Error(error || 'hash failed'));
+            }
+        };
+
+        this._hashWorker.onerror = (err) => {
+            console.error('SHA-256 worker crashed:', err.message || err);
+            // Reject everything still pending — callers fall back to "no hash".
+            for (const pending of this._hashPending.values()) {
+                pending.reject(new Error('worker crashed'));
+            }
+            this._hashPending.clear();
+            this._hashWorker = null;
+        };
+    }
+
+    /**
+     * Hash a locally-shared file off the main thread, then push the result
+     * to the server so peers can verify integrity after download.
+     * Best-effort: failures are logged, never surfaced to the user — a
+     * transfer without a checksum still works, it's just unverified.
+     */
+    async _hashFileAsync(fileId, file) {
+        if (!this._hashWorker) return;
+        if (file.size === 0 || file.size > HASH_SIZE_LIMIT) return;
+
+        try {
+            const buffer = await file.arrayBuffer();
+            const sha256 = await new Promise((resolve, reject) => {
+                this._hashPending.set(fileId, { resolve, reject });
+                this._hashWorker.postMessage({ cmd: 'hash_file', fileId, buffer }, [buffer]);
+            });
+            this._localSha256.set(fileId, sha256);
+            // Patch the catalog entry so peers who already fetched the
+            // metadata (and anyone downloading after this point) can verify.
+            this.sendWS({
+                type: 'file_checksum_update',
+                session_id: this.sessionId,
+                file_id: fileId,
+                sha256,
+            });
+            console.log(`[hash] ${file.name}: ${sha256.slice(0, 12)}…`);
+        } catch (err) {
+            console.warn(`[hash] failed for ${file.name}:`, err);
+        }
     }
 
     // =====================================================================
@@ -234,13 +332,13 @@ class LADEXApp {
                     `Host ${msg.host_peer_id.slice(-6)} unreachable — choose another or retry`,
                     'warning', 5000
                 );
-                this.hideProgress();
+                this.hideProgress(`dl:${msg.file_id}`);
                 break;
 
             // Phase 5: remote receiver declined the file
             case 'transfer_declined':
                 this.toast(`Receiver declined the file transfer`, 'warning', 5000);
-                this.hideProgress();
+                this.hideProgress(`send:${msg.file_id}:${msg.from_session_id}`);
                 break;
 
             // ── WebRTC signaling ────────────────────────────────────────
@@ -255,6 +353,10 @@ class LADEXApp {
                 break;
 
             // ── misc ────────────────────────────────────────────────────
+            // Phase 10: AP isolation diagnostic
+            case 'no_peers_warning':
+                this._showApIsolationBanner(msg.message);
+                break;
             case 'error':
                 this.toast(msg.message, 'error', 6000);
                 break;
@@ -296,8 +398,60 @@ class LADEXApp {
         const zip = new JSZip();
         for (const f of files) zip.file(f.webkitRelativePath || f.name, f);
         const folderName = files[0].webkitRelativePath?.split('/')[0] || 'folder';
+        const zipName = `${folderName}.zip`;
+
+        // Stream straight to disk when possible so a huge folder doesn't
+        // have to fit in RAM as one Blob; fall back to the old in-memory
+        // path otherwise.
+        const file = window.showSaveFilePicker
+            ? await this._zipToDisk(zip, zipName)
+            : await this._zipToMemory(zip, zipName);
+        if (file) await this.uploadFile(file);
+    }
+
+    async _zipToDisk(zip, zipName) {
+        let fileHandle;
+        try {
+            fileHandle = await window.showSaveFilePicker({
+                suggestedName: zipName,
+                types: [{ description: 'Zip archive', accept: { 'application/zip': ['.zip'] } }],
+            });
+        } catch (err) {
+            if (err.name === 'AbortError') return null; // user cancelled the save dialog
+            console.warn('showSaveFilePicker failed, falling back to in-memory zip:', err);
+            return this._zipToMemory(zip, zipName);
+        }
+
+        const writable = await fileHandle.createWritable();
+        let failure = null;
+
+        // generateInternalStream + streamFiles avoids buffering the whole
+        // archive; pausing the stream while each chunk is written to disk
+        // gives real backpressure, so only one chunk is ever in memory.
+        await new Promise((resolve) => {
+            const stream = zip.generateInternalStream({ type: 'uint8array', streamFiles: true });
+            stream.on('data', (chunk) => {
+                stream.pause();
+                writable.write(chunk)
+                    .then(() => stream.resume())
+                    .catch((err) => { failure = err; resolve(); });
+            });
+            stream.on('error', (err) => { failure = err; resolve(); });
+            stream.on('end', resolve);
+            stream.resume();
+        });
+
+        if (failure) {
+            await writable.close().catch(() => {});
+            throw failure;
+        }
+        await writable.close();
+        return fileHandle.getFile();
+    }
+
+    async _zipToMemory(zip, zipName) {
         const blob = await zip.generateAsync({ type: 'blob' });
-        await this.uploadFile(new File([blob], `${folderName}.zip`, { type: 'application/zip' }));
+        return new File([blob], zipName, { type: 'application/zip' });
     }
 
     async uploadFile(file) {
@@ -320,6 +474,8 @@ class LADEXApp {
             }
         });
         console.log(`Shared: ${file.name} (${this.formatFileSize(file.size)})`);
+        // Phase 11.3: hash the file asynchronously; patch catalog when done
+        this._hashFileAsync(fileId, file);
     }
 
     // =====================================================================
@@ -415,7 +571,7 @@ class LADEXApp {
         if (attempt >= this.MAX_RETRIES) {
             this.pendingDownloads.delete(fileId);
             this.toast(`Download failed after ${this.MAX_RETRIES} attempts`, 'error', 6000);
-            this.hideProgress();
+            this.hideProgress(`dl:${fileId}`);
             return;
         }
         if (attempt > 0) {
@@ -450,14 +606,31 @@ class LADEXApp {
     /**
      * Called when an incoming transfer fails (RTC/DC error).
      * Retries with exponential back-off.
+     *
+     * BUG-09 fix: this used to schedule the retry unconditionally.
+     * cancelActiveTransfer() marks the transfer cancelled and closes the
+     * RTC connection, which is exactly what triggers the onclose/onerror
+     * handlers that call _retryDownload() in the first place — so
+     * cancelling a download made it retry itself, and since neither this
+     * function nor _requestDownloadWithRetry() ever checked for
+     * cancellation, the exponential-backoff chain (up to MAX_RETRIES
+     * attempts) ran to completion regardless of what the user asked for.
+     * pendingDownloads is the authoritative "still wanted" set — cleared by
+     * cancelActiveTransfer() and by a completed/exhausted download — so an
+     * absent entry here means "don't resurrect this."
      */
     _retryDownload(fileId) {
+        if (!this.pendingDownloads.has(fileId)) return;
+
         const retryInfo = this.activeTransfers.get(`retry:${fileId}`);
         const attempt = retryInfo ? retryInfo.attempt + 1 : 1;
         this.activeTransfers.delete(`retry:${fileId}`);
 
         const delay = this.RETRY_BASE_DELAY * Math.pow(2, attempt - 1);
-        setTimeout(() => this._requestDownloadWithRetry(fileId, attempt), delay);
+        setTimeout(() => {
+            if (!this.pendingDownloads.has(fileId)) return; // cancelled while waiting
+            this._requestDownloadWithRetry(fileId, attempt);
+        }, delay);
     }
 
     /**
@@ -598,6 +771,8 @@ class LADEXApp {
         const transferId = `send:${fileId}:${targetSessionId}`;
 
         // 1. Send metadata header as a text message
+        // Phase 11.3: include sha256 if we've already computed it
+        const sha256 = this._localSha256.get(fileId) || null;
         try {
             dc.send(JSON.stringify({
                 fileId,
@@ -605,6 +780,7 @@ class LADEXApp {
                 fileSize: file.size,
                 mimeType: file.type || 'application/octet-stream',
                 totalChunks,
+                sha256, // null if hash not yet ready (large file), receiver verifies lazily
             }));
         } catch (err) {
             console.error('Failed to send file header:', err);
@@ -613,7 +789,10 @@ class LADEXApp {
         }
 
         this.activeTransfers.set(transferId, { startTime: Date.now(), bytesSent: 0, totalBytes: file.size });
-        this.showProgress(`Sending ${file.name}`, 0);
+        this._transferPeers.set(transferId, targetSessionId);
+        // BUG-12 fix: each transfer gets its own progress card, keyed by
+        // transferId — see showProgress()/hideProgress().
+        this.showProgress(transferId, `Sending ${file.name}`, 0, null, null, 0, file.size);
 
         // 2. Stream binary chunks using file.slice() (disk → DataChannel)
         for (let i = 0; i < totalChunks; i++) {
@@ -629,7 +808,7 @@ class LADEXApp {
             if (dc.readyState !== 'open') {
                 console.warn('DataChannel closed mid-transfer (sender)');
                 this.activeTransfers.delete(transferId);
-                this.hideProgress();
+                this.hideProgress(transferId);
                 return;
             }
 
@@ -647,7 +826,7 @@ class LADEXApp {
                 if (bpAttempts > 500) {
                     console.warn('Back-pressure timeout (sender)');
                     this.activeTransfers.delete(transferId);
-                    this.hideProgress();
+                    this.hideProgress(transferId);
                     this.closeRTC(targetSessionId);
                     return;
                 }
@@ -658,7 +837,7 @@ class LADEXApp {
             } catch (err) {
                 console.error('DC send error:', err);
                 this.activeTransfers.delete(transferId);
-                this.hideProgress();
+                this.hideProgress(transferId);
                 this.closeRTC(targetSessionId);
                 return;
             }
@@ -671,12 +850,12 @@ class LADEXApp {
                 const elapsed = (Date.now() - transfer.startTime) / 1000;
                 const speed = elapsed > 0 ? end / elapsed : 0;
                 const remaining = speed > 0 ? (file.size - end) / speed : 0;
-                this.showProgress(`Sending ${file.name}`, pct, speed, remaining);
+                this.showProgress(transferId, `Sending ${file.name}`, pct, speed, remaining, end, file.size);
             }
         }
 
         this.activeTransfers.delete(transferId);
-        this.hideProgress();
+        this.hideProgress(transferId);
         this.toast(`Sent ${file.name}`, 'success');
         console.log(`File ${file.name} sent to ${targetSessionId.slice(-6)}`);
 
@@ -733,11 +912,13 @@ class LADEXApp {
             }
         };
 
-        // When the sender's DataChannel arrives
+        // When the sender's DataChannel arrives — Phase 8: show consent dialog first
         pc.ondatachannel = (event) => {
             const dc = event.channel;
             dc.binaryType = 'arraybuffer';
-            this.setupReceiverDC(dc, from_session_id);
+            // Buffer the first message (the JSON header) to get file metadata,
+            // then pause and show the consent dialog before resuming.
+            this._handleIncomingDCWithConsent(dc, from_session_id);
         };
 
         try {
@@ -813,33 +994,264 @@ class LADEXApp {
     }
 
     /**
-     * Set up a DataChannel on the receiver side.
-     * First message = JSON header, subsequent messages = binary chunks.
+     * Phase 8 §8.5: Intercept the first DC message (metadata header),
+     * then pause and show a consent dialog before starting the receive.
+     * The DataChannel is effectively paused until the user accepts or declines.
+     *
+     * BUG-02 fix: the sender starts streaming binary chunks immediately
+     * after the header (see streamFileOverDC) — it doesn't wait for any
+     * acknowledgement. RTCDataChannel does not queue 'message' events for a
+     * listener that gets attached later, so every chunk that arrived while
+     * the consent dialog (and any async showSaveFilePicker() prompt) was
+     * still waiting on the user used to fire into the void and be lost —
+     * silently corrupting or hanging every transfer. We now buffer anything
+     * that isn't the header here; _installChunkReceiver() replays the
+     * buffer, in order, once the real receiver handler is ready.
      */
-    setupReceiverDC(dc, fromPeerId) {
-        let meta = null;       // filled on first message
+    _handleIncomingDCWithConsent(dc, fromPeerId) {
+        dc._pendingChunks = [];
+        let headerHandled = false;
+
+        dc.onmessage = (event) => {
+            if (!headerHandled) {
+                headerHandled = true;
+                let meta;
+                try {
+                    meta = JSON.parse(event.data);
+                } catch {
+                    console.error('Invalid file header in consent flow');
+                    this.closeRTC(fromPeerId);
+                    return;
+                }
+                this._showTransferConsentDialog(meta, fromPeerId, dc);
+                return;
+            }
+            // A binary chunk arriving before the user has responded (or
+            // while showSaveFilePicker() is awaiting them) — buffer it.
+            dc._pendingChunks.push(event.data);
+        };
+    }
+
+    /**
+     * BUG-02 fix: install the real per-chunk handler on a DataChannel that
+     * was buffering chunks during the consent dialog. Replays anything that
+     * arrived early, in order, through the exact same path as live chunks,
+     * then hands off future messages to it too.
+     */
+    _installChunkReceiver(dc, onChunk) {
+        const queued = dc._pendingChunks || [];
+        dc._pendingChunks = null;
+        dc.onmessage = (event) => {
+            if (typeof event.data === 'string') return; // stray text frame
+            onChunk(event.data);
+        };
+        for (const chunk of queued) onChunk(chunk);
+    }
+
+    /**
+     * Phase 8 §8.5: Non-blocking consent dialog.
+     * Accept → opens showSaveFilePicker (or falls back to Blob path).
+     * Decline → sends transfer_declined to sender.
+     */
+    _showTransferConsentDialog(meta, fromPeerId, dc) {
+        // BUG-05 fix: fromPeerId is a peer-chosen session_id, not trustworthy.
+        const senderShort = this.escapeHtml(fromPeerId.slice(-6));
+        const sizeStr = this.formatFileSize(meta.fileSize);
+
+        // Remove any existing dialog
+        document.getElementById('incoming-file-dialog')?.remove();
+
+        const dialog = document.createElement('div');
+        dialog.id = 'incoming-file-dialog';
+        dialog.className = 'incoming-file-dialog';
+        dialog.innerHTML = `
+            <div class="ifd-inner">
+                <div class="ifd-icon">📥</div>
+                <div class="ifd-title">Incoming file from <strong>${senderShort}</strong></div>
+                <div class="ifd-name">&ldquo;${this.escapeHtml(meta.fileName)}&rdquo;</div>
+                <div class="ifd-size">${sizeStr}</div>
+                <div class="ifd-actions">
+                    <button id="ifd-accept" class="btn btn-primary">Accept &amp; choose save location</button>
+                    <button id="ifd-decline" class="btn btn-danger">Decline</button>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(dialog);
+
+        document.getElementById('ifd-accept').addEventListener('click', async () => {
+            dialog.remove();
+            // Phase 8: FSAA path (primary)
+            if (window.showSaveFilePicker) {
+                await this._setupFSAAReceive(dc, meta, fromPeerId);
+            } else {
+                // Fallback: classic Blob-accumulator path
+                this.setupReceiverDC(dc, fromPeerId, meta);
+            }
+        });
+
+        document.getElementById('ifd-decline').addEventListener('click', () => {
+            dialog.remove();
+            // Notify sender of decline
+            this.sendWS({
+                type: 'transfer_declined',
+                session_id: this.sessionId,
+                file_id: meta.fileId,
+            });
+            this.closeRTC(fromPeerId);
+        });
+    }
+
+    /**
+     * Phase 8 §8.2: FSAA streaming receive.
+     * Chunks are written sequentially to a FileSystemWritableFileStream.
+     * O(1) memory: only one chunk is live at any time.
+     * The sequential `await writable.write()` provides natural receive-side backpressure.
+     */
+    async _setupFSAAReceive(dc, meta, fromPeerId) {
+        let fileHandle;
+        try {
+            fileHandle = await window.showSaveFilePicker({
+                suggestedName: meta.fileName,
+                types: [{ description: 'File', accept: { [meta.mimeType || 'application/octet-stream']: [] } }],
+            });
+        } catch (err) {
+            if (err.name === 'AbortError') {
+                // User dismissed the picker
+                this.sendWS({ type: 'transfer_declined', session_id: this.sessionId, file_id: meta.fileId });
+                this.closeRTC(fromPeerId);
+                return;
+            }
+            // Unexpected error — fall back to Blob path
+            console.warn('showSaveFilePicker failed, falling back:', err);
+            this.setupReceiverDC(dc, fromPeerId, meta);
+            return;
+        }
+
+        let writable;
+        try {
+            writable = await fileHandle.createWritable();
+        } catch (err) {
+            console.error('createWritable failed:', err);
+            this.toast('Could not open file for writing.', 'error');
+            this.closeRTC(fromPeerId);
+            return;
+        }
+
+        let receivedBytes = 0;
+        const startTime = Date.now();
+        let transferComplete = false;
+        // BUG-12 fix: keyed by fileId (not fileId+peer) — a retry can pick
+        // a different host peer for the same logical download, and the
+        // user's progress card should follow the download, not the peer.
+        const transferId = `dl:${meta.fileId}`;
+        this._transferPeers.set(transferId, fromPeerId);
+        this.showProgress(transferId, `Downloading ${meta.fileName}`, 0, null, null, 0, meta.fileSize);
+        console.log(`[FSAA] Receiving ${meta.fileName} (${this.formatFileSize(meta.fileSize)})`);
+
+        // Use an async queue so we never process two chunks concurrently
+        // and the DC’s JS buffer can’t grow unboundedly.
+        let writeChain = Promise.resolve();
+
+        const onChunk = (chunk) => {
+            // Chain writes — each write waits for the previous one
+            writeChain = writeChain.then(async () => {
+                if (transferComplete) return;
+                try {
+                    await writable.write(chunk);  // sequential, backpressure-safe
+                } catch (err) {
+                    console.error('Write error:', err);
+                    transferComplete = true;
+                    try { await writable.close(); } catch (_) {}
+                    this.hideProgress(transferId);
+                    this.toast(`Write error while receiving ${meta.fileName}`, 'error');
+                    this.closeRTC(fromPeerId);
+                    return;
+                }
+                receivedBytes += chunk.byteLength;
+                const pct = Math.round((receivedBytes / meta.fileSize) * 100);
+                const elapsed = (Date.now() - startTime) / 1000;
+                const speed = elapsed > 0 ? receivedBytes / elapsed : 0;
+                const remaining = speed > 0 ? (meta.fileSize - receivedBytes) / speed : 0;
+                this.showProgress(transferId, `Downloading ${meta.fileName}`, pct, speed, remaining, receivedBytes, meta.fileSize);
+
+                if (receivedBytes >= meta.fileSize) {
+                    transferComplete = true;
+                    try {
+                        await writable.close();
+                    } catch (err) {
+                        console.warn('writable.close() error:', err);
+                    }
+                    this.hideProgress(transferId);
+                    this.pendingDownloads.delete(meta.fileId);
+                    this.activeTransfers.delete(`retry:${meta.fileId}`);
+                    this.toast(`Downloaded ${meta.fileName} (${this.formatFileSize(meta.fileSize)})`, 'success', 5000);
+                    console.log(`[FSAA] Download complete: ${meta.fileName}`);
+                    // Notify server we now also host this file
+                    this.sendWS({ type: 'file_downloaded', session_id: this.sessionId, file_id: meta.fileId });
+                    setTimeout(() => this.closeRTC(fromPeerId), 2000);
+                }
+            });
+        };
+
+        // BUG-02 fix: replay any chunks buffered during the consent dialog /
+        // showSaveFilePicker() prompt, then hand off future ones the same way.
+        this._installChunkReceiver(dc, onChunk);
+
+        dc.onclose = () => {
+            if (!transferComplete && meta && receivedBytes < meta.fileSize) {
+                writeChain.then(async () => {
+                    try { await writable.close(); } catch (_) {}
+                });
+                this.hideProgress(transferId);
+                const wasCancelled = this.cancelledTransfers.has(`cancelled:${meta.fileId}`);
+                if (!wasCancelled) {
+                    this.toast(`Transfer interrupted: ${meta.fileName} — retrying…`, 'warning');
+                    this._retryDownload(meta.fileId);
+                } else {
+                    this.cancelledTransfers.delete(`cancelled:${meta.fileId}`);
+                }
+            }
+        };
+
+        dc.onerror = (err) => {
+            console.error('DC error (FSAA receive):', err);
+            if (!transferComplete) {
+                writeChain.then(async () => {
+                    try { await writable.close(); } catch (_) {}
+                });
+                this.hideProgress(transferId);
+                if (meta && !this.cancelledTransfers.has(`cancelled:${meta.fileId}`)) {
+                    this.toast(`Transfer error: ${meta.fileName} — retrying…`, 'warning');
+                    this._retryDownload(meta.fileId);
+                }
+            }
+        };
+    }
+
+    /**
+     * Set up a DataChannel on the receiver side (legacy Blob path).
+     * Used when showSaveFilePicker is not available (Firefox/Safari).
+     *
+     * BUG-02 fix: `meta` is now passed in from the consent dialog instead
+     * of being re-parsed from "the first message" — that header was already
+     * consumed by _handleIncomingDCWithConsent before this function is ever
+     * called, so waiting for it again here meant this fallback path was
+     * broken independently of the chunk-buffering bug (it would try to
+     * JSON.parse the first binary chunk and fail).
+     */
+    setupReceiverDC(dc, fromPeerId, meta) {
         let chunks = [];
         let receivedBytes = 0;
         let startTime = Date.now();
         let transferComplete = false;  // Flag to prevent onclose from firing after success
+        // BUG-12 fix: see the matching comment in _setupFSAAReceive.
+        const transferId = `dl:${meta.fileId}`;
+        this._transferPeers.set(transferId, fromPeerId);
 
-        dc.onmessage = (event) => {
-            // First message is the JSON header (string)
-            if (!meta) {
-                try {
-                    meta = JSON.parse(event.data);
-                } catch (err) {
-                    console.error('Invalid file header:', err);
-                    this.closeRTC(fromPeerId);
-                    return;
-                }
-                console.log(`Receiving ${meta.fileName} (${this.formatFileSize(meta.fileSize)}) from ${fromPeerId.slice(-6)}`);
-                this.showProgress(`Downloading ${meta.fileName}`, 0);
-                return;
-            }
+        console.log(`Receiving ${meta.fileName} (${this.formatFileSize(meta.fileSize)}) from ${fromPeerId.slice(-6)}`);
+        this.showProgress(transferId, `Downloading ${meta.fileName}`, 0, null, null, 0, meta.fileSize);
 
-            // Subsequent messages are binary ArrayBuffers
-            const chunk = event.data;           // ArrayBuffer
+        const onChunk = (chunk) => {
             chunks.push(chunk);
             receivedBytes += chunk.byteLength;
 
@@ -847,7 +1259,7 @@ class LADEXApp {
             const elapsed = (Date.now() - startTime) / 1000;
             const speed = elapsed > 0 ? receivedBytes / elapsed : 0;
             const remaining = speed > 0 ? (meta.fileSize - receivedBytes) / speed : 0;
-            this.showProgress(`Downloading ${meta.fileName}`, pct, speed, remaining);
+            this.showProgress(transferId, `Downloading ${meta.fileName}`, pct, speed, remaining, receivedBytes, meta.fileSize);
 
             // All chunks received?
             if (receivedBytes >= meta.fileSize) {
@@ -856,18 +1268,22 @@ class LADEXApp {
             }
         };
 
+        // BUG-02 fix: replay any chunks buffered during the consent dialog,
+        // then hand off future ones the same way.
+        this._installChunkReceiver(dc, onChunk);
+
         dc.onclose = () => {
             console.log('DataChannel closed (receiver side)');
             // If we received all data before close, finalizeReceivedFile
             // already handled it.  If not, the transfer was interrupted.
             // BUT: don't retry if user manually cancelled
-            const wasCancelled = this.cancelledTransfers.has(`cancelled:${meta?.fileId}`);
+            const wasCancelled = this.cancelledTransfers.has(`cancelled:${meta.fileId}`);
             if (wasCancelled) {
                 this.cancelledTransfers.delete(`cancelled:${meta.fileId}`);
                 return; // User cancelled, don't retry
             }
-            if (!transferComplete && meta && receivedBytes < meta.fileSize) {
-                this.hideProgress();
+            if (!transferComplete && receivedBytes < meta.fileSize) {
+                this.hideProgress(transferId);
                 this.toast(`Transfer interrupted: ${meta.fileName} — retrying…`, 'warning');
                 this._retryDownload(meta.fileId);
             }
@@ -875,17 +1291,15 @@ class LADEXApp {
 
         dc.onerror = (err) => {
             console.error('DataChannel error (receiver):', err);
-            const wasCancelled = this.cancelledTransfers.has(`cancelled:${meta?.fileId}`);
+            const wasCancelled = this.cancelledTransfers.has(`cancelled:${meta.fileId}`);
             if (wasCancelled) {
                 this.cancelledTransfers.delete(`cancelled:${meta.fileId}`);
                 return; // User cancelled, don't retry
             }
             if (!transferComplete) {
-                this.hideProgress();
-                if (meta) {
-                    this.toast(`Transfer error: ${meta.fileName} — retrying…`, 'warning');
-                    this._retryDownload(meta.fileId);
-                }
+                this.hideProgress(transferId);
+                this.toast(`Transfer error: ${meta.fileName} — retrying…`, 'warning');
+                this._retryDownload(meta.fileId);
             }
         };
     }
@@ -901,7 +1315,7 @@ class LADEXApp {
         // Trigger browser "Save As"
         this.saveFileToDisk(file, meta.fileName);
 
-        this.hideProgress();
+        this.hideProgress(`dl:${meta.fileId}`);
         this.pendingDownloads.delete(meta.fileId);
         this.activeTransfers.delete(`retry:${meta.fileId}`);
         this.toast(`Downloaded ${meta.fileName} (${this.formatFileSize(meta.fileSize)})`, 'success', 5000);
@@ -970,7 +1384,7 @@ class LADEXApp {
             this.handleFileUpload(e.target.files, true);
             e.target.value = '';
         });
-        document.getElementById('cancel-transfer').addEventListener('click', () => {
+        document.getElementById('cancel-all-transfers').addEventListener('click', () => {
             this.cancelActiveTransfer();
         });
         document.getElementById('send-message-btn').addEventListener('click', () => {
@@ -992,6 +1406,19 @@ class LADEXApp {
         document.getElementById('messages-modal').addEventListener('click', (e) => {
             if (e.target.id === 'messages-modal') this.hideMessageModal();
         });
+        // BUG-05 fix: delegated handler for the file/message list, which is
+        // rebuilt (and re-populated with peer-controlled data) on every
+        // updateFileList() call — data-action attributes instead of inline
+        // onclick="app.foo('${id}')" strings.
+        document.getElementById('files-list').addEventListener('click', (e) => {
+            const btn = e.target.closest('[data-action]');
+            if (!btn) return;
+            if (btn.dataset.action === 'download-file') {
+                this.downloadFile(btn.dataset.fileId);
+            } else if (btn.dataset.action === 'view-message') {
+                this.viewMessage(btn.dataset.messageId);
+            }
+        });
         this.updateSendButton();
     }
 
@@ -1012,6 +1439,15 @@ class LADEXApp {
             return;
         }
 
+        // BUG-05 fix: file/message ids, sender/host ids and content all
+        // originate from other peers on the LAN (or, before the BUG-06 CSWSH
+        // fix, potentially from an arbitrary website) — none of it is
+        // trustworthy. Everything interpolated below is escaped, and the
+        // two actions that used to be inline onclick="app.foo('${id}')"
+        // handlers (a nested HTML-attribute-inside-JS-string context that's
+        // easy to break out of even with escaping) are now data-action
+        // attributes read by a single delegated listener in
+        // setupEventListeners() instead.
         tbody.innerHTML = allItems.map(item => {
             if (item.type === 'file') {
                 const f = item.data;
@@ -1026,19 +1462,19 @@ class LADEXApp {
                             <div class="file-hosts">
                                 ${hosts.map(h => h === this.sessionId
                                     ? '<span class="host-badge host-self">You</span>'
-                                    : `<span class="host-badge">${h.slice(-6)}</span>`
+                                    : `<span class="host-badge">${this.escapeHtml(h.slice(-6))}</span>`
                                 ).join('')}
                             </div>
                         </td>
                         <td class="file-actions">
                             ${hosts.length > 0
-                                ? `<button class="btn download${isDownloading ? ' downloading' : ''}" onclick="app.downloadFile('${f.id}')" ${isDownloading ? 'disabled' : ''}>${isDownloading ? '⏳ Downloading…' : '⬇️ Download'}</button>`
+                                ? `<button class="btn download${isDownloading ? ' downloading' : ''}" data-action="download-file" data-file-id="${this.escapeHtml(f.id)}" ${isDownloading ? 'disabled' : ''}>${isDownloading ? '⏳ Downloading…' : '⬇️ Download'}</button>`
                                 : '<span style="color:#a0aec0;">No hosts</span>'}
                         </td>
                     </tr>`;
             } else {
                 const m = item.data;
-                const who = m.sender_id === this.sessionId ? 'You' : `User ${m.sender_id.slice(-6)}`;
+                const who = m.sender_id === this.sessionId ? 'You' : `User ${this.escapeHtml(m.sender_id.slice(-6))}`;
                 const preview = m.content.length > 50 ? m.content.substring(0, 50) + '…' : m.content;
                 return `
                     <tr class="message-row">
@@ -1047,86 +1483,161 @@ class LADEXApp {
                         <td class="file-size">${m.content.length} chars</td>
                         <td><span class="host-badge">${who}</span></td>
                         <td class="file-actions">
-                            <button class="btn download" onclick="app.viewMessage('${m.id}')">View</button>
+                            <button class="btn download" data-action="view-message" data-message-id="${this.escapeHtml(m.id)}">View</button>
                         </td>
                     </tr>`;
             }
         }).join('');
     }
 
-    // ── Progress modal ──────────────────────────────────────────────────
+    // =====================================================================
+    //  PROGRESS PANEL  (BUG-12 fix)
+    //
+    //  Used to be one global modal shared by every send/receive — a second
+    //  concurrent transfer would overwrite the first's numbers, and either
+    //  one finishing/failing would call hideProgress() with no id and hide
+    //  it out from under the other. Now it's a docked panel holding one
+    //  card per transferId, so concurrent transfers each get their own
+    //  progress bar, byte counter, and Cancel button that only cancels
+    //  that one transfer.
+    //
+    //  transferId convention: `send:${fileId}:${targetSessionId}` for an
+    //  upload (peer-specific — sending the same file to two peers at once
+    //  is genuinely two transfers), `dl:${fileId}` for a download (NOT
+    //  peer-specific — a retry can pick a different host for the same
+    //  logical download, and the card should follow the download).
+    // =====================================================================
 
-    showProgress(filename, percentage, speedBytesPerSec, etaSeconds) {
-        const modal      = document.getElementById('progress-modal');
-        const filenameEl = document.getElementById('progress-filename');
-        const pctEl      = document.getElementById('progress-percentage');
-        const fillEl     = document.getElementById('progress-fill');
-        const speedEl    = document.getElementById('progress-speed');
-        const etaEl      = document.getElementById('progress-eta');
-        const bytesEl    = document.getElementById('progress-bytes');
-        if (!modal) return;
+    showProgress(transferId, filename, percentage, speedBytesPerSec, etaSeconds, transferredBytes, totalBytes) {
+        const list = document.getElementById('progress-list');
+        const panel = document.getElementById('progress-panel');
+        if (!list || !panel) return;
 
-        if (filenameEl) filenameEl.textContent = filename;
-        if (pctEl)      pctEl.textContent = `${percentage}%`;
-        if (fillEl)     fillEl.style.width = `${percentage}%`;
-
-        if (speedEl) {
-            speedEl.textContent = speedBytesPerSec != null
-                ? `${this.formatFileSize(speedBytesPerSec)}/s`
-                : '';
+        let card = this._progressCards.get(transferId);
+        if (!card) {
+            card = document.createElement('div');
+            card.className = 'progress-card';
+            card.innerHTML = `
+                <div class="progress-info">
+                    <span class="progress-filename"></span>
+                    <span class="progress-percentage"></span>
+                </div>
+                <div class="progress-bar"><div class="progress-fill"></div></div>
+                <div class="progress-stats">
+                    <span class="progress-speed"></span>
+                    <span class="progress-eta"></span>
+                </div>
+                <div class="progress-bytes"></div>
+                <button class="btn secondary progress-cancel">Cancel</button>
+            `;
+            card.querySelector('.progress-cancel').addEventListener('click', () => {
+                this.cancelTransfer(transferId);
+            });
+            list.appendChild(card);
+            this._progressCards.set(transferId, card);
         }
-        if (etaEl) {
-            if (etaSeconds != null && isFinite(etaSeconds)) {
-                const s = Math.round(etaSeconds);
-                if (s < 60) etaEl.textContent = `${s}s left`;
-                else if (s < 3600) etaEl.textContent = `${Math.floor(s/60)}m ${s%60}s left`;
-                else etaEl.textContent = `${Math.floor(s/3600)}h ${Math.floor((s%3600)/60)}m left`;
-            } else {
-                etaEl.textContent = 'Calculating…';
-            }
+
+        card.querySelector('.progress-filename').textContent = filename;
+        card.querySelector('.progress-percentage').textContent = `${percentage}%`;
+        card.querySelector('.progress-fill').style.width = `${percentage}%`;
+        card.querySelector('.progress-speed').textContent = speedBytesPerSec != null
+            ? `${this.formatFileSize(speedBytesPerSec)}/s`
+            : '';
+
+        const etaEl = card.querySelector('.progress-eta');
+        if (etaSeconds != null && isFinite(etaSeconds)) {
+            const s = Math.round(etaSeconds);
+            if (s < 60) etaEl.textContent = `${s}s left`;
+            else if (s < 3600) etaEl.textContent = `${Math.floor(s/60)}m ${s%60}s left`;
+            else etaEl.textContent = `${Math.floor(s/3600)}h ${Math.floor((s%3600)/60)}m left`;
+        } else {
+            etaEl.textContent = 'Calculating…';
         }
 
-        // Show transferred / total bytes
-        if (bytesEl) {
-            // Determine total from an active transfer
-            let transferred = 0, total = 0;
-            for (const [, t] of this.activeTransfers) {
-                if (t.totalBytes) {
-                    transferred = t.bytesSent || 0;
-                    total = t.totalBytes;
-                    break;
-                }
-            }
-            bytesEl.textContent = total > 0
-                ? `${this.formatFileSize(transferred)} / ${this.formatFileSize(total)}`
-                : '';
-        }
+        card.querySelector('.progress-bytes').textContent = totalBytes > 0
+            ? `${this.formatFileSize(transferredBytes || 0)} / ${this.formatFileSize(totalBytes)}`
+            : '';
 
-        modal.style.display = 'block';
+        panel.classList.add('visible');
     }
 
-    hideProgress() {
-        const modal = document.getElementById('progress-modal');
-        if (modal) modal.style.display = 'none';
+    hideProgress(transferId) {
+        const card = this._progressCards.get(transferId);
+        if (card) {
+            card.remove();
+            this._progressCards.delete(transferId);
+        }
+        this._transferPeers.delete(transferId);
+        const panel = document.getElementById('progress-panel');
+        if (panel && !this._progressCards.size) panel.classList.remove('visible');
     }
 
-    cancelActiveTransfer() {
-        // Mark all current transfers as cancelled so async loops break
-        for (const [id] of this.activeTransfers) {
-            this.cancelledTransfers.add(id);
-        }
-        // Mark all pending downloads as cancelled to prevent retry
-        for (const fileId of this.pendingDownloads) {
+    /** Cancel one transfer by id — used by each card's own Cancel button. */
+    cancelTransfer(transferId) {
+        this.cancelledTransfers.add(transferId);
+        if (transferId.startsWith('dl:')) {
+            const fileId = transferId.slice('dl:'.length);
             this.cancelledTransfers.add(`cancelled:${fileId}`);
+            this.pendingDownloads.delete(fileId);
         }
-        // Close all active RTC connections to abort transfers
-        for (const [peerId] of this.rtcConnections) {
-            this.closeRTC(peerId);
-        }
-        this.activeTransfers.clear();
-        this.pendingDownloads.clear();
-        this.hideProgress();
+        this.activeTransfers.delete(transferId);
+        const peerId = this._transferPeers.get(transferId);
+        if (peerId) this.closeRTC(peerId);
+        this.hideProgress(transferId);
         this.toast('Transfer cancelled', 'info');
+    }
+
+    /** Cancel every in-flight transfer — bound to the panel's "Cancel all" button. */
+    cancelActiveTransfer() {
+        const ids = new Set([
+            ...this.activeTransfers.keys(),
+            ...Array.from(this.pendingDownloads, fileId => `dl:${fileId}`),
+        ]);
+        for (const id of ids) this.cancelTransfer(id);
+        if (ids.size === 0) this.toast('No transfers in progress', 'info');
+    }
+
+    /**
+     * Phase 8 §8.3: Show a persistent warning banner for browsers lacking FSAA.
+     * Keeps the legacy Blob path working but lets users know about the limitation.
+     */
+    _showFsaaBanner() {
+        if (document.getElementById('fsaa-warning-banner')) return;
+        const banner = document.createElement('div');
+        banner.id = 'fsaa-warning-banner';
+        banner.className = 'system-banner system-banner-warning';
+        banner.innerHTML = `
+            <span>⚠️ Your browser does not support streaming downloads.
+            Files larger than ~2 GB may cause this tab to crash.
+            Use Chrome or Edge for large-file transfers.</span>
+            <button class="banner-dismiss" onclick="this.parentElement.remove()">✕</button>
+        `;
+        document.body.prepend(banner);
+    }
+
+    /**
+     * Phase 10 §10.4: Show a sticky AP isolation diagnostic banner.
+     * Non-dismissible initially; user can close after reading.
+     */
+    _showApIsolationBanner(message) {
+        if (document.getElementById('ap-isolation-banner')) return; // already shown
+        const banner = document.createElement('div');
+        banner.id = 'ap-isolation-banner';
+        banner.className = 'system-banner system-banner-error';
+        banner.innerHTML = `
+            <div class="banner-content">
+                <strong>⚠️ No other LADEX nodes found on this network.</strong>
+                <span>If you expect other devices to be present, check:</span>
+                <ul>
+                    <li>All devices are on the <strong>same Wi-Fi network</strong></li>
+                    <li><strong>AP/client isolation</strong> is disabled on your router (common on guest networks and mobile hotspots)</li>
+                    <li>No firewall is blocking <strong>UDP port 7878</strong> or <strong>TCP port 8080</strong></li>
+                </ul>
+            </div>
+            <button class="banner-dismiss" onclick="this.parentElement.remove()">✕</button>
+        `;
+        document.body.prepend(banner);
+        console.warn('AP isolation diagnostic:', message);
     }
 
     showError(message) {
@@ -1140,7 +1651,20 @@ class LADEXApp {
 // =====================================================================
 
 document.addEventListener('DOMContentLoaded', () => {
-    window.app = new LADEXApp();
+    try {
+        window.app = new LADEXApp();
+    } catch (err) {
+        // BUG-01 fix: if construction throws, window.app is never assigned
+        // and every inline onclick="app.…" handler in the DOM fails with an
+        // opaque "app is not defined" — surface the real cause instead.
+        console.error('LADEX failed to start:', err);
+        const banner = document.createElement('div');
+        banner.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:9999;' +
+            'background:#c0392b;color:#fff;padding:12px 16px;font:14px sans-serif;';
+        banner.textContent = `LADEX failed to start: ${err.message || err}. ` +
+            'Check the browser console for details, then reload the page.';
+        document.body.appendChild(banner);
+    }
 });
 
 window.addEventListener('beforeunload', () => {
@@ -1226,8 +1750,18 @@ LADEXApp.prototype.updateSendButton = function() {
     btn.disabled = !document.getElementById('message-input').value.trim();
 };
 
+// BUG-05 fix: the previous implementation (textContent → innerHTML
+// round-trip through a scratch <div>) only escapes characters that are
+// special in HTML *text* content (&, <, >). It leaves " and ' untouched,
+// which is fine for text nodes but unsafe wherever escaped output lands
+// inside an HTML attribute value (e.g. data-file-id="${...}") — an
+// attacker-controlled id containing `"` could close the attribute early
+// and inject new ones. This version is safe in both contexts.
 LADEXApp.prototype.escapeHtml = function(text) {
-    const d = document.createElement('div');
-    d.textContent = text;
-    return d.innerHTML;
+    return String(text)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
 };

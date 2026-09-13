@@ -46,6 +46,7 @@ use tokio::sync::RwLock;
 use crate::mesh;
 use crate::auth;
 use crate::NodeState;
+use crate::types::hostname;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -368,15 +369,3 @@ pub fn build_announce(state: &NodeState, http_port: u16) -> AnnouncePacket {
     }
 }
 
-/// Returns the system hostname, or a fallback label.
-fn hostname() -> String {
-    std::env::var("HOSTNAME")
-        .or_else(|_| {
-            use std::process::Command;
-            Command::new("hostname")
-                .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                .map_err(|_| std::env::VarError::NotPresent)
-        })
-        .unwrap_or_else(|_| "LADEX Node".to_string())
-}

@@ -74,6 +74,17 @@ pub fn prune_tombstones(local: &mut HashMap<String, FileMetadata>) {
     local.retain(|_, f| !f.deleted || (now_ms - f.deleted_at) < TOMBSTONE_TTL_MS);
 }
 
+/// BUG-08 fix companion: remove peer-departure tombstones whose `left_at` is
+/// more than 60 seconds old, mirroring `prune_tombstones` above. Without
+/// this, a correctly-propagated departure tombstone would sit in
+/// `local_peers` forever (harmless to correctness — `left: true` is still
+/// respected everywhere it's checked — but an unbounded, pointless leak).
+pub fn prune_peer_tombstones(local: &mut HashMap<SessionId, PeerInfo>) {
+    let now = chrono::Utc::now();
+    const TOMBSTONE_TTL: chrono::Duration = chrono::Duration::seconds(60);
+    local.retain(|_, p| !p.left || p.left_at.map(|t| now - t < TOMBSTONE_TTL).unwrap_or(false));
+}
+
 // ---------------------------------------------------------------------------
 // Merge: chat messages
 // ---------------------------------------------------------------------------
@@ -110,7 +121,7 @@ pub fn merge_messages(local: &mut Vec<TextMessage>, incoming: Vec<TextMessage>) 
 // Merge: peer list
 // ---------------------------------------------------------------------------
 
-/// Merge `incoming` peer infos into `local` using LWW on `connected_at`.
+/// Merge `incoming` peer infos into `local` using LWW.
 /// Peers from remote nodes are stored alongside local peers in `local_peers`
 /// so the browser tab's peer list is a unified view of the whole mesh.
 ///
@@ -119,6 +130,13 @@ pub fn merge_messages(local: &mut Vec<TextMessage>, incoming: Vec<TextMessage>) 
 /// unfortunate but matches the existing field layout — `local_peers` is the
 /// *peer registry visible to the browser*, regardless of where those peers
 /// are physically connected.
+///
+/// BUG-08 fix: the LWW key is `left_at` for a departure tombstone (`left ==
+/// true`) and `connected_at` otherwise — mirrors `merge_files`'s handling
+/// of `deleted`/`deleted_at` above. `left_at` is always set to "now" when a
+/// departure is pushed (see `push_peer_left_to_mesh`), so it reliably beats
+/// whatever `connected_at` it's replacing, unlike the old MIN_UTC sentinel
+/// that could never win an LWW comparison.
 pub fn merge_peers(
     local: &mut HashMap<SessionId, PeerInfo>,
     incoming: Vec<PeerInfo>,
@@ -129,8 +147,9 @@ pub fn merge_peers(
                 local.insert(peer.session_id.clone(), peer);
             }
             Some(existing) => {
-                // LWW: keep whichever has the newer connected_at timestamp.
-                if peer.connected_at > existing.connected_at {
+                let incoming_ts = if peer.left { peer.left_at.unwrap_or(peer.connected_at) } else { peer.connected_at };
+                let existing_ts = if existing.left { existing.left_at.unwrap_or(existing.connected_at) } else { existing.connected_at };
+                if incoming_ts > existing_ts {
                     local.insert(peer.session_id.clone(), peer);
                 }
             }
@@ -170,15 +189,48 @@ pub async fn apply_peer_sync(state: &NodeState, incoming: Vec<PeerInfo>) {
 }
 
 
-/// Apply an incoming chat sync and fan out the full history to local tabs.
+/// BUG-13 fix: cap the in-memory chat history so a long-running node
+/// doesn't accumulate it forever. Messages are kept sorted ascending by
+/// `created_at` everywhere they're inserted, so trimming the front drops
+/// the oldest ones. Chat history isn't authoritative state the way the
+/// file catalog is — silently aging out old messages is an acceptable
+/// tradeoff for bounded memory, same idea as the file tombstone TTL above.
+const MAX_CHAT_MESSAGES: usize = 500;
+pub fn prune_messages(messages: &mut Vec<TextMessage>) {
+    if messages.len() > MAX_CHAT_MESSAGES {
+        let excess = messages.len() - MAX_CHAT_MESSAGES;
+        messages.drain(0..excess);
+    }
+}
+
+/// Apply an incoming chat sync (a mesh peer's full history, sent once after
+/// its handshake — see mesh::post_handshake_sync) and fan out only the
+/// messages we didn't already have to local tabs.
+///
+/// BUG-13 fix: this used to broadcast `ServerMessage::MessageHistory` with
+/// the *entire*, ever-growing merged history on every single ChatSync —
+/// meaning every new mesh connection cost every local browser tab an
+/// O(history size) payload, even though a tab typically already has nearly
+/// all of it (it got its own full snapshot on `join`; see
+/// websocket.rs). The delta is broadcast the same way a freshly-sent local
+/// message already was — one `TextMessage` event per new message, which
+/// the client appends incrementally — instead of a snapshot that replaces
+/// the client's whole array (see app.js handleMessageHistory).
 pub async fn apply_chat_sync(state: &NodeState, incoming: Vec<TextMessage>) {
-    let merged: Vec<TextMessage> = {
+    let new_messages: Vec<TextMessage> = {
         let mut messages = state.messages.write().await;
+        let existing_ids: std::collections::HashSet<String> =
+            messages.iter().map(|m| m.id.clone()).collect();
+        let new_ones: Vec<TextMessage> = incoming.iter()
+            .filter(|m| !existing_ids.contains(&m.id))
+            .cloned()
+            .collect();
         merge_messages(&mut messages, incoming);
-        messages.clone()
+        prune_messages(&mut messages);
+        new_ones
     };
-    if !merged.is_empty() {
-        websocket::broadcast(state, ServerMessage::MessageHistory { messages: merged }).await;
+    for message in new_messages {
+        websocket::broadcast(state, ServerMessage::TextMessage { message }).await;
     }
 }
 
@@ -193,6 +245,7 @@ pub async fn apply_chat_message(state: &NodeState, message: TextMessage) {
             let mut messages = state.messages.write().await;
             messages.push(message.clone());
             messages.sort_by_key(|m| m.created_at);
+            prune_messages(&mut messages); // BUG-13 fix
         }
         websocket::broadcast(state, ServerMessage::TextMessage { message }).await;
     }
@@ -236,18 +289,23 @@ pub async fn push_peer_to_mesh(mesh_peers: &MeshPeers, peer: PeerInfo) {
 }
 
 /// Broadcast a peer departure tombstone to all mesh peers.
-/// We reuse `PeerSync` with a peer whose session is marked offline
-/// by setting `hosting_node_id = None` (signals "this session ended").
-/// Phase 10 adds explicit tombstone fields; for now the absence of a sender
-/// is sufficient for mesh peers to clean up their `local_peers` entry.
+/// We reuse `PeerSync` with a peer marked `left: true` (BUG-08 fix) and
+/// `hosting_node_id: None`. `left_at` is set to "now" so it reliably wins
+/// the LWW comparison in `merge_peers` against whatever `connected_at` the
+/// receiving node currently has for this session — unlike the old
+/// `connected_at: DateTime::MIN_UTC` sentinel, which could never be
+/// greater than a real connection time and so silently lost that
+/// comparison forever, leaving every other mesh node believing a
+/// long-gone browser tab was still a live, routable peer.
 pub async fn push_peer_left_to_mesh(mesh_peers: &MeshPeers, session_id: SessionId) {
-    // A PeerInfo with no hosting_node_id signals departure.
     let departed = PeerInfo {
         session_id: session_id.clone(),
-        connected_at: chrono::DateTime::<chrono::Utc>::MIN_UTC,
+        connected_at: chrono::Utc::now(),
         user_agent: None,
         hosting_node_id: None, // None = departed / offline
         node_rtt_ms: None,
+        left: true,
+        left_at: Some(chrono::Utc::now()),
     };
     push_peer_to_mesh(mesh_peers, departed).await;
 }
