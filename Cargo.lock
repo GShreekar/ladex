@@ -788,6 +788,7 @@ dependencies = [
  "if-addrs",
  "include_dir",
  "mime_guess",
+ "qrcode",
  "rand 0.8.5",
  "rcgen",
  "ring",
@@ -1039,6 +1040,12 @@ checksum = "02b3e5e68a3a1a02aad3ec490a98007cbc13c37cbe84a3cd7b8e406d76e7f778"
 dependencies = [
  "unicode-ident",
 ]
+
+[[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
 
 [[package]]
 name = "quote"

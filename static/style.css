@@ -785,6 +785,42 @@ th:nth-child(5), td:nth-child(5) { width: 15%; }
     background: rgba(0, 0, 0, 0.2);
 }
 
+/* F1: Add a Device (QR code) modal */
+.add-device-modal {
+    max-width: 380px;
+    padding: 0 0 24px;
+    text-align: center;
+}
+
+.add-device-hint {
+    color: rgba(120, 219, 226, 0.8);
+    font-size: 0.9em;
+    margin: 16px 24px 12px;
+}
+
+.qr-code-container {
+    display: flex;
+    justify-content: center;
+    margin: 0 24px;
+    padding: 16px;
+    background: #fff;
+    border-radius: 10px;
+}
+
+.qr-code-container svg {
+    width: 100%;
+    height: auto;
+    max-width: 260px;
+}
+
+.add-device-url {
+    margin: 14px 24px 0;
+    font-size: 0.8em;
+    color: rgba(120, 219, 226, 0.6);
+    word-break: break-all;
+    font-family: 'Orbitron', monospace;
+}
+
 .copy-btn {
     position: absolute;
     top: 8px;

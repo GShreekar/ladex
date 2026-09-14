@@ -686,6 +686,9 @@ async fn main() {
         println!("Access locally: https://localhost:{}", args.port);
         println!("Access from network: https://{local_ip}:{}", args.port);
         println!("Note: your browser will warn about the self-signed certificate on first visit — this is expected for a LAN-local tool with no public CA. Click through (\"Advanced\" → \"Proceed\").");
+        if primary_local_ip.is_some() {
+            print_qr_code(&format!("https://{local_ip}:{}", args.port));
+        }
 
         let internal_server = warp::serve(routes).run(internal_addr);
         tokio::spawn(internal_server);
@@ -706,6 +709,9 @@ async fn main() {
 
         println!("Access locally: http://localhost:{}", args.port);
         println!("Access from network: http://{local_ip}:{}", args.port);
+        if primary_local_ip.is_some() {
+            print_qr_code(&format!("http://{local_ip}:{}", args.port));
+        }
 
         let server_fut = warp::serve(routes).run(addr);
         tokio::select! {
@@ -729,4 +735,18 @@ fn get_local_ip() -> Option<IpAddr> {
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect("8.8.8.8:80").ok()?;
     socket.local_addr().ok().map(|addr| addr.ip())
+}
+
+// F1: scan the URL from a phone instead of typing it in
+fn print_qr_code(url: &str) {
+    use qrcode::{render::unicode, QrCode};
+    match QrCode::new(url) {
+        Ok(code) => {
+            let qr = code.render::<unicode::Dense1x2>()
+                .quiet_zone(false)
+                .build();
+            println!("\nScan to open on your phone:\n{qr}");
+        }
+        Err(e) => tracing::warn!("QR code: failed to encode {url}: {e}"),
+    }
 }

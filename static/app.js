@@ -1406,6 +1406,15 @@ class LADEXApp {
         document.getElementById('messages-modal').addEventListener('click', (e) => {
             if (e.target.id === 'messages-modal') this.hideMessageModal();
         });
+        document.getElementById('add-device-btn').addEventListener('click', () => {
+            this.showAddDeviceModal();
+        });
+        document.getElementById('close-add-device').addEventListener('click', () => {
+            this.hideAddDeviceModal();
+        });
+        document.getElementById('add-device-modal').addEventListener('click', (e) => {
+            if (e.target.id === 'add-device-modal') this.hideAddDeviceModal();
+        });
         // BUG-05 fix: delegated handler for the file/message list, which is
         // rebuilt (and re-populated with peer-controlled data) on every
         // updateFileList() call — data-action attributes instead of inline
@@ -1711,6 +1720,41 @@ LADEXApp.prototype.viewMessage = function(messageId) {
 
 LADEXApp.prototype.hideMessageModal = function() {
     document.getElementById('messages-modal').style.display = 'none';
+};
+
+// F1: QR code so a phone can join by scanning instead of typing the URL
+LADEXApp.prototype.showAddDeviceModal = function() {
+    const url = location.href;
+    document.getElementById('qr-code-container').innerHTML = this._renderQrSvg(url);
+    document.getElementById('add-device-url').textContent = url;
+    document.getElementById('add-device-modal').style.display = 'block';
+};
+
+LADEXApp.prototype.hideAddDeviceModal = function() {
+    document.getElementById('add-device-modal').style.display = 'none';
+};
+
+// Renders a QR code as inline SVG using the vendored qrcode.js encoder
+LADEXApp.prototype._renderQrSvg = function(text, moduleSize = 6) {
+    if (typeof qrcode === 'undefined') {
+        return '<p style="color:#c0392b;padding:20px;">QR library not loaded.</p>';
+    }
+    const qr = qrcode(0, 'M'); // type 0 = auto-pick the smallest size that fits
+    qr.addData(text);
+    qr.make();
+    const count = qr.getModuleCount();
+    const size = count * moduleSize;
+    let modules = '';
+    for (let row = 0; row < count; row++) {
+        for (let col = 0; col < count; col++) {
+            if (qr.isDark(row, col)) {
+                modules += `<rect x="${col * moduleSize}" y="${row * moduleSize}" width="${moduleSize}" height="${moduleSize}"/>`;
+            }
+        }
+    }
+    return `<svg viewBox="0 0 ${size} ${size}" xmlns="http://www.w3.org/2000/svg">` +
+        `<rect width="${size}" height="${size}" fill="#fff"/>` +
+        `<g fill="#16213e">${modules}</g></svg>`;
 };
 
 LADEXApp.prototype.copyMessageContent = function() {
