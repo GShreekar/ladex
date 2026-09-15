@@ -26,4 +26,5 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 if-addrs = "0.15"                   # BUG-03 fix: enumerate local IPv4s for cert SANs
 gethostname = "0.5"                 # BUG-14 fix: read hostname without shelling out
 qrcode = { version = "0.14", default-features = false } # F1: terminal QR code
+mdns-sd = "0.21"                    # F2: advertise ladex.local via mDNS/DNS-SD
 

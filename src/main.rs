@@ -14,6 +14,7 @@ mod discovery;
 mod state;
 mod auth;
 mod tls;
+mod mdns;
 
 use types::*;
 use include_dir::{include_dir, Dir};
@@ -675,6 +676,12 @@ async fn main() {
     // Race the server against a SIGTERM/SIGINT signal. On receiving a
     // signal, broadcast Goodbye to all peers before exiting.
     let state_shutdown = state.clone();
+    let tls_enabled = tls_server_config.is_some();
+
+    // F2: advertise ladex.local alongside the IP-based URLs above — a
+    // memorable alternative, not a replacement, since .local resolution
+    // isn't universally supported.
+    let mdns_handle = mdns::advertise(&local_ips, args.port, tls_enabled);
 
     if let Some(tls_config) = tls_server_config {
         // Public TLS proxy on args.port; warp itself only listens on
@@ -702,6 +709,9 @@ async fn main() {
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("Shutdown: SIGINT received — sending Goodbye to mesh peers");
                 mesh::broadcast_goodbye(&state_shutdown).await;
+                if let Some(handle) = mdns_handle {
+                    mdns::shutdown(handle).await;
+                }
             }
         }
     } else {
@@ -719,6 +729,9 @@ async fn main() {
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("Shutdown: SIGINT received — sending Goodbye to mesh peers");
                 mesh::broadcast_goodbye(&state_shutdown).await;
+                if let Some(handle) = mdns_handle {
+                    mdns::shutdown(handle).await;
+                }
             }
         }
     }

@@ -53,11 +53,25 @@ pub fn install_crypto_provider() {
 /// on the self-signed certificate — a device dialing any of these IPs must
 /// see a cert that actually covers that IP, or the browser adds a second
 /// warning (cert mismatch) on top of the expected self-signed one.
+// Common virtual/container interface name prefixes — their addresses are
+// only reachable from inside that virtual network, not from other devices
+// on the actual LAN, so advertising them (in the TLS cert, the printed
+// URLs, or mDNS) would just point people at a dead end. Not exhaustive,
+// but covers the tools people are overwhelmingly likely to have running
+// alongside LADEX on a dev machine.
+const VIRTUAL_IFACE_PREFIXES: &[&str] = &[
+    "docker", "br-", "veth", "virbr", "tun", "tap", "podman", "lxcbr", "vmnet", "vboxnet",
+];
+
+fn is_virtual_iface(name: &str) -> bool {
+    VIRTUAL_IFACE_PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
 pub fn local_ipv4_addresses() -> Vec<IpAddr> {
     match if_addrs::get_if_addrs() {
         Ok(ifaces) => ifaces
             .into_iter()
-            .filter(|i| !i.is_loopback())
+            .filter(|i| !i.is_loopback() && !is_virtual_iface(&i.name))
             .filter_map(|i| match i.ip() {
                 IpAddr::V4(v4) => Some(IpAddr::V4(v4)),
                 IpAddr::V6(_) => None,
