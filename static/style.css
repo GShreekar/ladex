@@ -365,6 +365,129 @@ section {
     flex-direction: column;
 }
 
+/* F3 / F5: Devices strip */
+.devices-section {
+    padding: 10px 20px 0;
+}
+
+.devices-count {
+    color: rgba(120, 219, 226, 0.6);
+    font-size: 0.85em;
+}
+
+.devices-list {
+    display: flex;
+    gap: 10px;
+    overflow-x: auto;
+    padding-bottom: 8px;
+}
+
+.device-chip {
+    flex: 0 0 auto;
+    min-width: 110px;
+    background: rgba(120, 219, 226, 0.08);
+    border: 1px solid rgba(120, 219, 226, 0.3);
+    border-radius: 12px;
+    padding: 8px 12px;
+    cursor: pointer;
+    transition: all 0.2s ease;
+}
+
+.device-chip:hover {
+    background: rgba(120, 219, 226, 0.16);
+    border-color: rgba(120, 219, 226, 0.5);
+}
+
+.device-chip.device-chip-dragover {
+    background: rgba(120, 219, 226, 0.3);
+    border-color: #78dbe2;
+    transform: scale(1.04);
+}
+
+.device-chip-self {
+    background: linear-gradient(135deg, rgba(255, 119, 198, 0.15), rgba(120, 119, 198, 0.15));
+    border-color: rgba(255, 119, 198, 0.4);
+}
+
+.device-chip-name {
+    font-family: 'Orbitron', monospace;
+    font-size: 0.85em;
+    color: #78dbe2;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.device-chip-you {
+    color: rgba(255, 119, 198, 0.8);
+    font-weight: normal;
+}
+
+.device-chip-host {
+    font-size: 0.7em;
+    color: rgba(120, 219, 226, 0.5);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    margin-top: 2px;
+}
+
+.device-chip-input {
+    width: 100%;
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid #78dbe2;
+    border-radius: 4px;
+    color: #78dbe2;
+    font-family: 'Orbitron', monospace;
+    font-size: 0.85em;
+    padding: 2px 4px;
+}
+
+.send-file-popover {
+    position: fixed;
+    z-index: 1100;
+    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+    border: 1px solid rgba(120, 119, 198, 0.4);
+    border-radius: 10px;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+    padding: 8px;
+    max-width: 260px;
+    max-height: 300px;
+    overflow-y: auto;
+}
+
+.send-file-popover-title {
+    font-family: 'Orbitron', monospace;
+    font-size: 0.8em;
+    color: rgba(120, 219, 226, 0.7);
+    padding: 4px 8px 8px;
+}
+
+.send-file-option {
+    display: block;
+    width: 100%;
+    text-align: left;
+    background: none;
+    border: none;
+    border-radius: 6px;
+    color: #e8e8e8;
+    padding: 8px;
+    cursor: pointer;
+    font-size: 0.85em;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.send-file-option:hover {
+    background: rgba(120, 219, 226, 0.15);
+}
+
+.delete-file-btn {
+    padding: 6px 10px;
+    margin-left: 6px;
+}
+
 h2 {
     font-family: 'Orbitron', monospace;
     font-size: 1.1rem;

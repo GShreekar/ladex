@@ -306,6 +306,8 @@ pub async fn push_peer_left_to_mesh(mesh_peers: &MeshPeers, session_id: SessionI
         node_rtt_ms: None,
         left: true,
         left_at: Some(chrono::Utc::now()),
+        hosting_node_name: None,
+        nickname: None,
     };
     push_peer_to_mesh(mesh_peers, departed).await;
 }

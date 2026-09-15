@@ -177,6 +177,10 @@ pub struct NodeState {
     /// accepting side can't rely on the TCP-level remote address to learn
     /// where a peer that dialed *us* actually is.
     pub local_ip: Option<IpAddr>,
+
+    /// F5: this machine's hostname, shown to peers as the "hosted on"
+    /// label for every browser tab connected to this node.
+    pub node_name: String,
 }
 
 // Convenience accessor — keeps the auth middleware readable.
@@ -413,6 +417,7 @@ async fn main() {
         tls_client_config,
         http_port: args.port,
         local_ip: primary_local_ip,
+        node_name: types::hostname(),
     };
 
     // ── Phase 3: connect to manually-specified peers ─────────────────────

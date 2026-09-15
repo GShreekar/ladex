@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
     <title>LADEX</title>
     <link rel="icon" type="image/svg+xml" href="static/favicon.svg">
-    <link rel="stylesheet" href="static/style.css?v=6">
+    <link rel="stylesheet" href="static/style.css?v=7">
     <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
     <meta http-equiv="Pragma" content="no-cache">
     <meta http-equiv="Expires" content="0">
@@ -66,6 +66,13 @@
                         <p>Drop files here or click to select</p>
                     </div>
                 </div>
+            </section>
+
+            <!-- F3 / F5: connected devices — drag a file row here (or click
+                 a device) to send it directly; click "you" to set a nickname -->
+            <section class="devices-section">
+                <h2>Devices <span id="devices-count" class="devices-count"></span></h2>
+                <div id="devices-list" class="devices-list"></div>
             </section>
 
             <section class="files-section">
@@ -144,7 +151,7 @@
 
     <script src="static/jszip.min.js"></script>
     <script src="static/qrcode.js"></script>
-    <script src="static/app.js?v=11"></script>
+    <script src="static/app.js?v=12"></script>
     <script>
         document.addEventListener('DOMContentLoaded', function() {
             const logoutBtn = document.getElementById('logout-btn');

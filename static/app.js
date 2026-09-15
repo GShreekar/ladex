@@ -28,6 +28,17 @@ class LADEXApp {
         // Phase 6: RTT-aware peer map (same data as this.peers but refreshed via peer_sync)
         // node_rtt_ms is stored on each PeerInfo when received from the server.
 
+        // F5: editable device nickname, persisted per-browser
+        this.nickname = localStorage.getItem('ladex_nickname') || '';
+        // F3: peers whose next incoming DataChannel we already have consent
+        // for — set when the user accepts an IncomingFileOffer, consumed by
+        // _handleIncomingDCWithConsent so it doesn't ask a second time.
+        this._preAcceptedTransfers = new Set();
+        // F4: fileId → name for deletes this tab initiated, so the
+        // 'file_removed' broadcast echo can confirm with the right message
+        // instead of a generic one (or a duplicate toast).
+        this._pendingDeletes = new Map();
+
         // ── WebRTC state ────────────────────────────────────────────────
         // Active RTCPeerConnections keyed by remote sessionId.
         this.rtcConnections = new Map();
@@ -101,6 +112,7 @@ class LADEXApp {
         this.connectWebSocket();
         this.setupEventListeners();
         this.setupDragAndDrop();
+        this.updateDevicesList();
         // Phase 8: warn non-FSAA browsers once on load
         if (!window.showSaveFilePicker) {
             this._showFsaaBanner();
@@ -116,6 +128,116 @@ class LADEXApp {
             return false;
         };
         if (!update()) setTimeout(() => { if (!update()) setTimeout(update, 1000); }, 100);
+    }
+
+    // =====================================================================
+    //  F5: DEVICE NAMES
+    // =====================================================================
+
+    /** Best-effort "OS · Browser" label from a User-Agent string. Modern
+     *  browsers increasingly freeze/generalize UA strings (Chrome's User-Agent
+     *  Reduction, etc.), so exact phone models aren't reliably available
+     *  any more — this gets the OS family plus, for Android, a device model
+     *  when the browser still includes one. */
+    _friendlyDeviceName(userAgent) {
+        if (!userAgent) return null;
+        const ua = userAgent;
+
+        let os = null;
+        if (/iPhone/.test(ua)) os = 'iPhone';
+        else if (/iPad/.test(ua)) os = 'iPad';
+        else if (/Android/.test(ua)) {
+            const m = ua.match(/Android [\d.]+;\s*([^;)]+?)(?:\s+Build\/|\))/);
+            const model = m && m[1] && m[1].trim();
+            os = (model && model !== 'K') ? model : 'Android';
+        }
+        else if (/Windows/.test(ua)) os = 'Windows';
+        else if (/Mac OS X/.test(ua)) os = 'Mac';
+        else if (/Linux/.test(ua)) os = 'Linux';
+
+        let browser = null;
+        if (/Edg\//.test(ua)) browser = 'Edge';
+        else if (/OPR\//.test(ua)) browser = 'Opera';
+        else if (/Firefox\//.test(ua)) browser = 'Firefox';
+        else if (/Chrome\/|CriOS\//.test(ua)) browser = 'Chrome';
+        else if (/Safari\//.test(ua)) browser = 'Safari';
+
+        if (os && browser) return `${os} · ${browser}`;
+        return os || browser || null;
+    }
+
+    /**
+     * Nickname (if set) > UA-derived name > short session id.
+     * `peer` may be undefined (e.g. a host_id we haven't gotten PeerInfo
+     * for yet) — sessionId is passed separately so the fallback still has
+     * something to work with in that case.
+     */
+    _deviceDisplayName(sessionId, peer) {
+        const isSelf = sessionId === this.sessionId;
+        const nickname = isSelf ? this.nickname : peer?.nickname;
+        if (nickname) return nickname;
+        const friendly = this._friendlyDeviceName(peer?.user_agent);
+        if (friendly) return friendly;
+        return `Peer ${sessionId.slice(-6)}`;
+    }
+
+    updateDevicesList() {
+        const list = document.getElementById('devices-list');
+        const countEl = document.getElementById('devices-count');
+        if (!list) return;
+
+        const others = Array.from(this.peers.values()).filter(p => p.session_id !== this.sessionId && !p.left);
+        const self = { session_id: this.sessionId, nickname: this.nickname };
+
+        const chip = (peer, isSelf) => {
+            const name = this.escapeHtml(this._deviceDisplayName(peer.session_id, peer));
+            const host = peer.hosting_node_name ? this.escapeHtml(peer.hosting_node_name) : '';
+            const rtt = (!isSelf && peer.node_rtt_ms != null) ? `${peer.node_rtt_ms}ms` : '';
+            const sub = [host, rtt].filter(Boolean).join(' · ');
+            const youBadge = isSelf ? ' <span class="device-chip-you">(you)</span>' : '';
+            return `
+                <div class="device-chip${isSelf ? ' device-chip-self' : ''}" data-session-id="${this.escapeHtml(peer.session_id)}" title="${isSelf ? 'Click to set a nickname' : 'Click to send a file, or drag one here'}">
+                    <div class="device-chip-name">${name}${youBadge}</div>
+                    ${sub ? `<div class="device-chip-host">${sub}</div>` : ''}
+                </div>`;
+        };
+
+        list.innerHTML = chip(self, true) + others.map(p => chip(p, false)).join('');
+        if (countEl) countEl.textContent = `(${1 + others.length})`;
+    }
+
+    /** Turns the "you" chip's name into an inline text input. Avoids
+     *  prompt()/alert() — those block the JS event loop, which could stall
+     *  an in-flight transfer while the dialog is open. */
+    _editNicknameInline(chipEl) {
+        const nameEl = chipEl.querySelector('.device-chip-name');
+        if (!nameEl || chipEl.querySelector('.device-chip-input')) return; // already editing
+
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.className = 'device-chip-input';
+        input.maxLength = 40;
+        input.value = this.nickname || '';
+        input.placeholder = 'Nickname…';
+
+        const commit = () => {
+            const nickname = input.value.trim().slice(0, 40);
+            this.nickname = nickname;
+            localStorage.setItem('ladex_nickname', nickname);
+            if (nickname) {
+                this.sendWS({ type: 'set_nickname', session_id: this.sessionId, nickname });
+            }
+            this.updateDevicesList();
+        };
+        input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') input.blur();
+            if (e.key === 'Escape') { input.value = this.nickname || ''; input.blur(); }
+        });
+        input.addEventListener('blur', commit, { once: true });
+
+        nameEl.replaceWith(input);
+        input.focus();
+        input.select();
     }
 
     // =====================================================================
@@ -237,7 +359,12 @@ class LADEXApp {
         this.ws.onopen = () => {
             console.log('WS connected');
             this.updateConnectionStatus(true);
-            this.sendWS({ type: 'join', session_id: this.sessionId, user_agent: navigator.userAgent });
+            this.sendWS({
+                type: 'join',
+                session_id: this.sessionId,
+                user_agent: navigator.userAgent,
+                nickname: this.nickname || null,
+            });
             // Re-register locally-hosted files after reconnect so the
             // catalog is accurate.
             for (const [fileId, file] of this.files.entries()) {
@@ -291,14 +418,16 @@ class LADEXApp {
             case 'peer_joined':
                 this.peers.set(msg.peer.session_id, msg.peer);
                 this.updatePeerStatus(msg.total_peers);
+                this.updateDevicesList();
                 break;
             case 'peer_left':
                 this.peers.delete(msg.session_id);
                 this.updatePeerStatus(msg.total_peers);
                 // Clean up any RTC connection to that peer
                 this.closeRTC(msg.session_id);
+                this.updateDevicesList();
                 break;
-            // Phase 6: incremental peer list update (RTT changes)
+            // Phase 6: incremental peer list update (RTT changes, nicknames, ...)
             case 'peer_sync':
                 if (msg.peers) {
                     for (const peer of msg.peers) {
@@ -306,12 +435,13 @@ class LADEXApp {
                             // Departure tombstone
                             this.peers.delete(peer.session_id);
                         } else {
-                            // Merge: update RTT without overwriting other fields
+                            // Merge: update fields without overwriting others
                             const existing = this.peers.get(peer.session_id) || {};
                             this.peers.set(peer.session_id, { ...existing, ...peer });
                         }
                     }
                 }
+                this.updateDevicesList();
                 break;
 
             // ── file catalog ────────────────────────────────────────────
@@ -319,6 +449,20 @@ class LADEXApp {
                 this.serverFiles = msg.files || [];
                 this.updateFileList(this.serverFiles);
                 break;
+
+            // F4: someone unshared a file (possibly us — deleteFile() records
+            // the name here first so this can confirm with it, instead of
+            // double-toasting alongside an optimistic message there)
+            case 'file_removed': {
+                const pendingName = this._pendingDeletes.get(msg.file_id);
+                if (pendingName !== undefined) {
+                    this._pendingDeletes.delete(msg.file_id);
+                    this.toast(`Unshared ${pendingName}`, 'success');
+                } else {
+                    this.toast('A shared file was removed', 'info');
+                }
+                break;
+            }
 
             // ── download orchestration ──────────────────────────────────
             case 'download_request':
@@ -340,6 +484,16 @@ class LADEXApp {
                 this.toast(`Receiver declined the file transfer`, 'warning', 5000);
                 this.hideProgress(`send:${msg.file_id}:${msg.from_session_id}`);
                 break;
+
+            // F3: someone is offering to send us a file directly
+            case 'incoming_file_offer':
+                this._showFileOfferDialog(msg);
+                break;
+            case 'file_offer_declined': {
+                const name = this._deviceDisplayName(msg.from_session_id, this.peers.get(msg.from_session_id));
+                this.toast(`${name} declined your file offer`, 'warning');
+                break;
+            }
 
             // ── WebRTC signaling ────────────────────────────────────────
             case 'webrtc_offer':
@@ -485,14 +639,20 @@ class LADEXApp {
     setupDragAndDrop() {
         const body = document.body;
         let dragDepth = 0;
+        // F3 also uses drag-and-drop internally (a file row onto a device
+        // chip), which bubbles up to these same body listeners — only react
+        // to drags actually carrying OS files, not that internal one.
+        const isFileDrag = (e) => e.dataTransfer.types.includes('Files');
 
         body.addEventListener('dragenter', (e) => {
+            if (!isFileDrag(e)) return;
             e.preventDefault();
             dragDepth++;
             body.classList.add('drag-over');
         });
 
         body.addEventListener('dragleave', (e) => {
+            if (!isFileDrag(e)) return;
             e.preventDefault();
             dragDepth--;
             if (dragDepth <= 0) {
@@ -502,11 +662,13 @@ class LADEXApp {
         });
 
         body.addEventListener('dragover', (e) => {
+            if (!isFileDrag(e)) return;
             e.preventDefault();
             e.dataTransfer.dropEffect = 'copy';
         });
 
         body.addEventListener('drop', (e) => {
+            if (!isFileDrag(e)) return;
             e.preventDefault();
             dragDepth = 0;
             body.classList.remove('drag-over');
@@ -536,6 +698,87 @@ class LADEXApp {
         }
         this.pendingDownloads.add(fileId);
         this._requestDownloadWithRetry(fileId, 0);
+    }
+
+    // =====================================================================
+    //  F4: UNSHARE / DELETE
+    // =====================================================================
+
+    /** Only the uploader can delete — the server enforces this too; this
+     *  is just so the button doesn't even appear for anyone else. The
+     *  confirmation toast fires from the 'file_removed' broadcast echo
+     *  (see handleServerMessage), not here, so we don't double-toast. */
+    deleteFile(fileId) {
+        const f = this.serverFiles.find(x => x.id === fileId);
+        this._pendingDeletes.set(fileId, f ? f.name : 'File');
+        this.sendWS({ type: 'delete_file', session_id: this.sessionId, file_id: fileId });
+    }
+
+    // =====================================================================
+    //  F3: SEND-TO-PERSON
+    //  Push a file straight to one device instead of publishing it to the
+    //  catalog for anyone to find — drag a file row onto a device chip, or
+    //  click a chip to pick a file. The target gets a consent prompt
+    //  (handleServerMessage 'incoming_file_offer'); accepting reuses the
+    //  normal request_download_from flow, which is how the actual transfer
+    //  happens (see _handleIncomingDCWithConsent's pre-accept bypass).
+    // =====================================================================
+
+    offerFileToPeer(fileId, targetSessionId) {
+        const file = this.getFile(fileId);
+        if (!file) {
+            this.toast('That file is no longer available', 'error');
+            return;
+        }
+        this.sendWS({
+            type: 'offer_file_to',
+            session_id: this.sessionId,
+            target_session_id: targetSessionId,
+            file_id: fileId,
+        });
+        const name = this._deviceDisplayName(targetSessionId, this.peers.get(targetSessionId));
+        this.toast(`Offered "${file.name}" to ${name}`, 'info');
+    }
+
+    _showSendFilePicker(anchorEl, targetSessionId) {
+        document.querySelector('.send-file-popover')?.remove();
+        if (this.files.size === 0) {
+            this.toast('You have no files to send — upload one first', 'info');
+            return;
+        }
+
+        const targetName = this.escapeHtml(this._deviceDisplayName(targetSessionId, this.peers.get(targetSessionId)));
+        const popover = document.createElement('div');
+        popover.className = 'send-file-popover';
+        popover.innerHTML = `
+            <div class="send-file-popover-title">Send to ${targetName}</div>
+            ${Array.from(this.files.entries()).map(([id, file]) => `
+                <button class="send-file-option" data-file-id="${this.escapeHtml(id)}">${this.escapeHtml(file.name)}</button>
+            `).join('')}
+        `;
+        document.body.appendChild(popover);
+
+        const rect = anchorEl.getBoundingClientRect();
+        popover.style.left = `${Math.min(rect.left, window.innerWidth - popover.offsetWidth - 16)}px`;
+        popover.style.top = `${rect.bottom + 6}px`;
+
+        popover.addEventListener('click', (e) => {
+            const btn = e.target.closest('.send-file-option');
+            if (!btn) return;
+            this.offerFileToPeer(btn.dataset.fileId, targetSessionId);
+            popover.remove();
+        });
+
+        // Close on outside click — deferred so this same click doesn't fire it
+        setTimeout(() => {
+            const closeHandler = (e) => {
+                if (!popover.contains(e.target)) {
+                    popover.remove();
+                    document.removeEventListener('click', closeHandler);
+                }
+            };
+            document.addEventListener('click', closeHandler);
+        }, 0);
     }
 
     /**
@@ -1023,6 +1266,12 @@ class LADEXApp {
                     this.closeRTC(fromPeerId);
                     return;
                 }
+                // F3: the user already consented at the file-offer stage —
+                // don't ask again now that the transfer is actually starting.
+                if (this._preAcceptedTransfers.delete(fromPeerId)) {
+                    this._beginReceive(dc, meta, fromPeerId);
+                    return;
+                }
                 this._showTransferConsentDialog(meta, fromPeerId, dc);
                 return;
             }
@@ -1030,6 +1279,16 @@ class LADEXApp {
             // while showSaveFilePicker() is awaiting them) — buffer it.
             dc._pendingChunks.push(event.data);
         };
+    }
+
+    /** FSAA when available, Blob-accumulator fallback otherwise. Shared by
+     *  the consent dialog's Accept button and the F3 pre-accept bypass. */
+    async _beginReceive(dc, meta, fromPeerId) {
+        if (window.showSaveFilePicker) {
+            await this._setupFSAAReceive(dc, meta, fromPeerId);
+        } else {
+            this.setupReceiverDC(dc, fromPeerId, meta);
+        }
     }
 
     /**
@@ -1046,6 +1305,72 @@ class LADEXApp {
             onChunk(event.data);
         };
         for (const chunk of queued) onChunk(chunk);
+    }
+
+    /**
+     * F3: someone offered to send us a file directly (no catalog browsing
+     * involved). This is a separate, earlier-stage consent step from
+     * _showTransferConsentDialog below — that one fires once a DataChannel
+     * has actually opened; this one fires before any WebRTC connection
+     * exists at all. Accepting marks the sender pre-approved so the later
+     * DataChannel-level dialog doesn't ask a second time for the same
+     * transfer (see _handleIncomingDCWithConsent).
+     */
+    _showFileOfferDialog(msg) {
+        const file = this.serverFiles.find(f => f.id === msg.file_id);
+        const senderName = this.escapeHtml(this._deviceDisplayName(msg.from_session_id, this.peers.get(msg.from_session_id)));
+        const fileName = file ? this.escapeHtml(file.name) : 'a file';
+        const sizeStr = file ? this.formatFileSize(file.size) : '';
+
+        document.getElementById('file-offer-dialog')?.remove();
+        const dialog = document.createElement('div');
+        dialog.id = 'file-offer-dialog';
+        dialog.className = 'incoming-file-dialog';
+        dialog.innerHTML = `
+            <div class="ifd-inner">
+                <div class="ifd-icon">📨</div>
+                <div class="ifd-title"><strong>${senderName}</strong> wants to send you a file</div>
+                <div class="ifd-name">&ldquo;${fileName}&rdquo;</div>
+                <div class="ifd-size">${sizeStr}</div>
+                <div class="ifd-actions">
+                    <button id="fod-accept" class="btn btn-primary">Accept</button>
+                    <button id="fod-decline" class="btn btn-danger">Decline</button>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(dialog);
+
+        document.getElementById('fod-accept').addEventListener('click', () => {
+            dialog.remove();
+            const localFile = this.getFile(msg.file_id);
+            if (localFile) {
+                this.saveFileToDisk(localFile, localFile.name);
+                this.toast(`Saved ${localFile.name}`, 'success');
+                return;
+            }
+            if (this.pendingDownloads.has(msg.file_id)) {
+                this.toast('Already downloading that file', 'warning');
+                return;
+            }
+            this.pendingDownloads.add(msg.file_id);
+            this._preAcceptedTransfers.add(msg.from_session_id);
+            this.sendWS({
+                type: 'request_download_from',
+                session_id: this.sessionId,
+                file_id: msg.file_id,
+                host_peer_id: msg.from_session_id,
+            });
+        });
+
+        document.getElementById('fod-decline').addEventListener('click', () => {
+            dialog.remove();
+            this.sendWS({
+                type: 'decline_file_offer',
+                session_id: this.sessionId,
+                target_session_id: msg.from_session_id,
+                file_id: msg.file_id,
+            });
+        });
     }
 
     /**
@@ -1080,13 +1405,7 @@ class LADEXApp {
 
         document.getElementById('ifd-accept').addEventListener('click', async () => {
             dialog.remove();
-            // Phase 8: FSAA path (primary)
-            if (window.showSaveFilePicker) {
-                await this._setupFSAAReceive(dc, meta, fromPeerId);
-            } else {
-                // Fallback: classic Blob-accumulator path
-                this.setupReceiverDC(dc, fromPeerId, meta);
-            }
+            await this._beginReceive(dc, meta, fromPeerId);
         });
 
         document.getElementById('ifd-decline').addEventListener('click', () => {
@@ -1426,7 +1745,45 @@ class LADEXApp {
                 this.downloadFile(btn.dataset.fileId);
             } else if (btn.dataset.action === 'view-message') {
                 this.viewMessage(btn.dataset.messageId);
+            } else if (btn.dataset.action === 'delete-file') {
+                this.deleteFile(btn.dataset.fileId);
             }
+        });
+        // F3: drag a file row onto a device chip to send it directly
+        document.getElementById('files-list').addEventListener('dragstart', (e) => {
+            const row = e.target.closest('tr.file-row');
+            if (!row) return;
+            e.dataTransfer.setData('text/plain', row.dataset.fileId);
+            e.dataTransfer.effectAllowed = 'copy';
+        });
+        // F3 / F5: devices strip — click self to rename, click a peer (or
+        // drop a file row on one) to send them a file
+        const devicesList = document.getElementById('devices-list');
+        devicesList.addEventListener('click', (e) => {
+            const chip = e.target.closest('.device-chip');
+            if (!chip) return;
+            if (chip.dataset.sessionId === this.sessionId) {
+                this._editNicknameInline(chip);
+            } else {
+                this._showSendFilePicker(chip, chip.dataset.sessionId);
+            }
+        });
+        devicesList.addEventListener('dragover', (e) => {
+            const chip = e.target.closest('.device-chip:not(.device-chip-self)');
+            if (!chip) return;
+            e.preventDefault();
+            chip.classList.add('device-chip-dragover');
+        });
+        devicesList.addEventListener('dragleave', (e) => {
+            e.target.closest('.device-chip')?.classList.remove('device-chip-dragover');
+        });
+        devicesList.addEventListener('drop', (e) => {
+            const chip = e.target.closest('.device-chip:not(.device-chip-self)');
+            if (!chip) return;
+            e.preventDefault();
+            chip.classList.remove('device-chip-dragover');
+            const fileId = e.dataTransfer.getData('text/plain');
+            if (fileId) this.offerFileToPeer(fileId, chip.dataset.sessionId);
         });
         this.updateSendButton();
     }
@@ -1462,8 +1819,9 @@ class LADEXApp {
                 const f = item.data;
                 const hosts = Array.isArray(f.hosts) ? f.hosts : Array.from(f.hosts || []);
                 const isDownloading = this.pendingDownloads.has(f.id);
+                const isMine = f.uploader_id === this.sessionId;
                 return `
-                    <tr class="file-row">
+                    <tr class="file-row" draggable="true" data-file-id="${this.escapeHtml(f.id)}">
                         <td class="file-name">📄 ${this.escapeHtml(f.name)}</td>
                         <td class="file-type">${this.escapeHtml(f.mime_type)}</td>
                         <td class="file-size">${this.formatSize(f.size)}</td>
@@ -1471,7 +1829,7 @@ class LADEXApp {
                             <div class="file-hosts">
                                 ${hosts.map(h => h === this.sessionId
                                     ? '<span class="host-badge host-self">You</span>'
-                                    : `<span class="host-badge">${this.escapeHtml(h.slice(-6))}</span>`
+                                    : `<span class="host-badge">${this.escapeHtml(this._deviceDisplayName(h, this.peers.get(h)))}</span>`
                                 ).join('')}
                             </div>
                         </td>
@@ -1479,11 +1837,12 @@ class LADEXApp {
                             ${hosts.length > 0
                                 ? `<button class="btn download${isDownloading ? ' downloading' : ''}" data-action="download-file" data-file-id="${this.escapeHtml(f.id)}" ${isDownloading ? 'disabled' : ''}>${isDownloading ? '⏳ Downloading…' : '⬇️ Download'}</button>`
                                 : '<span style="color:#a0aec0;">No hosts</span>'}
+                            ${isMine ? `<button class="btn secondary delete-file-btn" data-action="delete-file" data-file-id="${this.escapeHtml(f.id)}" title="Unshare">🗑️</button>` : ''}
                         </td>
                     </tr>`;
             } else {
                 const m = item.data;
-                const who = m.sender_id === this.sessionId ? 'You' : `User ${this.escapeHtml(m.sender_id.slice(-6))}`;
+                const who = m.sender_id === this.sessionId ? 'You' : this.escapeHtml(this._deviceDisplayName(m.sender_id, this.peers.get(m.sender_id)));
                 const preview = m.content.length > 50 ? m.content.substring(0, 50) + '…' : m.content;
                 return `
                     <tr class="message-row">

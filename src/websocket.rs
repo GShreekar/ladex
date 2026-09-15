@@ -25,6 +25,14 @@ pub async fn websocket_handler(ws: Ws, state: NodeState) -> Result<impl Reply, R
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// F5: the client already truncates nicknames to 40 chars, but a
+/// non-browser client (or a modified one) could send anything — cap it
+/// server-side too. Char-based, not byte-based, so this never splits a
+/// multi-byte UTF-8 sequence.
+fn cap_nickname(nickname: String) -> String {
+    nickname.chars().take(60).collect()
+}
+
 pub async fn broadcast(state: &NodeState, msg: ServerMessage) {
     let senders = state.local_senders.read().await;
     for sender in senders.values() {
@@ -94,7 +102,7 @@ async fn handle_client_message(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match msg {
         // ── Join ─────────────────────────────────────────────────────────
-        ClientMessage::Join { session_id: id, user_agent } => {
+        ClientMessage::Join { session_id: id, user_agent, nickname } => {
             *session_id = Some(id.clone());
             { let mut s = state.local_senders.write().await; s.insert(id.clone(), peer_tx.clone()); }
 
@@ -106,6 +114,8 @@ async fn handle_client_message(
                 node_rtt_ms: None,
                 left: false,
                 left_at: None,
+                hosting_node_name: Some(state.node_name.clone()),
+                nickname: nickname.map(cap_nickname).filter(|n| !n.is_empty()),
             };
 
             let peers_count = {
@@ -129,6 +139,32 @@ async fn handle_client_message(
 
             broadcast(state, ServerMessage::PeerJoined { peer: peer.clone(), total_peers: peers_count }).await;
             state::push_peer_to_mesh(&state.mesh_peers, peer).await;
+        }
+
+        // ── F5: nickname change after join ─────────────────────────────────
+        ClientMessage::SetNickname { session_id: id, nickname } => {
+            let updated = {
+                let mut peers = state.local_peers.write().await;
+                match peers.get_mut(&id) {
+                    Some(peer) => {
+                        let nickname = cap_nickname(nickname);
+                        peer.nickname = if nickname.is_empty() { None } else { Some(nickname) };
+                        // Bump connected_at so this update actually wins the
+                        // LWW comparison on other mesh nodes — merge_peers
+                        // requires a strictly newer timestamp to apply an
+                        // update, and a nickname change alone wouldn't
+                        // produce one otherwise (see BUG-08's fix for the
+                        // same principle applied to departures).
+                        peer.connected_at = chrono::Utc::now();
+                        Some(peer.clone())
+                    }
+                    None => None,
+                }
+            };
+            if let Some(peer) = updated {
+                broadcast(state, ServerMessage::PeerSync { peers: vec![peer.clone()] }).await;
+                state::push_peer_to_mesh(&state.mesh_peers, peer).await;
+            }
         }
 
         // ── File upload ───────────────────────────────────────────────────
@@ -361,6 +397,63 @@ async fn handle_client_message(
             } else {
                 tracing::warn!("FileChecksumUpdate: unknown file_id {file_id}");
             }
+        }
+
+        // ── F4: unshare / delete ────────────────────────────────────────
+        ClientMessage::DeleteFile { session_id: requester_id, file_id } => {
+            let tombstoned: Option<FileMetadata> = {
+                let mut files = state.files.write().await;
+                match files.get_mut(&file_id) {
+                    Some(file) if file.deleted => None, // already gone
+                    Some(file) if file.uploader_id != requester_id => {
+                        tracing::warn!(
+                            "DeleteFile: {requester_id} tried to delete {file_id}, owned by {}",
+                            file.uploader_id
+                        );
+                        None
+                    }
+                    Some(file) => {
+                        file.deleted = true;
+                        file.deleted_at = chrono::Utc::now().timestamp_millis() as u64;
+                        Some(file.clone())
+                    }
+                    None => None,
+                }
+            };
+
+            if let Some(file) = tombstoned {
+                let files: Vec<FileMetadata> = {
+                    let files = state.files.read().await;
+                    files.values().filter(|f| !f.deleted).cloned().collect()
+                };
+                broadcast(state, ServerMessage::FileListUpdate { files }).await;
+                broadcast(state, ServerMessage::FileRemoved { file_id: file.id.clone() }).await;
+                state::push_file_to_mesh(&state.mesh_peers, file).await;
+            } else {
+                send_to(state, &requester_id, ServerMessage::Error {
+                    message: "Could not delete that file — it may not exist, already be removed, or not be yours".to_string(),
+                }).await;
+            }
+        }
+
+        // ── F3: send-to-person ──────────────────────────────────────────
+        // Push a file directly to one peer instead of publishing it to the
+        // catalog for anyone to find. Reuses the existing signal-routing
+        // path (route_signal already handles same-node vs cross-node
+        // delivery) — the target just gets a consent prompt instead of a
+        // browsable catalog entry.
+        ClientMessage::OfferFileTo { session_id: from, target_session_id, file_id } => {
+            mesh::route_signal(
+                state, &from, &target_session_id,
+                ServerMessage::IncomingFileOffer { file_id, from_session_id: from.clone() },
+            ).await;
+        }
+
+        ClientMessage::DeclineFileOffer { session_id: from, target_session_id, file_id } => {
+            mesh::route_signal(
+                state, &from, &target_session_id,
+                ServerMessage::FileOfferDeclined { file_id, from_session_id: from.clone() },
+            ).await;
         }
     }
     Ok(())

@@ -63,6 +63,16 @@ pub struct PeerInfo {
     /// so it actually wins the merge).
     #[serde(default)]
     pub left_at: Option<chrono::DateTime<chrono::Utc>>,
+
+    // ── F5: device names ─────────────────────────────────────────────────
+    /// Hostname of the machine hosting this session (NodeState::node_name).
+    /// Set by the hosting node itself; other nodes just carry it along.
+    #[serde(default)]
+    pub hosting_node_name: Option<String>,
+    /// User-editable nickname, set client-side and persisted in
+    /// localStorage. Overrides the User-Agent-derived name in the UI.
+    #[serde(default)]
+    pub nickname: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -133,6 +143,15 @@ pub enum ClientMessage {
     Join {
         session_id: SessionId,
         user_agent: Option<String>,
+        #[serde(default)]
+        nickname: Option<String>,
+    },
+
+    /// F5: user changed their nickname after already joining
+    #[serde(rename = "set_nickname")]
+    SetNickname {
+        session_id: SessionId,
+        nickname: String,
     },
 
     /// Peer registers a file it is willing to share (metadata only, zero bytes)
@@ -220,6 +239,31 @@ pub enum ClientMessage {
         session_id: SessionId,
         file_id: String,
         sha256: String,
+    },
+
+    /// F4: unshare a file. Only the original uploader may do this.
+    #[serde(rename = "delete_file")]
+    DeleteFile {
+        session_id: SessionId,
+        file_id: String,
+    },
+
+    /// F3: push a file directly to one peer instead of publishing it to the
+    /// catalog for anyone to find. Routed to `target_session_id`, who gets
+    /// an IncomingFileOffer consent prompt.
+    #[serde(rename = "offer_file_to")]
+    OfferFileTo {
+        session_id: SessionId,
+        target_session_id: SessionId,
+        file_id: String,
+    },
+
+    /// F3: the offer's recipient declined it — routed back to the sender.
+    #[serde(rename = "decline_file_offer")]
+    DeclineFileOffer {
+        session_id: SessionId,
+        target_session_id: SessionId,
+        file_id: String,
     },
 }
 
@@ -331,6 +375,22 @@ pub enum ServerMessage {
     #[serde(rename = "no_peers_warning")]
     NoPeersWarning {
         message: String,
+    },
+
+    /// F3: someone is offering to send this file directly — show a consent
+    /// prompt. The client resolves file name/size/mime from its own
+    /// already-synced catalog by `file_id`.
+    #[serde(rename = "incoming_file_offer")]
+    IncomingFileOffer {
+        file_id: String,
+        from_session_id: SessionId,
+    },
+
+    /// F3: the peer we offered a file to declined it.
+    #[serde(rename = "file_offer_declined")]
+    FileOfferDeclined {
+        file_id: String,
+        from_session_id: SessionId,
     },
 }
 
