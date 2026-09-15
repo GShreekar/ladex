@@ -736,6 +736,17 @@ th:nth-child(5), td:nth-child(5) { width: 15%; }
     border: 1px solid rgba(120, 219, 226, 0.3);
 }
 
+/* F7: integrity verification badge */
+.integrity-badge {
+    display: inline-block;
+    margin-left: 6px;
+    font-weight: bold;
+    font-size: 0.9em;
+}
+
+.integrity-badge.integrity-ok  { color: #6bde8a; }
+.integrity-badge.integrity-bad { color: #ff6b6b; }
+
 .host-badge.host-self {
     background: linear-gradient(135deg, #ff77c6, #7877c6);
     color: white;
@@ -1281,6 +1292,22 @@ progress::-webkit-progress-value {
 
 .toast-icon { font-size: 1.2em; flex-shrink: 0; }
 .toast-msg  { flex: 1; }
+
+.toast-action {
+    flex-shrink: 0;
+    background: rgba(120, 219, 226, 0.15);
+    border: 1px solid rgba(120, 219, 226, 0.4);
+    border-radius: 6px;
+    color: #78dbe2;
+    font-family: 'Orbitron', monospace;
+    font-size: 0.9em;
+    padding: 4px 10px;
+    cursor: pointer;
+}
+
+.toast-action:hover {
+    background: rgba(120, 219, 226, 0.3);
+}
 
 .toast-info    { border-left: 3px solid #78dbe2; }
 .toast-success { border-left: 3px solid #6bde8a; }

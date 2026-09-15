@@ -216,7 +216,7 @@ async fn handle_client_message(
         // Client explicitly names the peer it wants to download from.
         // Node honors the choice without override.  Returns HostUnreachable
         // if that peer is not present in the merged peer list.
-        ClientMessage::RequestDownloadFrom { session_id: requester_id, file_id, host_peer_id } => {
+        ClientMessage::RequestDownloadFrom { session_id: requester_id, file_id, host_peer_id, resume_from_bytes } => {
             // Verify the file exists and is not tombstoned
             let file_valid = {
                 let files = state.files.read().await;
@@ -254,6 +254,7 @@ async fn handle_client_message(
                 ServerMessage::DownloadRequest {
                     file_id,
                     requester_session_id: requester_id.clone(),
+                    resume_from_bytes,
                 },
             ).await;
         }
@@ -283,6 +284,7 @@ async fn handle_client_message(
                     ServerMessage::DownloadRequest {
                         file_id,
                         requester_session_id: requester_id.clone(),
+                        resume_from_bytes: None, // legacy path has no host choice to resume against
                     },
                 ).await;
             }

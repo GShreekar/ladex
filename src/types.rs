@@ -118,6 +118,15 @@ pub struct FileMetadata {
     /// Receivers compare against this value after transfer and surface ✓/✗ UI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
+
+    /// F6: true when this catalog entry is a folder rather than a single
+    /// file. The server treats it as completely opaque — same as every
+    /// other field here, it's a signaling relay only; the sending client
+    /// decides whether to respond to a download request with a normal
+    /// single-file stream or a folder-manifest stream based on this flag,
+    /// same as it already decides FSAA vs Blob-fallback.
+    #[serde(default)]
+    pub is_folder: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -210,6 +219,10 @@ pub enum ClientMessage {
         file_id: String,
         /// The specific peer session ID the client chose as host.
         host_peer_id: SessionId,
+        /// F8: resume a previously-interrupted download from this byte
+        /// offset instead of starting over. `None`/0 = fresh download.
+        #[serde(default)]
+        resume_from_bytes: Option<u64>,
     },
 
     /// Phase 5: Receiver signals it does not want the incoming file.
@@ -311,6 +324,9 @@ pub enum ServerMessage {
     DownloadRequest {
         file_id: String,
         requester_session_id: SessionId,
+        /// F8: resume from this byte offset — see ClientMessage::RequestDownloadFrom.
+        #[serde(default)]
+        resume_from_bytes: Option<u64>,
     },
 
     // ── WebRTC signaling (targeted to a single peer) ─────────────────────

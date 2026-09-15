@@ -21,6 +21,10 @@ class LADEXApp {
         // A File object is a handle to the on-disk blob — costs ~0 RAM
         // regardless of file size.  We only read slices on demand.
         this.files = new Map();
+        // F6: folders we're hosting, kept separate from single files since
+        // a folder isn't one File object — folderId → { name, entries:
+        // [{relativePath, file}], totalSize }. See handleFolderUpload.
+        this.folders = new Map();
 
         this.peers = new Map();
         this.messages = [];
@@ -38,6 +42,15 @@ class LADEXApp {
         // 'file_removed' broadcast echo can confirm with the right message
         // instead of a generic one (or a duplicate toast).
         this._pendingDeletes = new Map();
+        // F8: fileId → { fileHandle, bytesReceived } for downloads in
+        // progress or interrupted — kept across retries (within this page
+        // session) so a dropped connection resumes instead of restarting
+        // from byte zero. Cleared on completion, cancel, or giving up.
+        this._resumeState = new Map();
+        // F7: fileId → 'verified' | 'failed', for files this tab downloaded
+        // and checked against the sender's sha256 — drives the small badge
+        // in the file list.
+        this._integrityStatus = new Map();
 
         // ── WebRTC state ────────────────────────────────────────────────
         // Active RTCPeerConnections keyed by remote sessionId.
@@ -329,22 +342,37 @@ class LADEXApp {
      * @param {'info'|'success'|'error'|'warning'} type
      * @param {number} durationMs — auto-dismiss after this many ms
      */
-    toast(message, type = 'info', durationMs = 4000) {
+    /**
+     * @param {string} message
+     * @param {'info'|'success'|'error'|'warning'} type
+     * @param {number} durationMs — auto-dismiss after this many ms
+     * @param {{label: string, onClick: () => void}} [action] — F7: e.g. a
+     *   "Retry" button on an integrity-check-failed toast
+     */
+    toast(message, type = 'info', durationMs = 4000, action = null) {
         this._ensureToastContainer();
         const el = document.createElement('div');
         el.className = `toast toast-${type}`;
         const icons = { info: 'ℹ️', success: '✅', error: '❌', warning: '⚠️' };
         el.innerHTML = `<span class="toast-icon">${icons[type] || ''}</span><span class="toast-msg">${this.escapeHtml(message)}</span>`;
+        if (action) {
+            const btn = document.createElement('button');
+            btn.className = 'toast-action';
+            btn.textContent = action.label;
+            btn.addEventListener('click', () => { action.onClick(); dismiss(); });
+            el.appendChild(btn);
+        }
         this._toastContainer.appendChild(el);
         // Trigger CSS enter animation
         requestAnimationFrame(() => el.classList.add('toast-visible'));
-        setTimeout(() => {
+        const dismiss = () => {
             el.classList.remove('toast-visible');
             el.classList.add('toast-exit');
             el.addEventListener('transitionend', () => el.remove());
             // Fallback if transitionend doesn't fire
             setTimeout(() => el.remove(), 500);
-        }, durationMs);
+        };
+        setTimeout(dismiss, durationMs);
     }
 
     // =====================================================================
@@ -536,31 +564,53 @@ class LADEXApp {
                 await this.handleFolderUpload(files);
             } else {
                 for (const file of files) await this.uploadFile(file);
+                const count = files.length;
+                this.toast(`${count} file${count > 1 ? 's' : ''} shared`, 'success');
             }
-            const count = isFolder ? 1 : files.length;
-            this.toast(`${count} file${count > 1 ? 's' : ''} shared`, 'success');
         } catch (err) {
             this.toast(`Upload failed: ${err.message}`, 'error');
         }
     }
 
+    /**
+     * F6: real folder transfer. Used to zip the whole folder into one file
+     * at upload time (RAM-bound, and it turned "share a folder" into
+     * "share a .zip" — no directory structure on the other end, no
+     * per-file progress). Now a folder is its own catalog entry
+     * (is_folder: true); the actual files stream individually, in order,
+     * over the DataChannel when someone downloads it — see
+     * streamFolderOverDC. JSZip is still used, but only as the
+     * *receiving* end's fallback for browsers without showDirectoryPicker
+     * (see _receiveFolderToZip) — it never touches the sending side, or a
+     * browser that can write directly to a real folder, any more.
+     */
     async handleFolderUpload(files) {
-        if (typeof JSZip === 'undefined') {
-            this.toast('JSZip library not loaded.', 'error');
-            return;
-        }
-        const zip = new JSZip();
-        for (const f of files) zip.file(f.webkitRelativePath || f.name, f);
+        const folderId = this.generateFileId();
         const folderName = files[0].webkitRelativePath?.split('/')[0] || 'folder';
-        const zipName = `${folderName}.zip`;
+        const entries = Array.from(files).map(f => ({
+            relativePath: f.webkitRelativePath || f.name,
+            file: f,
+        }));
+        const totalSize = entries.reduce((sum, e) => sum + e.file.size, 0);
 
-        // Stream straight to disk when possible so a huge folder doesn't
-        // have to fit in RAM as one Blob; fall back to the old in-memory
-        // path otherwise.
-        const file = window.showSaveFilePicker
-            ? await this._zipToDisk(zip, zipName)
-            : await this._zipToMemory(zip, zipName);
-        if (file) await this.uploadFile(file);
+        this.folders.set(folderId, { name: folderName, entries, totalSize });
+
+        this.sendWS({
+            type: 'file_upload',
+            session_id: this.sessionId,
+            file: {
+                id: folderId,
+                name: folderName,
+                size: totalSize,
+                mime_type: 'inode/directory',
+                uploader_id: this.sessionId,
+                hosts: [this.sessionId],
+                uploaded_at: new Date().toISOString(),
+                is_folder: true,
+            },
+        });
+        console.log(`Shared folder: ${folderName} (${entries.length} files, ${this.formatFileSize(totalSize)})`);
+        this.toast(`Folder shared: ${folderName} (${entries.length} file${entries.length > 1 ? 's' : ''})`, 'success');
     }
 
     async _zipToDisk(zip, zipName) {
@@ -689,6 +739,12 @@ class LADEXApp {
             this.toast('Download already in progress', 'warning');
             return;
         }
+        // F6: if we're hosting this folder ourselves, there's nothing to
+        // download — it's already wherever the user picked it from.
+        if (this.folders.has(fileId)) {
+            this.toast('You already have this folder', 'info');
+            return;
+        }
         // If WE already have the file locally, just save it.
         const localFile = this.getFile(fileId);
         if (localFile) {
@@ -725,7 +781,9 @@ class LADEXApp {
     // =====================================================================
 
     offerFileToPeer(fileId, targetSessionId) {
-        const file = this.getFile(fileId);
+        // F6: a folder isn't in this.files (see handleFolderUpload) — check
+        // both so offering a folder works the same way as offering a file.
+        const file = this.getFile(fileId) || this.folders.get(fileId);
         if (!file) {
             this.toast('That file is no longer available', 'error');
             return;
@@ -742,8 +800,13 @@ class LADEXApp {
 
     _showSendFilePicker(anchorEl, targetSessionId) {
         document.querySelector('.send-file-popover')?.remove();
-        if (this.files.size === 0) {
-            this.toast('You have no files to send — upload one first', 'info');
+        // F6: offer folders alongside files — see handleFolderUpload.
+        const options = [
+            ...Array.from(this.files.entries()).map(([id, f]) => ({ id, name: f.name, icon: '📄' })),
+            ...Array.from(this.folders.entries()).map(([id, f]) => ({ id, name: f.name, icon: '📁' })),
+        ];
+        if (options.length === 0) {
+            this.toast('You have nothing to send — upload something first', 'info');
             return;
         }
 
@@ -752,8 +815,8 @@ class LADEXApp {
         popover.className = 'send-file-popover';
         popover.innerHTML = `
             <div class="send-file-popover-title">Send to ${targetName}</div>
-            ${Array.from(this.files.entries()).map(([id, file]) => `
-                <button class="send-file-option" data-file-id="${this.escapeHtml(id)}">${this.escapeHtml(file.name)}</button>
+            ${options.map(o => `
+                <button class="send-file-option" data-file-id="${this.escapeHtml(o.id)}">${o.icon} ${this.escapeHtml(o.name)}</button>
             `).join('')}
         `;
         document.body.appendChild(popover);
@@ -813,6 +876,7 @@ class LADEXApp {
     _requestDownloadWithRetry(fileId, attempt) {
         if (attempt >= this.MAX_RETRIES) {
             this.pendingDownloads.delete(fileId);
+            this._resumeState.delete(fileId); // give up — don't resume a dead attempt later
             this.toast(`Download failed after ${this.MAX_RETRIES} attempts`, 'error', 6000);
             this.hideProgress(`dl:${fileId}`);
             return;
@@ -830,13 +894,18 @@ class LADEXApp {
             return;
         }
 
-        console.log(`Requesting ${fileId} from host ${chosenHost.slice(-6)} (attempt ${attempt + 1}, Phase 6 client selection)`);
+        // F8: resume from wherever we already got to, if anywhere — any
+        // host serves identical bytes for this fileId, so it doesn't
+        // matter if a retry picks a different one than last time.
+        const resumeFromBytes = this._resumeState.get(fileId)?.bytesReceived || 0;
+        console.log(`Requesting ${fileId} from host ${chosenHost.slice(-6)} (attempt ${attempt + 1}${resumeFromBytes ? `, resuming from ${this.formatFileSize(resumeFromBytes)}` : ''})`);
         this.activeTransfers.set(`retry:${fileId}`, { attempt, fileId });
         this.sendWS({
             type: 'request_download_from',
             session_id: this.sessionId,
             file_id: fileId,
             host_peer_id: chosenHost,
+            resume_from_bytes: resumeFromBytes,
         });
     }
 
@@ -881,14 +950,25 @@ class LADEXApp {
      * We (the host) initiate a WebRTC connection and stream the file.
      */
     handleDownloadRequest(msg) {
-        const { file_id, requester_session_id } = msg;
+        const { file_id, requester_session_id, resume_from_bytes } = msg;
+
+        // F6: folders live in a separate map from single files (see
+        // handleFolderUpload) — same request/response protocol, different
+        // stream once the DataChannel is open.
+        const bundle = this.folders.get(file_id);
+        if (bundle) {
+            console.log(`Initiating folder transfer of ${bundle.name} → ${requester_session_id.slice(-6)}`);
+            this.initiateFolderSend(requester_session_id, file_id, bundle);
+            return;
+        }
+
         const file = this.getFile(file_id);
         if (!file) {
             console.error('Download request for file we don\'t have:', file_id);
             return;
         }
         console.log(`Initiating WebRTC transfer of ${file.name} → ${requester_session_id.slice(-6)}`);
-        this.initiateWebRTCSend(requester_session_id, file_id, file);
+        this.initiateWebRTCSend(requester_session_id, file_id, file, resume_from_bytes || 0);
     }
 
     // =====================================================================
@@ -915,7 +995,13 @@ class LADEXApp {
 
     // ── Sender side (host) ──────────────────────────────────────────────
 
-    async initiateWebRTCSend(targetSessionId, fileId, file) {
+    /**
+     * Shared RTCPeerConnection + DataChannel bring-up for the sender side —
+     * used by both a single-file send (initiateWebRTCSend) and a folder
+     * send (F6, initiateFolderSend). Calls onOpen(dc) once the channel is
+     * open; the caller decides what protocol to stream over it.
+     */
+    async _createSenderConnection(targetSessionId, dcLabel, transferId, onOpen) {
         // Clean up any previous connection to this peer
         this.closeRTC(targetSessionId);
 
@@ -930,18 +1016,12 @@ class LADEXApp {
             }
         }, this.ICE_TIMEOUT);
 
-        // Create a DataChannel labelled with the fileId
-        const dc = pc.createDataChannel(`file:${fileId}`, {
-            ordered: true,
-        });
+        const dc = pc.createDataChannel(dcLabel, { ordered: true });
         dc.binaryType = 'arraybuffer';
-
-        const transferId = `send:${fileId}:${targetSessionId}`;
 
         dc.onopen = () => {
             clearTimeout(iceTimer);
-            console.log(`DataChannel open → streaming ${file.name}`);
-            this.streamFileOverDC(dc, fileId, file, targetSessionId);
+            onOpen(dc);
         };
 
         dc.onclose = () => {
@@ -1000,17 +1080,41 @@ class LADEXApp {
         this.flushPendingCandidates(targetSessionId, pc);
     }
 
+    async initiateWebRTCSend(targetSessionId, fileId, file, resumeFromBytes = 0) {
+        const transferId = `send:${fileId}:${targetSessionId}`;
+        await this._createSenderConnection(targetSessionId, `file:${fileId}`, transferId, (dc) => {
+            console.log(`DataChannel open → streaming ${file.name}`);
+            this.streamFileOverDC(dc, fileId, file, targetSessionId, resumeFromBytes);
+        });
+    }
+
+    // F6: folder send — see streamFolderOverDC for the wire protocol.
+    async initiateFolderSend(targetSessionId, folderId, bundle) {
+        const transferId = `send:${folderId}:${targetSessionId}`;
+        await this._createSenderConnection(targetSessionId, `folder:${folderId}`, transferId, (dc) => {
+            console.log(`DataChannel open → streaming folder ${bundle.name}`);
+            this.streamFolderOverDC(dc, folderId, bundle, targetSessionId);
+        });
+    }
+
     /**
      * Stream a File over a DataChannel using file.slice() — never loads the
      * entire file into RAM.
      *
      * Wire protocol (per DataChannel message):
      *   Message 0:  UTF-8 JSON header
-     *       { "fileId", "fileName", "fileSize", "mimeType", "totalChunks" }
-     *   Messages 1..N:  raw ArrayBuffer chunks (binary, no base64)
+     *       { "fileId", "fileName", "fileSize", "mimeType", "totalChunks", "resumeFromBytes" }
+     *   Messages 1..N:  raw ArrayBuffer chunks (binary, no base64), starting
+     *                   at resumeFromBytes instead of byte 0 when resuming
+     *                   (see F8 in _setupFSAAReceive / setupReceiverDC).
      */
-    async streamFileOverDC(dc, fileId, file, targetSessionId) {
+    async streamFileOverDC(dc, fileId, file, targetSessionId, resumeFromBytes = 0) {
         const totalChunks = Math.ceil(file.size / this.RTC_CHUNK_SIZE);
+        // F8: resume on a chunk boundary — the receiver only ever confirms
+        // whole chunks written, so resumeFromBytes is already aligned in
+        // practice; this floor is just defense in depth.
+        const startChunk = Math.min(Math.floor(resumeFromBytes / this.RTC_CHUNK_SIZE), totalChunks);
+        const resumeOffset = startChunk * this.RTC_CHUNK_SIZE;
         const transferId = `send:${fileId}:${targetSessionId}`;
 
         // 1. Send metadata header as a text message
@@ -1024,6 +1128,7 @@ class LADEXApp {
                 mimeType: file.type || 'application/octet-stream',
                 totalChunks,
                 sha256, // null if hash not yet ready (large file), receiver verifies lazily
+                resumeFromBytes: resumeOffset,
             }));
         } catch (err) {
             console.error('Failed to send file header:', err);
@@ -1031,14 +1136,15 @@ class LADEXApp {
             return;
         }
 
-        this.activeTransfers.set(transferId, { startTime: Date.now(), bytesSent: 0, totalBytes: file.size });
+        this.activeTransfers.set(transferId, { startTime: Date.now(), bytesSent: resumeOffset, totalBytes: file.size });
         this._transferPeers.set(transferId, targetSessionId);
         // BUG-12 fix: each transfer gets its own progress card, keyed by
         // transferId — see showProgress()/hideProgress().
-        this.showProgress(transferId, `Sending ${file.name}`, 0, null, null, 0, file.size);
+        this.showProgress(transferId, `Sending ${file.name}`, Math.round((resumeOffset / file.size) * 100), null, null, resumeOffset, file.size);
 
-        // 2. Stream binary chunks using file.slice() (disk → DataChannel)
-        for (let i = 0; i < totalChunks; i++) {
+        // 2. Stream binary chunks using file.slice() (disk → DataChannel),
+        // starting from the resume point if there is one
+        for (let i = startChunk; i < totalChunks; i++) {
             // Check if this transfer was cancelled
             if (this.cancelledTransfers.has(transferId)) {
                 this.cancelledTransfers.delete(transferId);
@@ -1103,6 +1209,143 @@ class LADEXApp {
         console.log(`File ${file.name} sent to ${targetSessionId.slice(-6)}`);
 
         // Keep the connection open briefly so the last chunk flushes, then close
+        setTimeout(() => this.closeRTC(targetSessionId), 2000);
+    }
+
+    /**
+     * F6: streams a whole folder over one DataChannel — a manifest, then
+     * for each file (in order, one at a time — same bounded-memory
+     * approach as a single-file send) a header followed by its chunks.
+     *
+     * Wire protocol:
+     *   1. Text: { kind: 'folder-manifest', folderId, folderName, files:
+     *      [{relativePath, size, mimeType}], totalBytes, totalFiles }
+     *   2. Per file, in order:
+     *        Text:   { kind: 'file-header', relativePath, size, mimeType }
+     *        Binary: chunks (RTC_CHUNK_SIZE each)
+     *   3. Text: { kind: 'folder-done' }
+     */
+    async streamFolderOverDC(dc, folderId, bundle, targetSessionId) {
+        const transferId = `send:${folderId}:${targetSessionId}`;
+        const { entries, totalSize, name } = bundle;
+
+        try {
+            dc.send(JSON.stringify({
+                kind: 'folder-manifest',
+                folderId,
+                folderName: name,
+                files: entries.map(e => ({
+                    relativePath: e.relativePath,
+                    size: e.file.size,
+                    mimeType: e.file.type || 'application/octet-stream',
+                })),
+                totalBytes: totalSize,
+                totalFiles: entries.length,
+            }));
+        } catch (err) {
+            console.error('Failed to send folder manifest:', err);
+            this.closeRTC(targetSessionId);
+            return;
+        }
+
+        this.activeTransfers.set(transferId, { startTime: Date.now(), bytesSent: 0, totalBytes: totalSize });
+        this._transferPeers.set(transferId, targetSessionId);
+        this.showProgress(transferId, `Sending ${name}`, 0, null, null, 0, totalSize);
+
+        let bytesSentTotal = 0;
+        const startTime = Date.now();
+
+        for (const entry of entries) {
+            if (this.cancelledTransfers.has(transferId)) {
+                this.cancelledTransfers.delete(transferId);
+                this.activeTransfers.delete(transferId);
+                console.log('Folder transfer cancelled (sender):', name);
+                this.closeRTC(targetSessionId);
+                return;
+            }
+            if (dc.readyState !== 'open') {
+                console.warn('DataChannel closed mid-transfer (sender, folder)');
+                this.activeTransfers.delete(transferId);
+                this.hideProgress(transferId);
+                return;
+            }
+
+            const file = entry.file;
+            try {
+                dc.send(JSON.stringify({
+                    kind: 'file-header',
+                    relativePath: entry.relativePath,
+                    size: file.size,
+                    mimeType: file.type || 'application/octet-stream',
+                }));
+            } catch (err) {
+                console.error('Failed to send file header (folder):', err);
+                this.closeRTC(targetSessionId);
+                return;
+            }
+
+            const totalChunks = Math.ceil(file.size / this.RTC_CHUNK_SIZE);
+            for (let i = 0; i < totalChunks; i++) {
+                if (this.cancelledTransfers.has(transferId)) {
+                    this.cancelledTransfers.delete(transferId);
+                    this.activeTransfers.delete(transferId);
+                    this.closeRTC(targetSessionId);
+                    return;
+                }
+                if (dc.readyState !== 'open') {
+                    this.activeTransfers.delete(transferId);
+                    this.hideProgress(transferId);
+                    return;
+                }
+
+                const start = i * this.RTC_CHUNK_SIZE;
+                const end = Math.min(start + this.RTC_CHUNK_SIZE, file.size);
+                const buf = await file.slice(start, end).arrayBuffer();
+
+                let bpAttempts = 0;
+                while (dc.bufferedAmount > 4 * 1024 * 1024) {
+                    await new Promise(r => setTimeout(r, 20));
+                    bpAttempts++;
+                    if (bpAttempts > 500) {
+                        console.warn('Back-pressure timeout (sender, folder)');
+                        this.activeTransfers.delete(transferId);
+                        this.hideProgress(transferId);
+                        this.closeRTC(targetSessionId);
+                        return;
+                    }
+                }
+
+                try {
+                    dc.send(buf);
+                } catch (err) {
+                    console.error('DC send error (folder):', err);
+                    this.activeTransfers.delete(transferId);
+                    this.hideProgress(transferId);
+                    this.closeRTC(targetSessionId);
+                    return;
+                }
+
+                bytesSentTotal += (end - start);
+                const transfer = this.activeTransfers.get(transferId);
+                if (transfer) {
+                    transfer.bytesSent = bytesSentTotal;
+                    const pct = Math.round((bytesSentTotal / totalSize) * 100);
+                    const elapsed = (Date.now() - startTime) / 1000;
+                    const speed = elapsed > 0 ? bytesSentTotal / elapsed : 0;
+                    const remaining = speed > 0 ? (totalSize - bytesSentTotal) / speed : 0;
+                    this.showProgress(transferId, `Sending ${name} (${entry.relativePath})`, pct, speed, remaining, bytesSentTotal, totalSize);
+                }
+            }
+        }
+
+        try {
+            dc.send(JSON.stringify({ kind: 'folder-done' }));
+        } catch (_) { /* best-effort — the receiver also completes by byte count */ }
+
+        this.activeTransfers.delete(transferId);
+        this.hideProgress(transferId);
+        this.toast(`Sent folder ${name}`, 'success');
+        console.log(`Folder ${name} sent to ${targetSessionId.slice(-6)}`);
         setTimeout(() => this.closeRTC(targetSessionId), 2000);
     }
 
@@ -1266,6 +1509,13 @@ class LADEXApp {
                     this.closeRTC(fromPeerId);
                     return;
                 }
+                // F6: a folder manifest looks nothing like a single-file
+                // header — dispatch to its own consent dialog. Folders
+                // aren't offer-able via F3 yet, so no pre-accept bypass here.
+                if (meta.kind === 'folder-manifest') {
+                    this._showFolderConsentDialog(meta, fromPeerId, dc);
+                    return;
+                }
                 // F3: the user already consented at the file-offer stage —
                 // don't ask again now that the transfer is actually starting.
                 if (this._preAcceptedTransfers.delete(fromPeerId)) {
@@ -1373,6 +1623,319 @@ class LADEXApp {
         });
     }
 
+    // =====================================================================
+    //  F6: FOLDER RECEIVE
+    //  A folder manifest arrives on the same kind of DataChannel a single
+    //  file would, just with its own kind:'folder-manifest' header (see
+    //  streamFolderOverDC) — _handleIncomingDCWithConsent dispatches here
+    //  instead of the single-file consent dialog when it sees one.
+    // =====================================================================
+
+    /**
+     * Non-blocking consent dialog for an incoming folder.
+     * Accept → showDirectoryPicker() (falls back to assembling a zip for
+     * browsers without it — same FSAA-primary/fallback-secondary shape as
+     * every other receive path here).
+     * Decline → sends transfer_declined to sender.
+     */
+    _showFolderConsentDialog(meta, fromPeerId, dc) {
+        const senderName = this.escapeHtml(this._deviceDisplayName(fromPeerId, this.peers.get(fromPeerId)));
+        const folderName = this.escapeHtml(meta.folderName);
+        const sizeStr = this.formatFileSize(meta.totalBytes);
+
+        document.getElementById('incoming-file-dialog')?.remove();
+        const dialog = document.createElement('div');
+        dialog.id = 'incoming-file-dialog';
+        dialog.className = 'incoming-file-dialog';
+        dialog.innerHTML = `
+            <div class="ifd-inner">
+                <div class="ifd-icon">📁</div>
+                <div class="ifd-title">Incoming folder from <strong>${senderName}</strong></div>
+                <div class="ifd-name">&ldquo;${folderName}&rdquo;</div>
+                <div class="ifd-size">${meta.totalFiles} file${meta.totalFiles > 1 ? 's' : ''} · ${sizeStr}</div>
+                <div class="ifd-actions">
+                    <button id="ifd-accept" class="btn btn-primary">Accept &amp; choose folder</button>
+                    <button id="ifd-decline" class="btn btn-danger">Decline</button>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(dialog);
+
+        document.getElementById('ifd-accept').addEventListener('click', async () => {
+            dialog.remove();
+            if (window.showDirectoryPicker) {
+                await this._receiveFolderFSAA(dc, meta, fromPeerId);
+            } else {
+                await this._receiveFolderToZip(dc, meta, fromPeerId);
+            }
+        });
+
+        document.getElementById('ifd-decline').addEventListener('click', () => {
+            dialog.remove();
+            this.sendWS({
+                type: 'transfer_declined',
+                session_id: this.sessionId,
+                file_id: meta.folderId,
+            });
+            this.closeRTC(fromPeerId);
+        });
+    }
+
+    /**
+     * Resolves (creating as needed) the FileSystemFileHandle for a
+     * relativePath inside a picked directory, walking/creating each
+     * intermediate directory level — FSAA has no "create nested path"
+     * shortcut. Drops empty/"."/".." segments defensively; they're not an
+     * escape risk (a FileSystemDirectoryHandle can't resolve outside its
+     * own subtree regardless — getDirectoryHandle('..') just looks up a
+     * literally-named '..' entry), just not anything a sender should
+     * legitimately send.
+     */
+    async _resolveFolderFileHandle(dirHandle, relativePath) {
+        const parts = relativePath.split('/').filter(p => p && p !== '.' && p !== '..');
+        let dir = dirHandle;
+        for (let i = 0; i < parts.length - 1; i++) {
+            dir = await dir.getDirectoryHandle(parts[i], { create: true });
+        }
+        const leaf = parts[parts.length - 1] || 'unnamed';
+        return dir.getFileHandle(leaf, { create: true });
+    }
+
+    /** Streams each file in the folder straight to disk via FSAA — bounded
+     *  memory regardless of folder size, real directory structure. */
+    async _receiveFolderFSAA(dc, meta, fromPeerId) {
+        let dirHandle;
+        try {
+            dirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
+        } catch (err) {
+            if (err.name === 'AbortError') {
+                this.sendWS({ type: 'transfer_declined', session_id: this.sessionId, file_id: meta.folderId });
+                this.closeRTC(fromPeerId);
+                return;
+            }
+            console.warn('showDirectoryPicker failed, falling back to zip:', err);
+            await this._receiveFolderToZip(dc, meta, fromPeerId);
+            return;
+        }
+
+        const transferId = `dl:${meta.folderId}`;
+        this._transferPeers.set(transferId, fromPeerId);
+        this.showProgress(transferId, `Downloading ${meta.folderName}`, 0, null, null, 0, meta.totalBytes);
+
+        let totalReceived = 0;
+        let filesCompleted = 0;
+        let transferComplete = false;
+        let currentFile = null; // { relativePath, size, received, writable }
+        const startTime = Date.now();
+        let chain = Promise.resolve();
+
+        const finishCurrentFile = async () => {
+            if (currentFile?.writable) {
+                try { await currentFile.writable.close(); } catch (_) { /* best-effort */ }
+            }
+            currentFile = null;
+        };
+
+        const onMessage = (event) => {
+            chain = chain.then(async () => {
+                if (transferComplete) return;
+
+                if (typeof event.data === 'string') {
+                    let msg;
+                    try { msg = JSON.parse(event.data); } catch { return; }
+
+                    if (msg.kind === 'file-header') {
+                        await finishCurrentFile();
+                        try {
+                            const fileHandle = await this._resolveFolderFileHandle(dirHandle, msg.relativePath);
+                            const writable = await fileHandle.createWritable();
+                            currentFile = { relativePath: msg.relativePath, size: msg.size, received: 0, writable };
+                        } catch (err) {
+                            console.error(`Could not open ${msg.relativePath} for writing:`, err);
+                            currentFile = { relativePath: msg.relativePath, size: msg.size, received: 0, writable: null };
+                        }
+                    } else if (msg.kind === 'folder-done') {
+                        await finishCurrentFile();
+                        transferComplete = true;
+                        this.hideProgress(transferId);
+                        this.pendingDownloads.delete(meta.folderId);
+                        this.toast(`Downloaded folder ${meta.folderName} (${filesCompleted} file${filesCompleted === 1 ? '' : 's'})`, 'success', 5000);
+                        this.sendWS({ type: 'file_downloaded', session_id: this.sessionId, file_id: meta.folderId });
+                        setTimeout(() => this.closeRTC(fromPeerId), 2000);
+                    }
+                    return;
+                }
+
+                // Binary chunk for whichever file is currently open
+                if (!currentFile) return; // out-of-protocol — ignore defensively
+                if (currentFile.writable) {
+                    try {
+                        await currentFile.writable.write(event.data);
+                    } catch (err) {
+                        console.error(`Write error for ${currentFile.relativePath}:`, err);
+                    }
+                }
+                currentFile.received += event.data.byteLength;
+                totalReceived += event.data.byteLength;
+                if (currentFile.received >= currentFile.size) filesCompleted++;
+
+                const pct = Math.round((totalReceived / meta.totalBytes) * 100);
+                const elapsed = (Date.now() - startTime) / 1000;
+                const speed = elapsed > 0 ? totalReceived / elapsed : 0;
+                const remaining = speed > 0 ? (meta.totalBytes - totalReceived) / speed : 0;
+                this.showProgress(transferId, `Downloading ${meta.folderName} (${currentFile.relativePath})`, pct, speed, remaining, totalReceived, meta.totalBytes);
+            });
+        };
+
+        dc.onmessage = onMessage;
+        // Replay whatever arrived during the consent dialog / directory
+        // picker prompt — see _handleIncomingDCWithConsent's buffering.
+        const queued = dc._pendingChunks || [];
+        dc._pendingChunks = null;
+        for (const item of queued) onMessage({ data: item });
+
+        dc.onclose = () => {
+            if (!transferComplete) {
+                this.hideProgress(transferId);
+                this.pendingDownloads.delete(meta.folderId);
+                const wasCancelled = this.cancelledTransfers.has(`cancelled:${meta.folderId}`);
+                if (wasCancelled) {
+                    this.cancelledTransfers.delete(`cancelled:${meta.folderId}`);
+                } else {
+                    // F6 v1: folder transfers aren't resumable yet — unlike
+                    // single files (F8), so this is a fresh restart, not a
+                    // continuation. A worthwhile follow-up, not in scope here.
+                    this.toast(`Folder transfer interrupted: ${meta.folderName}`, 'warning');
+                }
+            }
+        };
+
+        dc.onerror = (err) => {
+            console.error('DC error (folder receive):', err);
+            if (!transferComplete) {
+                this.hideProgress(transferId);
+                this.pendingDownloads.delete(meta.folderId);
+                this.toast(`Folder transfer error: ${meta.folderName}`, 'error');
+            }
+        };
+    }
+
+    /** Fallback for browsers without showDirectoryPicker: assembles the
+     *  incoming files into a zip (one at a time — peak memory is bounded by
+     *  the largest single file, not the whole folder) and saves that,
+     *  reusing the same _zipToDisk/_zipToMemory helpers folder *uploads*
+     *  used before F6 moved uploads to real streaming. */
+    async _receiveFolderToZip(dc, meta, fromPeerId) {
+        if (typeof JSZip === 'undefined') {
+            this.toast('JSZip library not loaded — cannot receive this folder.', 'error');
+            this.sendWS({ type: 'transfer_declined', session_id: this.sessionId, file_id: meta.folderId });
+            this.closeRTC(fromPeerId);
+            return;
+        }
+
+        const zip = new JSZip();
+        const transferId = `dl:${meta.folderId}`;
+        this._transferPeers.set(transferId, fromPeerId);
+        this.showProgress(transferId, `Downloading ${meta.folderName}`, 0, null, null, 0, meta.totalBytes);
+
+        let totalReceived = 0;
+        let filesCompleted = 0;
+        let transferComplete = false;
+        let currentFile = null; // { relativePath, size, received, chunks }
+        const startTime = Date.now();
+
+        const finishCurrentFile = () => {
+            if (currentFile) {
+                zip.file(currentFile.relativePath, new Blob(currentFile.chunks));
+            }
+            currentFile = null;
+        };
+
+        const onMessage = (event) => {
+            if (transferComplete) return;
+
+            if (typeof event.data === 'string') {
+                let msg;
+                try { msg = JSON.parse(event.data); } catch { return; }
+
+                if (msg.kind === 'file-header') {
+                    finishCurrentFile();
+                    currentFile = { relativePath: msg.relativePath, size: msg.size, received: 0, chunks: [] };
+                } else if (msg.kind === 'folder-done') {
+                    finishCurrentFile();
+                    transferComplete = true;
+                    this._finalizeFolderZip(zip, meta, fromPeerId, filesCompleted);
+                }
+                return;
+            }
+
+            if (!currentFile) return;
+            currentFile.chunks.push(event.data);
+            currentFile.received += event.data.byteLength;
+            totalReceived += event.data.byteLength;
+            if (currentFile.received >= currentFile.size) filesCompleted++;
+
+            const pct = Math.round((totalReceived / meta.totalBytes) * 100);
+            const elapsed = (Date.now() - startTime) / 1000;
+            const speed = elapsed > 0 ? totalReceived / elapsed : 0;
+            const remaining = speed > 0 ? (meta.totalBytes - totalReceived) / speed : 0;
+            this.showProgress(transferId, `Downloading ${meta.folderName} (${currentFile.relativePath})`, pct, speed, remaining, totalReceived, meta.totalBytes);
+        };
+
+        dc.onmessage = onMessage;
+        const queued = dc._pendingChunks || [];
+        dc._pendingChunks = null;
+        for (const item of queued) onMessage({ data: item });
+
+        dc.onclose = () => {
+            if (!transferComplete) {
+                this.hideProgress(transferId);
+                this.pendingDownloads.delete(meta.folderId);
+                const wasCancelled = this.cancelledTransfers.has(`cancelled:${meta.folderId}`);
+                if (wasCancelled) {
+                    this.cancelledTransfers.delete(`cancelled:${meta.folderId}`);
+                } else {
+                    this.toast(`Folder transfer interrupted: ${meta.folderName}`, 'warning');
+                }
+            }
+        };
+
+        dc.onerror = (err) => {
+            console.error('DC error (folder receive, zip fallback):', err);
+            if (!transferComplete) {
+                this.hideProgress(transferId);
+                this.pendingDownloads.delete(meta.folderId);
+                this.toast(`Folder transfer error: ${meta.folderName}`, 'error');
+            }
+        };
+    }
+
+    async _finalizeFolderZip(zip, meta, fromPeerId, filesCompleted) {
+        const transferId = `dl:${meta.folderId}`;
+        const zipName = `${meta.folderName}.zip`;
+        try {
+            const file = window.showSaveFilePicker
+                ? await this._zipToDisk(zip, zipName)
+                : await this._zipToMemory(zip, zipName);
+            this.hideProgress(transferId);
+            this.pendingDownloads.delete(meta.folderId);
+            if (file) {
+                // _zipToDisk already saved it via the picker; _zipToMemory
+                // just builds the File object in memory, so trigger the
+                // actual download ourselves in that case.
+                if (!window.showSaveFilePicker) this.saveFileToDisk(file, zipName);
+                this.toast(`Downloaded folder ${meta.folderName} as ${zipName} (${filesCompleted} file${filesCompleted === 1 ? '' : 's'})`, 'success', 5000);
+            }
+        } catch (err) {
+            console.error('Failed to finalize folder zip:', err);
+            this.hideProgress(transferId);
+            this.pendingDownloads.delete(meta.folderId);
+            this.toast(`Could not save folder ${meta.folderName}: ${err.message}`, 'error');
+        }
+        this.sendWS({ type: 'file_downloaded', session_id: this.sessionId, file_id: meta.folderId });
+        setTimeout(() => this.closeRTC(fromPeerId), 2000);
+    }
+
     /**
      * Phase 8 §8.5: Non-blocking consent dialog.
      * Accept → opens showSaveFilePicker (or falls back to Blob path).
@@ -1421,42 +1984,105 @@ class LADEXApp {
     }
 
     /**
+     * F7: read back the part of a file we already wrote (on a resumed
+     * download) and fold it into a hasher, so the running hash stays
+     * correct across a resume without ever holding the whole prefix in
+     * memory at once.
+     */
+    async _hashExistingPrefix(hasher, fileHandle, bytesToHash) {
+        const existing = await fileHandle.getFile();
+        for (let offset = 0; offset < bytesToHash; offset += this.RTC_CHUNK_SIZE) {
+            const end = Math.min(offset + this.RTC_CHUNK_SIZE, bytesToHash);
+            const buf = await existing.slice(offset, end).arrayBuffer();
+            hasher.update(new Uint8Array(buf));
+        }
+    }
+
+    /** F7: a failed integrity check gets a toast with a one-click retry. */
+    _offerRedownload(fileId, fileName) {
+        this.toast(`Integrity check failed for "${fileName}" — it may be corrupted.`, 'error', 10000, {
+            label: 'Re-download',
+            onClick: () => {
+                this._resumeState.delete(fileId); // clean restart, not a resume
+                this.pendingDownloads.delete(fileId);
+                this.downloadFile(fileId);
+            },
+        });
+    }
+
+    /**
      * Phase 8 §8.2: FSAA streaming receive.
      * Chunks are written sequentially to a FileSystemWritableFileStream.
      * O(1) memory: only one chunk is live at any time.
      * The sequential `await writable.write()` provides natural receive-side backpressure.
+     *
+     * F8: resumes from meta.resumeFromBytes when we have a cached
+     * fileHandle from an earlier, interrupted attempt at this same fileId
+     * (see _resumeState) — reopens the SAME file with keepExistingData
+     * instead of prompting showSaveFilePicker() again, seeks past what's
+     * already on disk, and continues from there.
+     *
+     * F7: verifies the sender's sha256 (if it sent one) by hashing
+     * incrementally as chunks arrive — never re-reads the whole file to do
+     * it, so this scales to files far larger than available RAM. On a
+     * resume, the already-written prefix is read back once (bounded
+     * memory, see _hashExistingPrefix) to catch the hasher up first.
      */
     async _setupFSAAReceive(dc, meta, fromPeerId) {
+        const cached = this._resumeState.get(meta.fileId);
+        const isResume = !!(cached?.fileHandle && meta.resumeFromBytes > 0);
+
         let fileHandle;
-        try {
-            fileHandle = await window.showSaveFilePicker({
-                suggestedName: meta.fileName,
-                types: [{ description: 'File', accept: { [meta.mimeType || 'application/octet-stream']: [] } }],
-            });
-        } catch (err) {
-            if (err.name === 'AbortError') {
-                // User dismissed the picker
-                this.sendWS({ type: 'transfer_declined', session_id: this.sessionId, file_id: meta.fileId });
-                this.closeRTC(fromPeerId);
+        if (isResume) {
+            fileHandle = cached.fileHandle;
+        } else {
+            try {
+                fileHandle = await window.showSaveFilePicker({
+                    suggestedName: meta.fileName,
+                    types: [{ description: 'File', accept: { [meta.mimeType || 'application/octet-stream']: [] } }],
+                });
+            } catch (err) {
+                if (err.name === 'AbortError') {
+                    // User dismissed the picker
+                    this.sendWS({ type: 'transfer_declined', session_id: this.sessionId, file_id: meta.fileId });
+                    this.closeRTC(fromPeerId);
+                    return;
+                }
+                // Unexpected error — fall back to Blob path
+                console.warn('showSaveFilePicker failed, falling back:', err);
+                this.setupReceiverDC(dc, fromPeerId, meta);
                 return;
             }
-            // Unexpected error — fall back to Blob path
-            console.warn('showSaveFilePicker failed, falling back:', err);
-            this.setupReceiverDC(dc, fromPeerId, meta);
-            return;
         }
 
         let writable;
         try {
-            writable = await fileHandle.createWritable();
+            writable = await fileHandle.createWritable({ keepExistingData: isResume });
+            if (isResume) {
+                await writable.write({ type: 'seek', position: meta.resumeFromBytes });
+            }
         } catch (err) {
             console.error('createWritable failed:', err);
             this.toast('Could not open file for writing.', 'error');
+            this._resumeState.delete(meta.fileId);
             this.closeRTC(fromPeerId);
             return;
         }
 
-        let receivedBytes = 0;
+        let hasher = null;
+        if (meta.sha256 && typeof hashwasm !== 'undefined') {
+            try {
+                hasher = await hashwasm.createSHA256();
+                if (isResume) {
+                    await this._hashExistingPrefix(hasher, fileHandle, meta.resumeFromBytes);
+                }
+            } catch (err) {
+                console.warn('Could not start integrity hash:', err);
+                hasher = null;
+            }
+        }
+
+        let receivedBytes = isResume ? meta.resumeFromBytes : 0;
         const startTime = Date.now();
         let transferComplete = false;
         // BUG-12 fix: keyed by fileId (not fileId+peer) — a retry can pick
@@ -1464,8 +2090,9 @@ class LADEXApp {
         // user's progress card should follow the download, not the peer.
         const transferId = `dl:${meta.fileId}`;
         this._transferPeers.set(transferId, fromPeerId);
-        this.showProgress(transferId, `Downloading ${meta.fileName}`, 0, null, null, 0, meta.fileSize);
-        console.log(`[FSAA] Receiving ${meta.fileName} (${this.formatFileSize(meta.fileSize)})`);
+        this._resumeState.set(meta.fileId, { fileHandle, bytesReceived: receivedBytes });
+        this.showProgress(transferId, `Downloading ${meta.fileName}`, Math.round((receivedBytes / meta.fileSize) * 100), null, null, receivedBytes, meta.fileSize);
+        console.log(`[FSAA] Receiving ${meta.fileName} (${this.formatFileSize(meta.fileSize)})${isResume ? ` — resuming from ${this.formatFileSize(receivedBytes)}` : ''}`);
 
         // Use an async queue so we never process two chunks concurrently
         // and the DC’s JS buffer can’t grow unboundedly.
@@ -1486,10 +2113,13 @@ class LADEXApp {
                     this.closeRTC(fromPeerId);
                     return;
                 }
+                if (hasher) hasher.update(new Uint8Array(chunk));
                 receivedBytes += chunk.byteLength;
+                const resumeEntry = this._resumeState.get(meta.fileId);
+                if (resumeEntry) resumeEntry.bytesReceived = receivedBytes;
                 const pct = Math.round((receivedBytes / meta.fileSize) * 100);
                 const elapsed = (Date.now() - startTime) / 1000;
-                const speed = elapsed > 0 ? receivedBytes / elapsed : 0;
+                const speed = elapsed > 0 ? (receivedBytes - (isResume ? meta.resumeFromBytes : 0)) / elapsed : 0;
                 const remaining = speed > 0 ? (meta.fileSize - receivedBytes) / speed : 0;
                 this.showProgress(transferId, `Downloading ${meta.fileName}`, pct, speed, remaining, receivedBytes, meta.fileSize);
 
@@ -1503,8 +2133,23 @@ class LADEXApp {
                     this.hideProgress(transferId);
                     this.pendingDownloads.delete(meta.fileId);
                     this.activeTransfers.delete(`retry:${meta.fileId}`);
-                    this.toast(`Downloaded ${meta.fileName} (${this.formatFileSize(meta.fileSize)})`, 'success', 5000);
+                    this._resumeState.delete(meta.fileId);
                     console.log(`[FSAA] Download complete: ${meta.fileName}`);
+
+                    if (hasher) {
+                        const computed = hasher.digest('hex');
+                        if (computed === meta.sha256) {
+                            this._integrityStatus.set(meta.fileId, 'verified');
+                            this.toast(`Downloaded ${meta.fileName} (${this.formatFileSize(meta.fileSize)}) — ✓ verified`, 'success', 5000);
+                        } else {
+                            console.error(`Integrity check FAILED for ${meta.fileName}: expected ${meta.sha256}, got ${computed}`);
+                            this._integrityStatus.set(meta.fileId, 'failed');
+                            this._offerRedownload(meta.fileId, meta.fileName);
+                        }
+                        this.updateFileList(this.serverFiles);
+                    } else {
+                        this.toast(`Downloaded ${meta.fileName} (${this.formatFileSize(meta.fileSize)})`, 'success', 5000);
+                    }
                     // Notify server we now also host this file
                     this.sendWS({ type: 'file_downloaded', session_id: this.sessionId, file_id: meta.fileId });
                     setTimeout(() => this.closeRTC(fromPeerId), 2000);
@@ -1524,10 +2169,11 @@ class LADEXApp {
                 this.hideProgress(transferId);
                 const wasCancelled = this.cancelledTransfers.has(`cancelled:${meta.fileId}`);
                 if (!wasCancelled) {
-                    this.toast(`Transfer interrupted: ${meta.fileName} — retrying…`, 'warning');
+                    this.toast(`Transfer interrupted: ${meta.fileName} — resuming…`, 'warning');
                     this._retryDownload(meta.fileId);
                 } else {
                     this.cancelledTransfers.delete(`cancelled:${meta.fileId}`);
+                    this._resumeState.delete(meta.fileId);
                 }
             }
         };
@@ -1540,7 +2186,7 @@ class LADEXApp {
                 });
                 this.hideProgress(transferId);
                 if (meta && !this.cancelledTransfers.has(`cancelled:${meta.fileId}`)) {
-                    this.toast(`Transfer error: ${meta.fileName} — retrying…`, 'warning');
+                    this.toast(`Transfer error: ${meta.fileName} — resuming…`, 'warning');
                     this._retryDownload(meta.fileId);
                 }
             }
@@ -1558,32 +2204,79 @@ class LADEXApp {
      * broken independently of the chunk-buffering bug (it would try to
      * JSON.parse the first binary chunk and fail).
      */
-    setupReceiverDC(dc, fromPeerId, meta) {
-        let chunks = [];
-        let receivedBytes = 0;
+    /**
+     * F8: resumes in-memory from a previous attempt's buffered chunks (see
+     * _resumeState) instead of starting over — this path has no on-disk
+     * handle to reopen the way FSAA does, so "resuming" here just means not
+     * throwing away what's already been buffered in RAM.
+     *
+     * F7: verifies the sender's sha256 the same way as _setupFSAAReceive,
+     * hashing each chunk as it arrives (plus any already-buffered ones from
+     * a resume) rather than re-hashing the whole Blob at the end.
+     */
+    async setupReceiverDC(dc, fromPeerId, meta) {
+        const cached = this._resumeState.get(meta.fileId);
+        const isResume = !!(cached?.chunks && meta.resumeFromBytes > 0);
+
+        let chunks = isResume ? cached.chunks : [];
+        let receivedBytes = isResume ? cached.bytesReceived : 0;
         let startTime = Date.now();
         let transferComplete = false;  // Flag to prevent onclose from firing after success
         // BUG-12 fix: see the matching comment in _setupFSAAReceive.
         const transferId = `dl:${meta.fileId}`;
         this._transferPeers.set(transferId, fromPeerId);
+        this._resumeState.set(meta.fileId, { chunks, bytesReceived: receivedBytes });
 
-        console.log(`Receiving ${meta.fileName} (${this.formatFileSize(meta.fileSize)}) from ${fromPeerId.slice(-6)}`);
-        this.showProgress(transferId, `Downloading ${meta.fileName}`, 0, null, null, 0, meta.fileSize);
+        let hasher = null;
+        if (meta.sha256 && typeof hashwasm !== 'undefined') {
+            try {
+                hasher = await hashwasm.createSHA256();
+                for (const c of chunks) hasher.update(new Uint8Array(c)); // catch up on a resume
+            } catch (err) {
+                console.warn('Could not start integrity hash:', err);
+                hasher = null;
+            }
+        }
+
+        console.log(`Receiving ${meta.fileName} (${this.formatFileSize(meta.fileSize)}) from ${fromPeerId.slice(-6)}${isResume ? ` — resuming from ${this.formatFileSize(receivedBytes)}` : ''}`);
+        this.showProgress(transferId, `Downloading ${meta.fileName}`, Math.round((receivedBytes / meta.fileSize) * 100), null, null, receivedBytes, meta.fileSize);
 
         const onChunk = (chunk) => {
             chunks.push(chunk);
+            if (hasher) hasher.update(new Uint8Array(chunk));
             receivedBytes += chunk.byteLength;
+            const resumeEntry = this._resumeState.get(meta.fileId);
+            if (resumeEntry) resumeEntry.bytesReceived = receivedBytes;
 
             const pct = Math.round((receivedBytes / meta.fileSize) * 100);
             const elapsed = (Date.now() - startTime) / 1000;
-            const speed = elapsed > 0 ? receivedBytes / elapsed : 0;
+            const speed = elapsed > 0 ? (receivedBytes - (isResume ? meta.resumeFromBytes : 0)) / elapsed : 0;
             const remaining = speed > 0 ? (meta.fileSize - receivedBytes) / speed : 0;
             this.showProgress(transferId, `Downloading ${meta.fileName}`, pct, speed, remaining, receivedBytes, meta.fileSize);
 
             // All chunks received?
             if (receivedBytes >= meta.fileSize) {
                 transferComplete = true;  // Mark as complete before finalize
-                this.finalizeReceivedFile(meta, chunks, fromPeerId);
+                this._resumeState.delete(meta.fileId);
+
+                if (hasher) {
+                    const computed = hasher.digest('hex');
+                    if (computed === meta.sha256) {
+                        this._integrityStatus.set(meta.fileId, 'verified');
+                    } else {
+                        console.error(`Integrity check FAILED for ${meta.fileName}: expected ${meta.sha256}, got ${computed}`);
+                        this._integrityStatus.set(meta.fileId, 'failed');
+                        this.hideProgress(transferId);
+                        this.pendingDownloads.delete(meta.fileId);
+                        this._offerRedownload(meta.fileId, meta.fileName);
+                        this.updateFileList(this.serverFiles);
+                        // Still finalize — a corrupted copy the user can see
+                        // and retry beats silently discarding their transfer.
+                        this.finalizeReceivedFile(meta, chunks, fromPeerId, /* verified */ false);
+                        return;
+                    }
+                }
+                this.finalizeReceivedFile(meta, chunks, fromPeerId, hasher ? true : null);
             }
         };
 
@@ -1599,11 +2292,12 @@ class LADEXApp {
             const wasCancelled = this.cancelledTransfers.has(`cancelled:${meta.fileId}`);
             if (wasCancelled) {
                 this.cancelledTransfers.delete(`cancelled:${meta.fileId}`);
+                this._resumeState.delete(meta.fileId);
                 return; // User cancelled, don't retry
             }
             if (!transferComplete && receivedBytes < meta.fileSize) {
                 this.hideProgress(transferId);
-                this.toast(`Transfer interrupted: ${meta.fileName} — retrying…`, 'warning');
+                this.toast(`Transfer interrupted: ${meta.fileName} — resuming…`, 'warning');
                 this._retryDownload(meta.fileId);
             }
         };
@@ -1613,18 +2307,19 @@ class LADEXApp {
             const wasCancelled = this.cancelledTransfers.has(`cancelled:${meta.fileId}`);
             if (wasCancelled) {
                 this.cancelledTransfers.delete(`cancelled:${meta.fileId}`);
+                this._resumeState.delete(meta.fileId);
                 return; // User cancelled, don't retry
             }
             if (!transferComplete) {
                 this.hideProgress(transferId);
-                this.toast(`Transfer error: ${meta.fileName} — retrying…`, 'warning');
+                this.toast(`Transfer error: ${meta.fileName} — resuming…`, 'warning');
                 this._retryDownload(meta.fileId);
             }
         };
     }
 
     /** Assemble received chunks into a File, trigger browser download, become a host. */
-    finalizeReceivedFile(meta, chunks, fromPeerId) {
+    finalizeReceivedFile(meta, chunks, fromPeerId, verified = null) {
         const blob = new Blob(chunks, { type: meta.mimeType });
         const file = new File([blob], meta.fileName, { type: meta.mimeType });
 
@@ -1637,7 +2332,13 @@ class LADEXApp {
         this.hideProgress(`dl:${meta.fileId}`);
         this.pendingDownloads.delete(meta.fileId);
         this.activeTransfers.delete(`retry:${meta.fileId}`);
-        this.toast(`Downloaded ${meta.fileName} (${this.formatFileSize(meta.fileSize)})`, 'success', 5000);
+        const sizeStr = this.formatFileSize(meta.fileSize);
+        if (verified === false) {
+            this.toast(`Downloaded ${meta.fileName} (${sizeStr}) — ⚠ integrity check failed`, 'warning', 6000);
+        } else {
+            const suffix = verified === true ? ' — ✓ verified' : '';
+            this.toast(`Downloaded ${meta.fileName} (${sizeStr})${suffix}`, 'success', 5000);
+        }
         console.log(`Download complete: ${meta.fileName}`);
 
         // Notify server we now also host this file
@@ -1820,10 +2521,21 @@ class LADEXApp {
                 const hosts = Array.isArray(f.hosts) ? f.hosts : Array.from(f.hosts || []);
                 const isDownloading = this.pendingDownloads.has(f.id);
                 const isMine = f.uploader_id === this.sessionId;
+                // F7: ✓/✗ badge for files this tab downloaded and checked
+                // against the sender's sha256 (only set for our own downloads;
+                // F6 folders aren't hashed as a whole — see streamFolderOverDC)
+                const integrity = this._integrityStatus.get(f.id);
+                const integrityBadge = integrity === 'verified'
+                    ? '<span class="integrity-badge integrity-ok" title="Integrity verified">✓</span>'
+                    : integrity === 'failed'
+                        ? '<span class="integrity-badge integrity-bad" title="Integrity check failed">✗</span>'
+                        : '';
+                const icon = f.is_folder ? '📁' : '📄';
+                const typeLabel = f.is_folder ? 'Folder' : f.mime_type;
                 return `
                     <tr class="file-row" draggable="true" data-file-id="${this.escapeHtml(f.id)}">
-                        <td class="file-name">📄 ${this.escapeHtml(f.name)}</td>
-                        <td class="file-type">${this.escapeHtml(f.mime_type)}</td>
+                        <td class="file-name">${icon} ${this.escapeHtml(f.name)}${integrityBadge}</td>
+                        <td class="file-type">${this.escapeHtml(typeLabel)}</td>
                         <td class="file-size">${this.formatSize(f.size)}</td>
                         <td>
                             <div class="file-hosts">
