@@ -1,6 +1,5 @@
 /target
 **/*.rs.bk
-Cargo.lock
 
 .vscode/
 .idea
@@ -11,3 +10,5 @@ Cargo.lock
 Thumbs.db
 
 *.log
+
+docs

@@ -1,29 +1,52 @@
+// ============================================================================
+// LADEX — Browser-tab WebSocket handler (/ws)
+//
+// Phase 5: All WebRTC signaling messages now route through mesh::route_signal()
+//          which transparently delivers locally or wraps in MeshMessage::SignalRelay.
+// Phase 6: RequestDownloadFrom — client names its chosen host explicitly.
+//          Node honors the choice without override; returns HostUnreachable if
+//          that peer is gone.
+// Phase 5: TransferDeclined — receiver signals rejection; routed back to sender.
+// ============================================================================
+
+use crate::{mesh, state};
 use crate::types::*;
-use crate::AppState;
+use crate::NodeState;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use warp::ws::{Message, WebSocket, Ws};
 use warp::{Rejection, Reply};
 
-pub async fn websocket_handler(ws: Ws, state: AppState) -> Result<impl Reply, Rejection> {
+pub async fn websocket_handler(ws: Ws, state: NodeState) -> Result<impl Reply, Rejection> {
     Ok(ws.on_upgrade(move |socket| handle_websocket(socket, state)))
 }
 
 // ---------------------------------------------------------------------------
-// Helpers: broadcast to all peers / send to a single peer
+// Helpers
 // ---------------------------------------------------------------------------
 
-/// Send a message to every connected peer.
-async fn broadcast(state: &AppState, msg: ServerMessage) {
-    let senders = state.senders.read().await;
+/// F5: the client already truncates nicknames to 40 chars, but a
+/// non-browser client (or a modified one) could send anything — cap it
+/// server-side too. Char-based, not byte-based, so this never splits a
+/// multi-byte UTF-8 sequence.
+fn cap_nickname(nickname: String) -> String {
+    nickname.chars().take(60).collect()
+}
+
+pub async fn broadcast(state: &NodeState, msg: ServerMessage) {
+    let senders = state.local_senders.read().await;
     for sender in senders.values() {
         let _ = sender.send(msg.clone());
     }
 }
 
-/// Send a message to a single peer identified by session id.
-async fn send_to(state: &AppState, target: &SessionId, msg: ServerMessage) {
-    let senders = state.senders.read().await;
+/// Alias for broadcast — used by Phase 10 AP isolation diagnostic.
+pub async fn broadcast_all(state: &NodeState, msg: ServerMessage) {
+    broadcast(state, msg).await;
+}
+
+pub async fn send_to(state: &NodeState, target: &SessionId, msg: ServerMessage) {
+    let senders = state.local_senders.read().await;
     if let Some(sender) = senders.get(target) {
         let _ = sender.send(msg);
     }
@@ -33,49 +56,25 @@ async fn send_to(state: &AppState, target: &SessionId, msg: ServerMessage) {
 // WebSocket lifecycle
 // ---------------------------------------------------------------------------
 
-pub async fn handle_websocket(ws: WebSocket, state: AppState) {
+pub async fn handle_websocket(ws: WebSocket, state: NodeState) {
     let (mut ws_tx, mut ws_rx) = ws.split();
     let mut session_id: Option<SessionId> = None;
-
-    // Create a per-peer mpsc channel.  The sender half is registered in the
-    // shared map once we know the session_id (on Join).  The receiver half
-    // drives outgoing messages for THIS connection only.
     let (peer_tx, mut peer_rx) = mpsc::unbounded_channel::<ServerMessage>();
 
-    // Spawn a task that drains the per-peer receiver and writes to the WS.
     let outgoing_task = tokio::spawn(async move {
         while let Some(msg) = peer_rx.recv().await {
-            let json = match serde_json::to_string(&msg) {
-                Ok(j) => j,
-                Err(_) => continue,
-            };
-            if ws_tx.send(Message::text(json)).await.is_err() {
-                break;
-            }
+            let json = match serde_json::to_string(&msg) { Ok(j) => j, Err(_) => continue };
+            if ws_tx.send(Message::text(json)).await.is_err() { break; }
         }
     });
 
-    // Handle incoming messages
     while let Some(result) = ws_rx.next().await {
         match result {
             Ok(msg) => {
                 if let Ok(text) = msg.to_str() {
                     if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(text) {
-                        match handle_client_message(
-                            client_msg,
-                            &state,
-                            &mut session_id,
-                            &peer_tx,
-                        )
-                        .await
-                        {
-                            Ok(_) => {}
-                            Err(e) => {
-                                // Send the error only to THIS peer, not everyone
-                                let _ = peer_tx.send(ServerMessage::Error {
-                                    message: e.to_string(),
-                                });
-                            }
+                        if let Err(e) = handle_client_message(client_msg, &state, &mut session_id, &peer_tx).await {
+                            let _ = peer_tx.send(ServerMessage::Error { message: e.to_string() });
                         }
                     }
                 }
@@ -84,289 +83,420 @@ pub async fn handle_websocket(ws: WebSocket, state: AppState) {
         }
     }
 
-    // Cleanup when connection closes
     if let Some(id) = &session_id {
-        // Remove sender from shared map first
-        {
-            let mut senders = state.senders.write().await;
-            senders.remove(id);
-        }
+        { let mut s = state.local_senders.write().await; s.remove(id); }
         cleanup_peer(&state, id).await;
     }
-
     outgoing_task.abort();
 }
 
 // ---------------------------------------------------------------------------
-// Message handling
+// Message dispatcher
 // ---------------------------------------------------------------------------
 
 async fn handle_client_message(
     msg: ClientMessage,
-    state: &AppState,
+    state: &NodeState,
     session_id: &mut Option<SessionId>,
     peer_tx: &PeerSender,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match msg {
         // ── Join ─────────────────────────────────────────────────────────
-        ClientMessage::Join {
-            session_id: id,
-            user_agent,
-        } => {
+        ClientMessage::Join { session_id: id, user_agent, nickname } => {
             *session_id = Some(id.clone());
-
-            // Register this peer's sender so others can route messages to it
-            {
-                let mut senders = state.senders.write().await;
-                senders.insert(id.clone(), peer_tx.clone());
-            }
+            { let mut s = state.local_senders.write().await; s.insert(id.clone(), peer_tx.clone()); }
 
             let peer = PeerInfo {
                 session_id: id.clone(),
                 connected_at: chrono::Utc::now(),
                 user_agent,
+                hosting_node_id: Some(state.node_id.clone()),
+                node_rtt_ms: None,
+                left: false,
+                left_at: None,
+                hosting_node_name: Some(state.node_name.clone()),
+                nickname: nickname.map(cap_nickname).filter(|n| !n.is_empty()),
             };
 
             let peers_count = {
-                let mut peers = state.peers.write().await;
+                let mut peers = state.local_peers.write().await;
                 peers.insert(id.clone(), peer.clone());
                 peers.len()
             };
 
-            // Send current file catalog only to the newly joined peer
+            // Send merged catalog to new tab (non-deleted only)
             let files: Vec<FileMetadata> = {
                 let files = state.files.read().await;
-                files.values().cloned().collect()
+                files.values().filter(|f| !f.deleted).cloned().collect()
             };
             let _ = peer_tx.send(ServerMessage::FileListUpdate { files });
 
-            // Send message history only to the newly joined peer
-            let messages = {
-                let messages = state.messages.read().await;
-                messages.clone()
-            };
+            // Send full chat history
+            let messages = state.messages.read().await.clone();
             if !messages.is_empty() {
                 let _ = peer_tx.send(ServerMessage::MessageHistory { messages });
             }
 
-            // Notify ALL peers about the new peer
-            broadcast(
-                state,
-                ServerMessage::PeerJoined {
-                    peer,
-                    total_peers: peers_count,
-                },
-            )
-            .await;
+            broadcast(state, ServerMessage::PeerJoined { peer: peer.clone(), total_peers: peers_count }).await;
+            state::push_peer_to_mesh(&state.mesh_peers, peer).await;
         }
 
-        // ── File catalog ─────────────────────────────────────────────────
-        ClientMessage::FileUpload {
-            session_id: _,
-            file,
-        } => {
-            {
-                let mut files = state.files.write().await;
-                files.insert(file.id.clone(), file);
+        // ── F5: nickname change after join ─────────────────────────────────
+        ClientMessage::SetNickname { session_id: id, nickname } => {
+            let updated = {
+                let mut peers = state.local_peers.write().await;
+                match peers.get_mut(&id) {
+                    Some(peer) => {
+                        let nickname = cap_nickname(nickname);
+                        peer.nickname = if nickname.is_empty() { None } else { Some(nickname) };
+                        // Bump connected_at so this update actually wins the
+                        // LWW comparison on other mesh nodes — merge_peers
+                        // requires a strictly newer timestamp to apply an
+                        // update, and a nickname change alone wouldn't
+                        // produce one otherwise (see BUG-08's fix for the
+                        // same principle applied to departures).
+                        peer.connected_at = chrono::Utc::now();
+                        Some(peer.clone())
+                    }
+                    None => None,
+                }
+            };
+            if let Some(peer) = updated {
+                broadcast(state, ServerMessage::PeerSync { peers: vec![peer.clone()] }).await;
+                state::push_peer_to_mesh(&state.mesh_peers, peer).await;
             }
+        }
+
+        // ── File upload ───────────────────────────────────────────────────
+        // BUG-07 fix: a browser tab resends file_upload for every
+        // locally-held file after every WS reconnect (see app.js
+        // connectWebSocket()), always with `hosts: [own session_id]` since
+        // the tab only knows about itself. Treating that as a fresh upload
+        // — as a blind `files.insert()` did — replaced the whole catalog
+        // entry and wiped out every OTHER peer that had since become a
+        // host via file_downloaded, plus any sha256 computed after the
+        // original upload. If an id we already know about comes back in,
+        // this is a re-registration of the same file, not a new one: merge
+        // hosts and sha256 into the existing entry instead of replacing it.
+        ClientMessage::FileUpload { session_id: _, mut file } => {
+            let file_for_mesh = {
+                let mut files = state.files.write().await;
+                if let Some(existing) = files.get_mut(&file.id) {
+                    existing.hosts.extend(file.hosts.drain());
+                    if file.sha256.is_some() {
+                        existing.sha256 = file.sha256.take();
+                    }
+                    // A file id is only ever reused by the peer that
+                    // originally minted it re-registering it — never
+                    // treat that as resurrecting a deletion made by
+                    // someone else in the meantime.
+                    if existing.deleted {
+                        existing.deleted = false;
+                        existing.deleted_at = 0;
+                    }
+                    existing.clone()
+                } else {
+                    if file.created_at == 0 { file.created_at = chrono::Utc::now().timestamp_millis() as u64; }
+                    file.deleted = false;
+                    file.deleted_at = 0;
+                    files.insert(file.id.clone(), file.clone());
+                    file
+                }
+            };
 
             let files: Vec<FileMetadata> = {
                 let files = state.files.read().await;
-                files.values().cloned().collect()
+                files.values().filter(|f| !f.deleted).cloned().collect()
             };
             broadcast(state, ServerMessage::FileListUpdate { files }).await;
+            state::push_file_to_mesh(&state.mesh_peers, file_for_mesh).await;
         }
 
-        // ── Download request → pick a host (round-robin) ───────────────────
-        ClientMessage::RequestDownload {
-            session_id: requester_id,
-            file_id,
-        } => {
+        // ── Phase 6: Client-side host selection ──────────────────────────
+        // Client explicitly names the peer it wants to download from.
+        // Node honors the choice without override.  Returns HostUnreachable
+        // if that peer is not present in the merged peer list.
+        ClientMessage::RequestDownloadFrom { session_id: requester_id, file_id, host_peer_id, resume_from_bytes } => {
+            // Verify the file exists and is not tombstoned
+            let file_valid = {
+                let files = state.files.read().await;
+                files.get(&file_id).map(|f| !f.deleted).unwrap_or(false)
+            };
+            if !file_valid {
+                send_to(state, &requester_id, ServerMessage::Error {
+                    message: format!("File {file_id} not found or has been removed"),
+                }).await;
+                return Ok(());
+            }
+
+            // Check the chosen host is reachable (present in the merged peer
+            // list, and — BUG-08 fix — not a departure tombstone: a
+            // departed peer is still a key in the map, just marked `left`,
+            // so `contains_key` alone would keep routing to ghosts).
+            let host_known = {
+                let peers = state.local_peers.read().await;
+                peers.get(&host_peer_id).map(|p| !p.left).unwrap_or(false)
+            };
+            if !host_known {
+                // Phase 6: do NOT silently reroute — let client retry
+                send_to(state, &requester_id, ServerMessage::HostUnreachable {
+                    file_id,
+                    host_peer_id,
+                }).await;
+                return Ok(());
+            }
+
+            // Route DownloadRequest to the explicitly chosen host (Phase 5 path)
+            mesh::route_signal(
+                state,
+                &requester_id,
+                &host_peer_id,
+                ServerMessage::DownloadRequest {
+                    file_id,
+                    requester_session_id: requester_id.clone(),
+                    resume_from_bytes,
+                },
+            ).await;
+        }
+
+        // ── Legacy download request (server picks host — kept for fallback) ─
+        ClientMessage::RequestDownload { session_id: requester_id, file_id } => {
             let file_hosts = {
                 let files = state.files.read().await;
-                files.get(&file_id).map(|f| f.hosts.clone()).unwrap_or_default()
+                files.get(&file_id).filter(|f| !f.deleted).map(|f| f.hosts.clone()).unwrap_or_default()
             };
-
-            // Don't pick the requester as host for its own file
-            let mut available: Vec<SessionId> = file_hosts
-                .into_iter()
-                .filter(|h| *h != requester_id)
-                .collect();
+            let mut available: Vec<SessionId> = file_hosts.into_iter()
+                .filter(|h| *h != requester_id).collect();
 
             if available.is_empty() {
-                send_to(
+                send_to(state, &requester_id, ServerMessage::Error {
+                    message: "No hosts available for this file".to_string(),
+                }).await;
+            } else {
+                available.sort();
+                let idx = file_id.bytes().fold(0usize, |acc, b| acc.wrapping_add(b as usize)) % available.len();
+                let host_id = available[idx].clone();
+                // Phase 5: route through mesh so cross-node hosts work
+                mesh::route_signal(
                     state,
                     &requester_id,
-                    ServerMessage::Error {
-                        message: "No hosts available for this file".to_string(),
-                    },
-                )
-                .await;
-            } else {
-                // Round-robin: sort by session_id for determinism, then
-                // rotate based on a simple counter derived from the file_id
-                // hash so different files spread across different hosts.
-                available.sort();
-                let idx = file_id
-                    .bytes()
-                    .fold(0usize, |acc, b| acc.wrapping_add(b as usize))
-                    % available.len();
-                let host_id = &available[idx];
-
-                send_to(
-                    state,
-                    host_id,
+                    &host_id,
                     ServerMessage::DownloadRequest {
                         file_id,
-                        requester_session_id: requester_id,
+                        requester_session_id: requester_id.clone(),
+                        resume_from_bytes: None, // legacy path has no host choice to resume against
                     },
-                )
-                .await;
+                ).await;
             }
         }
 
         // ── File downloaded → register new host ──────────────────────────
-        ClientMessage::FileDownloaded {
-            session_id: downloader_id,
-            file_id,
-        } => {
-            {
+        ClientMessage::FileDownloaded { session_id: downloader_id, file_id } => {
+            let updated_file = {
                 let mut files = state.files.write().await;
                 if let Some(file) = files.get_mut(&file_id) {
                     file.hosts.insert(downloader_id);
-                }
-            }
-
+                    Some(file.clone())
+                } else { None }
+            };
             let files: Vec<FileMetadata> = {
                 let files = state.files.read().await;
-                files.values().cloned().collect()
+                files.values().filter(|f| !f.deleted).cloned().collect()
             };
             broadcast(state, ServerMessage::FileListUpdate { files }).await;
+            if let Some(f) = updated_file { state::push_file_to_mesh(&state.mesh_peers, f).await; }
         }
 
-        // ── WebRTC signaling: Offer ──────────────────────────────────────
-        ClientMessage::WebRTCOffer {
-            session_id: from,
-            target_session_id,
-            sdp,
-        } => {
-            send_to(
-                state,
-                &target_session_id,
-                ServerMessage::WebRTCOffer {
-                    from_session_id: from,
-                    sdp,
-                },
-            )
-            .await;
+        // ── Phase 5: WebRTC signaling — routed through mesh ──────────────
+        // All three signaling message types follow the same pattern:
+        // route_signal() decides local delivery vs. MeshMessage::SignalRelay.
+
+        ClientMessage::WebRTCOffer { session_id: from, target_session_id, sdp } => {
+            mesh::route_signal(
+                state, &from, &target_session_id,
+                ServerMessage::WebRTCOffer { from_session_id: from.clone(), sdp },
+            ).await;
         }
 
-        // ── WebRTC signaling: Answer ─────────────────────────────────────
-        ClientMessage::WebRTCAnswer {
-            session_id: from,
-            target_session_id,
-            sdp,
-        } => {
-            send_to(
-                state,
-                &target_session_id,
-                ServerMessage::WebRTCAnswer {
-                    from_session_id: from,
-                    sdp,
-                },
-            )
-            .await;
+        ClientMessage::WebRTCAnswer { session_id: from, target_session_id, sdp } => {
+            mesh::route_signal(
+                state, &from, &target_session_id,
+                ServerMessage::WebRTCAnswer { from_session_id: from.clone(), sdp },
+            ).await;
         }
 
-        // ── WebRTC signaling: ICE Candidate ──────────────────────────────
-        ClientMessage::ICECandidate {
-            session_id: from,
-            target_session_id,
-            candidate,
-        } => {
-            send_to(
-                state,
-                &target_session_id,
-                ServerMessage::ICECandidate {
-                    from_session_id: from,
-                    candidate,
-                },
-            )
-            .await;
+        ClientMessage::ICECandidate { session_id: from, target_session_id, candidate } => {
+            mesh::route_signal(
+                state, &from, &target_session_id,
+                ServerMessage::ICECandidate { from_session_id: from.clone(), candidate },
+            ).await;
         }
 
-        // ── Ping / Pong ──────────────────────────────────────────────────
+        // ── Phase 5: Transfer declined ────────────────────────────────────
+        // Receiver doesn't want the file.  Route rejection back to sender.
+        ClientMessage::TransferDeclined { session_id: from, file_id } => {
+            // We don't know the sender's session_id here, but we can broadcast
+            // to local tabs that host the file.  The sender tab will recognize
+            // its own file_id and surface a toast.
+            //
+            // Limitation: cross-node rejection routing is handled in Phase 5
+            // by embedding from_session_id in the SignalRelay payload.
+            // For same-node: broadcast the TransferDeclined to all local tabs.
+            broadcast(state, ServerMessage::TransferDeclined {
+                file_id,
+                from_session_id: from,
+            }).await;
+        }
+
+        // ── Ping / Pong ───────────────────────────────────────────────────
         ClientMessage::Ping { session_id: _ } => {
             let _ = peer_tx.send(ServerMessage::Pong);
         }
 
-        // ── Text messaging ───────────────────────────────────────────────
-        ClientMessage::TextMessage {
-            session_id: sender_id,
-            content,
-        } => {
+        // ── Text messaging ────────────────────────────────────────────────
+        ClientMessage::TextMessage { session_id: sender_id, content } => {
+            let now_ms = chrono::Utc::now().timestamp_millis() as u64;
             let message = TextMessage {
-                id: format!(
-                    "msg_{}_{}",
-                    sender_id,
-                    chrono::Utc::now().timestamp_millis()
-                ),
+                id: format!("msg_{}_{}", sender_id, now_ms),
                 content,
                 sender_id,
                 sender_name: None,
                 timestamp: chrono::Utc::now(),
+                created_at: now_ms,
             };
             {
                 let mut messages = state.messages.write().await;
                 messages.push(message.clone());
+                messages.sort_by_key(|m| m.created_at);
+                state::prune_messages(&mut messages); // BUG-13 fix
             }
-            broadcast(state, ServerMessage::TextMessage { message }).await;
+            broadcast(state, ServerMessage::TextMessage { message: message.clone() }).await;
+            state::push_message_to_mesh(&state.mesh_peers, message).await;
+        }
+
+        // ── Phase 11.3: checksum update ───────────────────────────────────
+        ClientMessage::FileChecksumUpdate { session_id: _, file_id, sha256 } => {
+            // Patch the sha256 field on the existing catalog entry.
+            let patched: Option<FileMetadata> = {
+                let mut files = state.files.write().await;
+                if let Some(file) = files.get_mut(&file_id) {
+                    file.sha256 = Some(sha256.clone());
+                    Some(file.clone())
+                } else {
+                    None
+                }
+            };
+            if let Some(file) = patched {
+                tracing::info!("Checksum: {file_id} → sha256={sha256:.16}…");
+                // Re-broadcast updated file list to local tabs
+                let files: Vec<FileMetadata> = {
+                    let files = state.files.read().await;
+                    files.values().filter(|f| !f.deleted).cloned().collect()
+                };
+                broadcast(state, ServerMessage::FileListUpdate { files }).await;
+                // Propagate updated FileMetadata to mesh peers
+                state::push_file_to_mesh(&state.mesh_peers, file).await;
+            } else {
+                tracing::warn!("FileChecksumUpdate: unknown file_id {file_id}");
+            }
+        }
+
+        // ── F4: unshare / delete ────────────────────────────────────────
+        ClientMessage::DeleteFile { session_id: requester_id, file_id } => {
+            let tombstoned: Option<FileMetadata> = {
+                let mut files = state.files.write().await;
+                match files.get_mut(&file_id) {
+                    Some(file) if file.deleted => None, // already gone
+                    Some(file) if file.uploader_id != requester_id => {
+                        tracing::warn!(
+                            "DeleteFile: {requester_id} tried to delete {file_id}, owned by {}",
+                            file.uploader_id
+                        );
+                        None
+                    }
+                    Some(file) => {
+                        file.deleted = true;
+                        file.deleted_at = chrono::Utc::now().timestamp_millis() as u64;
+                        Some(file.clone())
+                    }
+                    None => None,
+                }
+            };
+
+            if let Some(file) = tombstoned {
+                let files: Vec<FileMetadata> = {
+                    let files = state.files.read().await;
+                    files.values().filter(|f| !f.deleted).cloned().collect()
+                };
+                broadcast(state, ServerMessage::FileListUpdate { files }).await;
+                broadcast(state, ServerMessage::FileRemoved { file_id: file.id.clone() }).await;
+                state::push_file_to_mesh(&state.mesh_peers, file).await;
+            } else {
+                send_to(state, &requester_id, ServerMessage::Error {
+                    message: "Could not delete that file — it may not exist, already be removed, or not be yours".to_string(),
+                }).await;
+            }
+        }
+
+        // ── F3: send-to-person ──────────────────────────────────────────
+        // Push a file directly to one peer instead of publishing it to the
+        // catalog for anyone to find. Reuses the existing signal-routing
+        // path (route_signal already handles same-node vs cross-node
+        // delivery) — the target just gets a consent prompt instead of a
+        // browsable catalog entry.
+        ClientMessage::OfferFileTo { session_id: from, target_session_id, file_id } => {
+            mesh::route_signal(
+                state, &from, &target_session_id,
+                ServerMessage::IncomingFileOffer { file_id, from_session_id: from.clone() },
+            ).await;
+        }
+
+        ClientMessage::DeclineFileOffer { session_id: from, target_session_id, file_id } => {
+            mesh::route_signal(
+                state, &from, &target_session_id,
+                ServerMessage::FileOfferDeclined { file_id, from_session_id: from.clone() },
+            ).await;
         }
     }
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// Cleanup
+// Peer cleanup on disconnect
 // ---------------------------------------------------------------------------
 
-async fn cleanup_peer(state: &AppState, session_id: &SessionId) {
+async fn cleanup_peer(state: &NodeState, session_id: &SessionId) {
     let peers_count = {
-        let mut peers = state.peers.write().await;
+        let mut peers = state.local_peers.write().await;
         peers.remove(session_id);
         peers.len()
     };
 
-    // Remove peer from file hosts; drop files with zero remaining hosts
+    let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+    let mut tombstoned_files: Vec<FileMetadata> = Vec::new();
     {
         let mut files = state.files.write().await;
-        let mut to_remove = Vec::new();
-
-        for (file_id, file) in files.iter_mut() {
+        for file in files.values_mut() {
+            if !file.hosts.contains(session_id) { continue; }
             file.hosts.remove(session_id);
-            if file.hosts.is_empty() {
-                to_remove.push(file_id.clone());
+            if file.hosts.is_empty() && !file.deleted {
+                file.deleted = true;
+                file.deleted_at = now_ms;
+                tombstoned_files.push(file.clone());
             }
-        }
-
-        for file_id in &to_remove {
-            files.remove(file_id);
         }
     }
 
-    // Broadcast peer departure + updated catalog
-    broadcast(
-        state,
-        ServerMessage::PeerLeft {
-            session_id: session_id.clone(),
-            total_peers: peers_count,
-        },
-    )
-    .await;
+    broadcast(state, ServerMessage::PeerLeft { session_id: session_id.clone(), total_peers: peers_count }).await;
 
     let files: Vec<FileMetadata> = {
         let files = state.files.read().await;
-        files.values().cloned().collect()
+        files.values().filter(|f| !f.deleted).cloned().collect()
     };
     broadcast(state, ServerMessage::FileListUpdate { files }).await;
+
+    for tombstone in tombstoned_files {
+        state::push_file_to_mesh(&state.mesh_peers, tombstone).await;
+    }
+    state::push_peer_left_to_mesh(&state.mesh_peers, session_id.clone()).await;
 }

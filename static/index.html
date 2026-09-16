@@ -4,7 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
     <title>LADEX</title>
-    <link rel="stylesheet" href="static/style.css?v=4">
+    <link rel="icon" type="image/svg+xml" href="static/favicon.svg">
+    <link rel="stylesheet" href="static/style.css?v=8">
     <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
     <meta http-equiv="Pragma" content="no-cache">
     <meta http-equiv="Expires" content="0">
@@ -23,6 +24,11 @@
                 <span id="peer-status">Connected peers: 0</span>
                 <span id="peer-number">Peer: ---</span>
                 <span id="connection-status" class="status-disconnected">Disconnected</span>
+                <button id="add-device-btn" class="icon-btn" title="Add a device">
+                    <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
+                        <path d="M3,11H11V3H3M3,21H11V13H3M13,21H21V13H13M13,3V11H21V3"/>
+                    </svg>
+                </button>
                 <button id="logout-btn" class="icon-btn" title="Logout" style="display: none;">
                     <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
                         <path d="M17,7L15.59,8.41L18.17,11H8V13H18.17L15.59,15.59L17,17L22,12L17,7M4,5H12V3H4C2.89,3 2,3.89 2,5V19A2,2 0 0,0 4,21H12V19H4V5Z"/>
@@ -62,6 +68,13 @@
                 </div>
             </section>
 
+            <!-- F3 / F5: connected devices — drag a file row here (or click
+                 a device) to send it directly; click "you" to set a nickname -->
+            <section class="devices-section">
+                <h2>Devices <span id="devices-count" class="devices-count"></span></h2>
+                <div id="devices-list" class="devices-list"></div>
+            </section>
+
             <section class="files-section">
                 <h2>Shared Files and Messages</h2>
                 <div class="files-container">
@@ -86,24 +99,28 @@
         </main>
     </div>
 
-    <div id="progress-modal" class="modal">
-        <div class="modal-content">
-            <h3>File Transfer</h3>
-            <div class="progress-info">
-                <span id="progress-filename">Downloading file...</span>
-                <span id="progress-percentage">0%</span>
+    <!-- BUG-12 fix: a docked panel of per-transfer cards (built by
+         showProgress()/hideProgress() in app.js) instead of one shared
+         full-screen modal, so concurrent transfers don't overwrite or
+         hide each other. -->
+    <div id="progress-panel" class="progress-panel">
+        <div class="progress-panel-header">
+            <h3>File Transfers</h3>
+            <button id="cancel-all-transfers" class="btn secondary">Cancel all</button>
+        </div>
+        <div id="progress-list"></div>
+    </div>
+
+    <!-- F1: scan to open this page on a phone instead of typing the URL -->
+    <div id="add-device-modal" class="modal">
+        <div class="modal-content add-device-modal">
+            <div class="modal-header">
+                <h3>Add a Device</h3>
+                <button id="close-add-device" class="close-btn">&times;</button>
             </div>
-            <div class="progress-bar">
-                <div id="progress-fill"></div>
-            </div>
-            <div class="progress-stats">
-                <span id="progress-speed">0 MB/s</span>
-                <span id="progress-eta">Calculating...</span>
-            </div>
-            <div class="progress-bytes">
-                <span id="progress-bytes"></span>
-            </div>
-            <button id="cancel-transfer" class="btn secondary">Cancel</button>
+            <p class="add-device-hint">Scan with a phone or tablet on the same Wi-Fi:</p>
+            <div id="qr-code-container" class="qr-code-container"></div>
+            <div id="add-device-url" class="add-device-url"></div>
         </div>
     </div>
 
@@ -133,7 +150,9 @@
     </div>
 
     <script src="static/jszip.min.js"></script>
-    <script src="static/app.js?v=7"></script>
+    <script src="static/qrcode.js"></script>
+    <script src="static/hash-wasm-sha256.js"></script>
+    <script src="static/app.js?v=13"></script>
     <script>
         document.addEventListener('DOMContentLoaded', function() {
             const logoutBtn = document.getElementById('logout-btn');

@@ -10,11 +10,69 @@ pub type SessionId = String;
 pub type PeerSender = mpsc::UnboundedSender<ServerMessage>;
 pub type PeerSenders = Arc<RwLock<HashMap<SessionId, PeerSender>>>;
 
+// ---------------------------------------------------------------------------
+// Phase 1 — node identity
+// ---------------------------------------------------------------------------
+
+/// Identifies this node (machine) on the mesh.  Distinct from a browser tab's
+/// `session_id` — every node generates one `node_id` on startup, regardless
+/// of how many browser tabs connect to it locally.
+///
+/// In the current single-server phase (MESH_MODE=false) this is only used for
+/// cookie auth invalidation; the mesh layer (Phase 3) uses it to route messages.
+pub type NodeId = String;
+
+// ---------------------------------------------------------------------------
+// Peer / file / message data
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerInfo {
     pub session_id: SessionId,
     pub connected_at: chrono::DateTime<chrono::Utc>,
     pub user_agent: Option<String>,
+    /// Which node (machine) hosts this browser session.
+    /// Set to the local node_id when registering a local peer.
+    /// Used in Phase 5 (decentralized signaling) to route WebRTC signals
+    /// to the correct node without a central server.
+    #[serde(default)]
+    pub hosting_node_id: Option<NodeId>,
+    /// Round-trip latency (ms) from THIS node to the node hosting this peer.
+    /// Populated / updated by the Phase 6 Ping/Pong loop.
+    /// `None` until at least one Pong is received.
+    /// Exposed to browser tabs via PeerSync so clients can pick the fastest host.
+    #[serde(default)]
+    pub node_rtt_ms: Option<u32>,
+
+    // ── BUG-08 fix: explicit departure tombstone ─────────────────────────
+    // Mirrors FileMetadata's deleted/deleted_at (see below). Departure used
+    // to be signalled by a PeerInfo with `hosting_node_id: None` and
+    // `connected_at` set to `DateTime::MIN_UTC`, on the theory that a
+    // "sentinel" PeerInfo would merge in like any other update — but
+    // `merge_peers`'s LWW rule was `incoming.connected_at >
+    // existing.connected_at`, and MIN_UTC can never be greater than a real
+    // connection time. The departure marker silently lost that comparison
+    // on every other mesh node forever, so those nodes kept treating a
+    // long-gone browser tab as a live, routable peer (ghost peers).
+    /// True when this peer has disconnected. Tombstones propagate across
+    /// the mesh so all nodes stop treating this session as routable.
+    #[serde(default)]
+    pub left: bool,
+    /// When `left` was set, used as the LWW key for departures instead of
+    /// `connected_at` (always newer than the `connected_at` it's replacing,
+    /// so it actually wins the merge).
+    #[serde(default)]
+    pub left_at: Option<chrono::DateTime<chrono::Utc>>,
+
+    // ── F5: device names ─────────────────────────────────────────────────
+    /// Hostname of the machine hosting this session (NodeState::node_name).
+    /// Set by the hosting node itself; other nodes just carry it along.
+    #[serde(default)]
+    pub hosting_node_name: Option<String>,
+    /// User-editable nickname, set client-side and persisted in
+    /// localStorage. Overrides the User-Agent-derived name in the UI.
+    #[serde(default)]
+    pub nickname: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +95,38 @@ pub struct FileMetadata {
     pub uploader_id: SessionId,
     pub hosts: HashSet<SessionId>,
     pub uploaded_at: chrono::DateTime<chrono::Utc>,
+    /// Unix-millisecond timestamp used for last-write-wins merge (Phase 4).
+    /// Populated on file upload; preserved across catalog sync.
+    #[serde(default)]
+    pub created_at: u64,
+
+    // ── Phase 4: tombstone support ─────────────────────────────────────────
+    /// True when this file has been deleted.  Tombstones propagate across the
+    /// mesh so all nodes stop advertising the file.  The entry is pruned from
+    /// memory after `deleted_at` is 60+ seconds old (see `state::prune_tombstones`).
+    #[serde(default)]
+    pub deleted: bool,
+    /// Unix-millisecond timestamp of deletion.  Used as the LWW key for
+    /// tombstones (always > `created_at` for the same file).
+    #[serde(default)]
+    pub deleted_at: u64,
+
+    // ── Phase 11: integrity checksum ───────────────────────────────────────
+    /// SHA-256 hex digest of the original file bytes, computed on the sender
+    /// side in a Web Worker.  `None` if the sender didn't compute it (e.g.
+    /// very old client or a file shared before the field was introduced).
+    /// Receivers compare against this value after transfer and surface ✓/✗ UI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+
+    /// F6: true when this catalog entry is a folder rather than a single
+    /// file. The server treats it as completely opaque — same as every
+    /// other field here, it's a signaling relay only; the sending client
+    /// decides whether to respond to a download request with a normal
+    /// single-file stream or a folder-manifest stream based on this flag,
+    /// same as it already decides FSAA vs Blob-fallback.
+    #[serde(default)]
+    pub is_folder: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,6 +136,9 @@ pub struct TextMessage {
     pub sender_id: SessionId,
     pub sender_name: Option<String>,
     pub timestamp: chrono::DateTime<chrono::Utc>,
+    /// Unix-millisecond timestamp for LWW merge (Phase 4).
+    #[serde(default)]
+    pub created_at: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -59,6 +152,15 @@ pub enum ClientMessage {
     Join {
         session_id: SessionId,
         user_agent: Option<String>,
+        #[serde(default)]
+        nickname: Option<String>,
+    },
+
+    /// F5: user changed their nickname after already joining
+    #[serde(rename = "set_nickname")]
+    SetNickname {
+        session_id: SessionId,
+        nickname: String,
     },
 
     /// Peer registers a file it is willing to share (metadata only, zero bytes)
@@ -108,7 +210,29 @@ pub enum ClientMessage {
         candidate: String,
     },
 
-    // ── Misc ─────────────────────────────────────────────────────────────
+    /// Phase 6: Requester explicitly names the host it chose (client-side selection).
+    /// The node honors this choice without override.  Returns an error if the
+    /// named peer is unreachable rather than silently rerouting.
+    #[serde(rename = "request_download_from")]
+    RequestDownloadFrom {
+        session_id: SessionId,
+        file_id: String,
+        /// The specific peer session ID the client chose as host.
+        host_peer_id: SessionId,
+        /// F8: resume a previously-interrupted download from this byte
+        /// offset instead of starting over. `None`/0 = fresh download.
+        #[serde(default)]
+        resume_from_bytes: Option<u64>,
+    },
+
+    /// Phase 5: Receiver signals it does not want the incoming file.
+    /// Causes the sender to surface a rejection toast instead of stalling.
+    #[serde(rename = "transfer_declined")]
+    TransferDeclined {
+        session_id: SessionId,
+        file_id: String,
+    },
+
     #[serde(rename = "ping")]
     Ping {
         session_id: SessionId,
@@ -118,6 +242,41 @@ pub enum ClientMessage {
     TextMessage {
         session_id: SessionId,
         content: String,
+    },
+
+    /// Phase 11.3: Browser sends this after the SHA-256 Web Worker finishes
+    /// hashing the shared file.  The server patches the existing FileMetadata
+    /// entry with the hash and re-syncs to the mesh.
+    #[serde(rename = "file_checksum_update")]
+    FileChecksumUpdate {
+        session_id: SessionId,
+        file_id: String,
+        sha256: String,
+    },
+
+    /// F4: unshare a file. Only the original uploader may do this.
+    #[serde(rename = "delete_file")]
+    DeleteFile {
+        session_id: SessionId,
+        file_id: String,
+    },
+
+    /// F3: push a file directly to one peer instead of publishing it to the
+    /// catalog for anyone to find. Routed to `target_session_id`, who gets
+    /// an IncomingFileOffer consent prompt.
+    #[serde(rename = "offer_file_to")]
+    OfferFileTo {
+        session_id: SessionId,
+        target_session_id: SessionId,
+        file_id: String,
+    },
+
+    /// F3: the offer's recipient declined it — routed back to the sender.
+    #[serde(rename = "decline_file_offer")]
+    DeclineFileOffer {
+        session_id: SessionId,
+        target_session_id: SessionId,
+        file_id: String,
     },
 }
 
@@ -153,11 +312,21 @@ pub enum ServerMessage {
         file_id: String,
     },
 
+    /// Phase 6: Incremental peer list update (e.g. RTT change).
+    /// Browser tab merges these into its local peer map for host selection.
+    #[serde(rename = "peer_sync")]
+    PeerSync {
+        peers: Vec<PeerInfo>,
+    },
+
     /// Server tells a host: "peer X wants file Y — initiate WebRTC to them"
     #[serde(rename = "download_request")]
     DownloadRequest {
         file_id: String,
         requester_session_id: SessionId,
+        /// F8: resume from this byte offset — see ClientMessage::RequestDownloadFrom.
+        #[serde(default)]
+        resume_from_bytes: Option<u64>,
     },
 
     // ── WebRTC signaling (targeted to a single peer) ─────────────────────
@@ -200,10 +369,50 @@ pub enum ServerMessage {
     MessageHistory {
         messages: Vec<TextMessage>,
     },
+
+    /// Phase 5: Receiver declined the incoming file transfer.
+    /// Delivered to the sender so it can toast the user instead of stalling.
+    #[serde(rename = "transfer_declined")]
+    TransferDeclined {
+        file_id: String,
+        from_session_id: SessionId,
+    },
+
+    /// Phase 6: The explicitly named host peer was not found / not reachable.
+    /// Client should retry with a different host selection.
+    #[serde(rename = "host_unreachable")]
+    HostUnreachable {
+        file_id: String,
+        host_peer_id: SessionId,
+    },
+
+    /// Phase 10 §10.4: AP isolation diagnostic — no mesh peers found after 10s.
+    /// Browser tab surfaces a non-dismissible warning banner.
+    #[serde(rename = "no_peers_warning")]
+    NoPeersWarning {
+        message: String,
+    },
+
+    /// F3: someone is offering to send this file directly — show a consent
+    /// prompt. The client resolves file name/size/mime from its own
+    /// already-synced catalog by `file_id`.
+    #[serde(rename = "incoming_file_offer")]
+    IncomingFileOffer {
+        file_id: String,
+        from_session_id: SessionId,
+    },
+
+    /// F3: the peer we offered a file to declined it.
+    #[serde(rename = "file_offer_declined")]
+    FileOfferDeclined {
+        file_id: String,
+        from_session_id: SessionId,
+    },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PeerStats {
-    pub total_peers: usize,
-    pub peers: Vec<PeerInfo>,
+/// System hostname, or a fallback label if it can't be read.
+pub fn hostname() -> String {
+    gethostname::gethostname()
+        .into_string()
+        .unwrap_or_else(|_| "LADEX Node".to_string())
 }
