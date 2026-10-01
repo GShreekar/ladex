@@ -3,15 +3,19 @@
 //
 // Phase 5:  SignalRelay routing — deliver to local tab or forward one-hop.
 // Phase 6:  RTT tracking via Pong timestamps; push PeerSync to browser tabs.
-// Phase 7:  Passphrase enforcement in Hello/HelloAck.
+// Phase 7:  Passphrase-authenticated handshake (SPAKE2 + TLS channel binding,
+//           see auth.rs): Hello -> HelloAck -> HelloConfirm.
 // Phase 10: Heartbeat Ping/Pong (5s interval, 15s dead-peer timeout),
 //           exponential reconnect backoff (2/4/8/30s, give-up at 10 min),
 //           graceful Goodbye on shutdown, state cleanup on departure.
 // ============================================================================
 
 use crate::types::*;
-use crate::{auth, state, NodeState};
+use crate::auth::{Pake, Role, Transcript};
+use crate::server::{peer_ip, PeerAddr};
+use crate::{state, NodeState};
 
+use futures_util::stream::SplitStream;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -22,12 +26,34 @@ use tokio::sync::{mpsc, RwLock};
 use warp::ws::{Message, WebSocket, Ws};
 use warp::{Rejection, Reply};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+// v2: the passphrase hash is gone from Hello and discovery; peers authenticate
+// with a SPAKE2 exchange instead.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 // Phase 10 timing constants
 const HEARTBEAT_INTERVAL:  Duration = Duration::from_secs(5);
 const HEARTBEAT_TIMEOUT:   Duration = Duration::from_secs(15);
 const RECONNECT_GIVE_UP:   Duration = Duration::from_secs(600); // 10 min
+const HANDSHAKE_TIMEOUT:   Duration = Duration::from_secs(10);
+
+// Rejection reasons the dialing side treats as authentication failures and
+// backs off from, rather than retrying every few seconds.
+const REASON_RATE_LIMITED: &str = "too many failed attempts";
+const REASON_SECURITY_MODE: &str = "passphrase mismatch: one side is secured and the other is not";
+
+/// The peer could not be authenticated (wrong passphrase, mismatched security
+/// mode, a possible man in the middle, or we are being rate limited). Retrying
+/// immediately will not help.
+#[derive(Debug)]
+pub struct AuthFailure(pub String);
+
+impl std::fmt::Display for AuthFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for AuthFailure {}
 
 // ---------------------------------------------------------------------------
 // MeshPeerHandle
@@ -59,8 +85,11 @@ pub enum MeshMessage {
         node_id:          NodeId,
         node_name:        String,
         protocol_version: u32,
-        /// PBKDF2-SHA256 hex (Phase 7).  Empty string = no passphrase.
-        passphrase_hash:  String,
+        /// Whether the sender requires a passphrase. Secured and open
+        /// meshes never mix.
+        secured:          bool,
+        /// Hex SPAKE2 message (client side).
+        pake:             String,
         /// BUG-10 fix: the sender's own HTTP/mesh listening port. An
         /// inbound connection only reveals the *ephemeral* source port of
         /// the TCP connection the peer dialed with — not the port its own
@@ -86,7 +115,16 @@ pub enum MeshMessage {
         reason:    Option<String>,
         node_id:   NodeId,
         node_name: String,
+        /// Hex SPAKE2 message (server side); empty when rejected.
+        #[serde(default)]
+        pake:      String,
+        /// Hex server proof over the handshake transcript; empty when rejected.
+        #[serde(default)]
+        proof:     String,
     },
+    /// Client's proof that it derived the same key; the server registers the
+    /// peer only after verifying it.
+    HelloConfirm { proof: String },
     Ping { ts: u64 },
     Pong { ts: u64 },
 
@@ -235,6 +273,10 @@ pub fn spawn_reconnect(addr: IpAddr, http_port: u16, state: NodeState, peer_node
             tracing::info!("Reconnect: attempt {attempt} to {addr}:{http_port} ({peer_node_id})");
             match connect_to_peer(addr, http_port, state.clone()).await {
                 Ok(()) => { tracing::info!("Reconnect: success to {peer_node_id}"); return; }
+                Err(e) if e.downcast_ref::<AuthFailure>().is_some() => {
+                    tracing::warn!("Reconnect: giving up on {peer_node_id}: {e}");
+                    return;
+                }
                 Err(e) => tracing::warn!("Reconnect: failed: {e}"),
             }
         }
@@ -310,77 +352,113 @@ pub fn spawn_heartbeat(
 // Inbound handler — /mesh route
 // ---------------------------------------------------------------------------
 
-pub async fn mesh_ws_handler(ws: Ws, state: NodeState) -> Result<impl Reply, Rejection> {
-    Ok(ws.on_upgrade(move |socket| handle_inbound(socket, state)))
+pub async fn mesh_ws_handler(ws: Ws, peer: Option<PeerAddr>, state: NodeState) -> Result<impl Reply, Rejection> {
+    let remote_ip = peer_ip(peer);
+    Ok(ws.on_upgrade(move |socket| handle_inbound(socket, remote_ip, state)))
 }
 
-async fn handle_inbound(ws: WebSocket, state: NodeState) {
-    let (mut ws_tx, mut ws_rx) = ws.split();
-
-    // Wait for Hello
-    let raw_hello = loop {
-        match ws_rx.next().await {
-            Some(Ok(msg)) if msg.is_text() => {
-                match serde_json::from_str::<MeshMessage>(msg.to_str().unwrap_or("")) {
-                    Ok(MeshMessage::Hello { .. }) => break msg,
-                    Ok(_) => continue,
-                    Err(e) => { tracing::warn!("Mesh inbound: bad Hello JSON: {e}"); return; }
-                }
+/// Next text message from the peer, or None on timeout, close, error or bad JSON.
+async fn recv_handshake_message(rx: &mut SplitStream<WebSocket>) -> Option<MeshMessage> {
+    tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+        loop {
+            match rx.next().await? {
+                Ok(msg) if msg.is_text() => return serde_json::from_str(msg.to_str().unwrap_or("")).ok(),
+                Ok(msg) if msg.is_close() => return None,
+                Ok(_) => continue,
+                Err(_) => return None,
             }
-            Some(Ok(msg)) if msg.is_close() => return,
-            Some(Err(e)) => { tracing::warn!("Mesh inbound: WS error before Hello: {e}"); return; }
-            None => return,
-            _ => continue,
         }
-    };
+    })
+    .await
+    .ok()
+    .flatten()
+}
 
-    let (peer_node_id, peer_node_name, peer_protocol_version, peer_passphrase_hash, peer_http_port, peer_ip) =
-        match serde_json::from_str::<MeshMessage>(raw_hello.to_str().unwrap_or("")) {
-            Ok(MeshMessage::Hello { node_id, node_name, protocol_version, passphrase_hash, http_port, ip }) =>
-                (node_id, node_name, protocol_version, passphrase_hash, http_port, ip),
-            _ => return,
-        };
-
-    // Acks are sent one at a time on this straight-line path, so a plain
-    // &mut borrow of ws_tx is enough — no need to share it behind an
-    // Arc<Mutex<_>>.
+async fn handle_inbound(ws: WebSocket, remote_ip: IpAddr, state: NodeState) {
+    let (mut ws_tx, mut ws_rx) = ws.split();
     let our_node_name = hostname();
+
     async fn send_ack(
         ws_tx: &mut futures_util::stream::SplitSink<WebSocket, Message>,
-        accepted: bool,
-        reason: Option<String>,
-        node_id: NodeId,
+        state: &NodeState,
         node_name: String,
+        outcome: Result<(String, String), String>,
     ) {
-        let ack = MeshMessage::HelloAck { accepted, reason, node_id, node_name };
+        let (accepted, reason, pake, proof) = match outcome {
+            Ok((pake, proof)) => (true, None, pake, proof),
+            Err(reason) => (false, Some(reason), String::new(), String::new()),
+        };
+        let ack = MeshMessage::HelloAck { accepted, reason, node_id: state.node_id.clone(), node_name, pake, proof };
         let json = serde_json::to_string(&ack).unwrap_or_default();
         let _ = ws_tx.send(Message::text(json)).await;
     }
 
-    // Validate
+    // Every connection counts as a passphrase guess until it proves otherwise.
+    let ticket = match state.mesh_limiter.begin(remote_ip) {
+        Ok(ticket) => ticket,
+        Err(retry_after) => {
+            tracing::warn!("Mesh inbound: {remote_ip} is locked out for another {}s", retry_after.as_secs());
+            send_ack(&mut ws_tx, &state, our_node_name, Err(REASON_RATE_LIMITED.into())).await;
+            return;
+        }
+    };
+
+    let (peer_node_id, peer_node_name, peer_protocol_version, peer_secured, peer_pake, peer_http_port, peer_ip) =
+        match recv_handshake_message(&mut ws_rx).await {
+            Some(MeshMessage::Hello { node_id, node_name, protocol_version, secured, pake, http_port, ip }) =>
+                (node_id, node_name, protocol_version, secured, pake, http_port, ip),
+            _ => return,
+        };
+
     if peer_node_id == state.node_id {
-        send_ack(&mut ws_tx, false, Some("self-connection rejected".into()), state.node_id.clone(), our_node_name).await;
+        send_ack(&mut ws_tx, &state, our_node_name, Err("self-connection rejected".into())).await;
         return;
     }
     if peer_protocol_version != PROTOCOL_VERSION {
-        send_ack(&mut ws_tx, false, Some(format!(
+        send_ack(&mut ws_tx, &state, our_node_name, Err(format!(
             "protocol version mismatch: expected {PROTOCOL_VERSION}, got {peer_protocol_version}"
-        )), state.node_id.clone(), our_node_name).await;
+        ))).await;
         return;
     }
-    // Phase 7 check 2: passphrase enforcement
-    let our_hash = state.passphrase_hash.as_deref().unwrap_or("");
-    if !auth::hashes_match(our_hash, &peer_passphrase_hash) {
-        send_ack(&mut ws_tx, false, Some("wrong passphrase".into()), state.node_id.clone(), our_node_name).await;
-        tracing::warn!("Mesh inbound: passphrase mismatch from {peer_node_id} — rejected");
+    if peer_secured != state.passphrase.is_some() {
+        send_ack(&mut ws_tx, &state, our_node_name, Err(REASON_SECURITY_MODE.into())).await;
         return;
     }
     if state.mesh_peers.read().await.contains_key(&peer_node_id) {
-        send_ack(&mut ws_tx, false, Some("duplicate".into()), state.node_id.clone(), our_node_name).await;
+        send_ack(&mut ws_tx, &state, our_node_name, Err("duplicate".into())).await;
         return;
     }
 
-    send_ack(&mut ws_tx, true, None, state.node_id.clone(), our_node_name).await;
+    let pake = Pake::start(Role::Server, state.passphrase.as_deref().unwrap_or(""));
+    let server_pake = pake.message().to_vec();
+    let client_pake = hex::decode(&peer_pake).unwrap_or_default();
+    let Some(key) = pake.finish(&client_pake) else {
+        send_ack(&mut ws_tx, &state, our_node_name, Err("malformed handshake message".into())).await;
+        return;
+    };
+    let transcript = Transcript::new(&peer_node_id, &state.node_id, &client_pake, &server_pake, &state.tls_fingerprint);
+
+    let ack = (hex::encode(&server_pake), hex::encode(key.prove(Role::Server, &transcript)));
+    send_ack(&mut ws_tx, &state, our_node_name, Ok(ack)).await;
+
+    // Registering the peer waits for its proof; a wrong passphrase ends here
+    // and stays counted against the IP.
+    let proven = match recv_handshake_message(&mut ws_rx).await {
+        Some(MeshMessage::HelloConfirm { proof }) => {
+            hex::decode(&proof).is_ok_and(|proof| key.verify(Role::Client, &transcript, &proof))
+        }
+        _ => false,
+    };
+    if !proven {
+        tracing::warn!("Mesh inbound: {peer_node_id} at {remote_ip} failed to prove the passphrase — rejected");
+        return;
+    }
+    state.mesh_limiter.succeed(remote_ip, ticket);
+
+    // The peer may have connected to us in the meantime, from its own dial.
+    if state.mesh_peers.read().await.contains_key(&peer_node_id) {
+        return;
+    }
     tracing::info!("Mesh: inbound handshake OK — peer {peer_node_id} ({peer_node_name})");
 
     // BUG-10 fix: build a real, dialable address for this peer from its
@@ -431,55 +509,84 @@ pub async fn connect_to_peer(addr: IpAddr, http_port: u16, state: NodeState) -> 
     let url = format!("{}://{addr}:{http_port}/mesh", if tls_client_config.is_some() { "wss" } else { "ws" });
     tracing::info!("Mesh: dialing {url}");
 
-    let (mut tt_tx, mut tt_rx): (MeshSink, MeshSource) = if let Some(client_config) = tls_client_config {
-        let (ws_stream, _) = crate::tls::connect_wss(addr, http_port, "/mesh", client_config)
-            .await
-            .map_err(|e| anyhow::anyhow!("WSS connect to {url} failed: {e}"))?;
-        let (tx, rx) = ws_stream.split();
-        (Box::pin(tx), Box::pin(rx))
-    } else {
-        let (ws_stream, _) = tokio_tungstenite::connect_async(&url)
-            .await
-            .map_err(|e| anyhow::anyhow!("WS connect to {url} failed: {e}"))?;
-        let (tx, rx) = ws_stream.split();
-        (Box::pin(tx), Box::pin(rx))
-    };
+    // The fingerprint stays empty without TLS (--no-tls); the handshake then
+    // has nothing to bind to and a man in the middle can't be ruled out.
+    let (mut tt_tx, mut tt_rx, server_fingerprint): (MeshSink, MeshSource, Vec<u8>) =
+        if let Some(client_config) = tls_client_config {
+            let (ws_stream, _, fingerprint) = crate::tls::connect_wss(addr, http_port, "/mesh", client_config)
+                .await
+                .map_err(|e| anyhow::anyhow!("WSS connect to {url} failed: {e}"))?;
+            let (tx, rx) = ws_stream.split();
+            (Box::pin(tx), Box::pin(rx), fingerprint)
+        } else {
+            let (ws_stream, _) = tokio_tungstenite::connect_async(&url)
+                .await
+                .map_err(|e| anyhow::anyhow!("WS connect to {url} failed: {e}"))?;
+            let (tx, rx) = ws_stream.split();
+            (Box::pin(tx), Box::pin(rx), Vec::new())
+        };
 
-    // Phase 7: include passphrase_hash in Hello; BUG-10 fix: include our
-    // own http_port so the peer can reconnect to us if this connection
-    // later drops (see MeshMessage::Hello's doc comment).
+    let pake = Pake::start(Role::Client, state.passphrase.as_deref().unwrap_or(""));
+    let client_pake = pake.message().to_vec();
+    // BUG-10 fix: include our own http_port so the peer can reconnect to us
+    // if this connection later drops (see MeshMessage::Hello's doc comment).
     let hello = MeshMessage::Hello {
         node_id:          state.node_id.clone(),
         node_name:        hostname(),
         protocol_version: PROTOCOL_VERSION,
-        passphrase_hash:  state.passphrase_hash.clone().unwrap_or_default(),
+        secured:          state.passphrase.is_some(),
+        pake:             hex::encode(&client_pake),
         http_port:        state.http_port,
         ip:               state.local_ip.map(|ip| ip.to_string()).unwrap_or_default(),
     };
     tt_tx.send(tokio_tungstenite::tungstenite::Message::Text(serde_json::to_string(&hello)?)).await?;
 
-    let (peer_node_id, peer_node_name) = loop {
-        match tt_rx.next().await {
-            Some(Ok(msg)) if msg.is_text() => {
-                match serde_json::from_str::<MeshMessage>(msg.to_text().unwrap_or("")) {
-                    Ok(MeshMessage::HelloAck { accepted: true,  node_id, node_name, .. }) => {
-                        tracing::info!("Mesh: {url} accepted Hello (peer: {node_id})");
-                        break (node_id, node_name);
-                    }
-                    Ok(MeshMessage::HelloAck { accepted: false, reason, .. }) =>
-                        return Err(anyhow::anyhow!("Peer {url} rejected Hello: {}", reason.unwrap_or_default())),
-                    Ok(other) =>
-                        return Err(anyhow::anyhow!("Peer {url} sent {other:?} instead of HelloAck")),
-                    Err(e) =>
-                        return Err(anyhow::anyhow!("Bad HelloAck JSON from {url}: {e}")),
+    let (peer_node_id, peer_node_name, server_pake, server_proof) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+        loop {
+            match tt_rx.next().await {
+                Some(Ok(msg)) if msg.is_text() => {
+                    return match serde_json::from_str::<MeshMessage>(msg.to_text().unwrap_or("")) {
+                        Ok(MeshMessage::HelloAck { accepted: true, node_id, node_name, pake, proof, .. }) =>
+                            Ok((node_id, node_name, pake, proof)),
+                        Ok(MeshMessage::HelloAck { accepted: false, reason, .. }) => {
+                            let reason = reason.unwrap_or_default();
+                            let msg = format!("Peer {url} rejected Hello: {reason}");
+                            if reason == REASON_RATE_LIMITED || reason == REASON_SECURITY_MODE {
+                                Err(anyhow::Error::new(AuthFailure(msg)))
+                            } else {
+                                Err(anyhow::anyhow!(msg))
+                            }
+                        }
+                        Ok(other) => Err(anyhow::anyhow!("Peer {url} sent {other:?} instead of HelloAck")),
+                        Err(e) => Err(anyhow::anyhow!("Bad HelloAck JSON from {url}: {e}")),
+                    };
                 }
+                Some(Ok(msg)) if msg.is_close() => return Err(anyhow::anyhow!("Peer {url} closed during handshake")),
+                Some(Err(e))                    => return Err(anyhow::anyhow!("WS error from {url}: {e}")),
+                None                            => return Err(anyhow::anyhow!("Peer {url} disconnected during handshake")),
+                _ => continue,
             }
-            Some(Ok(msg)) if msg.is_close() => return Err(anyhow::anyhow!("Peer {url} closed during handshake")),
-            Some(Err(e))                    => return Err(anyhow::anyhow!("WS error from {url}: {e}")),
-            None                            => return Err(anyhow::anyhow!("Peer {url} disconnected during handshake")),
-            _ => continue,
         }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("Peer {url} did not answer Hello in time"))??;
+
+    // The server must prove it knows the passphrase over a transcript that
+    // includes the certificate we actually connected to.
+    let server_pake = hex::decode(&server_pake).unwrap_or_default();
+    let transcript = Transcript::new(&state.node_id, &peer_node_id, &client_pake, &server_pake, &server_fingerprint);
+    let server_proven = pake.finish(&server_pake).and_then(|key| {
+        let proof = hex::decode(&server_proof).ok()?;
+        key.verify(Role::Server, &transcript, &proof).then_some(key)
+    });
+    let Some(key) = server_proven else {
+        return Err(anyhow::Error::new(AuthFailure(format!(
+            "Peer {url} failed to prove the passphrase: wrong passphrase, or the connection is being intercepted"
+        ))));
     };
+    let confirm = MeshMessage::HelloConfirm { proof: hex::encode(key.prove(Role::Client, &transcript)) };
+    tt_tx.send(tokio_tungstenite::tungstenite::Message::Text(serde_json::to_string(&confirm)?)).await?;
+    tracing::info!("Mesh: {url} authenticated (peer: {peer_node_id})");
 
     if state.mesh_peers.read().await.contains_key(&peer_node_id) {
         tracing::warn!("Mesh: duplicate after handshake with {peer_node_id} — dropping");
@@ -767,7 +874,7 @@ async fn dispatch(msg: &MeshMessage, from_node_id: &NodeId, state: &NodeState) {
             remove_mesh_peer(state, node_id).await;
         }
 
-        MeshMessage::Hello { .. } | MeshMessage::HelloAck { .. } => {
+        MeshMessage::Hello { .. } | MeshMessage::HelloAck { .. } | MeshMessage::HelloConfirm { .. } => {
             tracing::warn!("Mesh: unexpected Hello/HelloAck mid-session from {from_node_id}");
         }
     }

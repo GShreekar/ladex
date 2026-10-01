@@ -1,79 +1,248 @@
-// ============================================================================
-// LADEX — Phase 7: Shared-Passphrase Mesh Auth
+// Passphrase handling for both entry points: the browser login and the
+// node-to-node mesh handshake.
 //
-// Derives a deterministic 32-byte hash from a plaintext passphrase using
-// PBKDF2-HMAC-SHA256 with a fixed, publicly-known salt and 10 000 iterations.
+// Mesh handshake (see mesh.rs): the two nodes run SPAKE2 with the passphrase as
+// the password, then each proves it derived the same key with an HMAC over a
+// transcript. The passphrase and anything derived from it never cross the wire,
+// and a passive or active attacker gets at most one passphrase guess per
+// connection, never an offline attack.
 //
-// Design notes (from ROADMAP.md §7):
-//
-//   • This is NOT protecting a user password against an attacker who has
-//     stolen a credential database — it is a shared mesh secret, equivalent
-//     to a WPA2 PSK.  The goal is (a) to make rainbow-table attacks on the
-//     announce/hello hash impractical, and (b) to produce a short,
-//     deterministic, hex-encodable value that all nodes on the mesh can
-//     compare without transmitting the passphrase itself.
-//
-//   • Salt is publicly known ("ladex-v1-mesh-salt").  This is intentional:
-//     changing it is a breaking wire-format change (increment PROTOCOL_VERSION).
-//     The salt's purpose is domain-separation + rainbow-table resistance,
-//     not secrecy.
-//
-//   • 10 000 iterations is the minimum NIST recommends for PBKDF2-SHA256
-//     for low-value shared secrets.  It's fast enough that the 2-second
-//     announce window is not a concern (≪1 ms on any modern CPU).
-//
-//   • Three-check enforcement (ROADMAP.md §7.2):
-//     1. Discovery pre-filter: skip peer if announce.passphrase_hash != ours.
-//     2. Hello/HelloAck handshake: reject if Hello.passphrase_hash != ours.
-//     3. No-passphrase policy: empty string is treated as a distinct passphrase,
-//        so secured and unsecured meshes never accidentally mix.
-// ============================================================================
+// The transcript includes a fingerprint of the server's TLS certificate as the
+// client saw it. A man in the middle terminating TLS with their own certificate
+// makes the two sides' transcripts differ, so the proofs fail.
 
-use ring::pbkdf2;
-use std::num::NonZeroU32;
+use rand::Rng;
+use ring::{digest, hmac};
+use subtle::ConstantTimeEq;
+use spake2::{Ed25519Group, Identity, Password, Spake2};
 
-/// Fixed public salt — domain-separation only, NOT a secret.
-/// Changing this is a wire-format breaking change → bump PROTOCOL_VERSION.
-const SALT: &[u8] = b"ladex-v1-mesh-salt";
+// Fixed SPAKE2 identities; the real node ids go into the transcript instead,
+// because the dialing side doesn't know the server's node id up front.
+const CLIENT_IDENTITY: &[u8] = b"ladex-v2 mesh client";
+const SERVER_IDENTITY: &[u8] = b"ladex-v2 mesh server";
 
-/// Number of PBKDF2 iterations.  10 000 per NIST SP 800-132 minimum
-/// for shared secrets.
-const ITERATIONS: u32 = 10_000;
+// Ed25519 SPAKE2 messages are 33 bytes; anything much larger isn't one.
+const MAX_PAKE_MESSAGE_LEN: usize = 64;
 
-/// Output length: 256 bits (SHA-256 output size).
-const OUTPUT_LEN: usize = 32;
+// No look-alike characters (i, l, o, 0, 1): these get typed in from a terminal.
+const PASSPHRASE_ALPHABET: &[u8] = b"abcdefghjkmnpqrstuvwxyz23456789";
 
-/// Derive the mesh passphrase hash from a plaintext passphrase.
-///
-/// Returns a lowercase hex-encoded 64-character string (32 bytes × 2 hex digits).
-///
-/// When `passphrase` is `None` or empty, returns `""` (the no-passphrase token).
-/// This is intentional: empty-passphrase nodes only connect to other
-/// empty-passphrase nodes.
-pub fn derive_hash(passphrase: Option<&str>) -> String {
-    let p = match passphrase {
-        None => return String::new(),
-        Some(s) if s.is_empty() => return String::new(),
-        Some(s) => s,
-    };
-
-    let iterations = NonZeroU32::new(ITERATIONS).unwrap();
-    let mut out = [0u8; OUTPUT_LEN];
-    pbkdf2::derive(
-        pbkdf2::PBKDF2_HMAC_SHA256,
-        iterations,
-        SALT,
-        p.as_bytes(),
-        &mut out,
-    );
-    hex::encode(out)
+#[derive(Clone, Copy)]
+pub enum Role {
+    Client,
+    Server,
 }
 
-/// Compare two passphrase hashes for mesh admission.
-///
-/// Returns `true` iff both hashes are equal (including both being empty).
-/// A non-empty hash never matches an empty hash — this enforces the
-/// "secured and unsecured meshes never mix" rule.
-pub fn hashes_match(ours: &str, theirs: &str) -> bool {
-    ours == theirs
+impl Role {
+    fn label(self) -> &'static [u8] {
+        match self {
+            Role::Client => b"client",
+            Role::Server => b"server",
+        }
+    }
+}
+
+pub struct Pake {
+    spake: Spake2<Ed25519Group>,
+    message: Vec<u8>,
+}
+
+impl Pake {
+    pub fn start(role: Role, passphrase: &str) -> Self {
+        let password = Password::new(passphrase.as_bytes());
+        let client = Identity::new(CLIENT_IDENTITY);
+        let server = Identity::new(SERVER_IDENTITY);
+        let (spake, message) = match role {
+            Role::Client => Spake2::<Ed25519Group>::start_a(&password, &client, &server),
+            Role::Server => Spake2::<Ed25519Group>::start_b(&password, &client, &server),
+        };
+        Self { spake, message }
+    }
+
+    pub fn message(&self) -> &[u8] {
+        &self.message
+    }
+
+    // None if the peer's message is malformed.
+    pub fn finish(self, peer_message: &[u8]) -> Option<SessionKey> {
+        if peer_message.len() > MAX_PAKE_MESSAGE_LEN {
+            return None;
+        }
+        let key = self.spake.finish(peer_message).ok()?;
+        Some(SessionKey(hmac::Key::new(hmac::HMAC_SHA256, &key)))
+    }
+}
+
+pub struct Transcript(Vec<u8>);
+
+impl Transcript {
+    // `tls_binding` is the server certificate's fingerprint, or empty when the
+    // connection isn't TLS.
+    pub fn new(
+        client_node_id: &str,
+        server_node_id: &str,
+        client_pake: &[u8],
+        server_pake: &[u8],
+        tls_binding: &[u8],
+    ) -> Self {
+        let mut bytes = b"ladex-v2 mesh transcript".to_vec();
+        for field in [client_node_id.as_bytes(), server_node_id.as_bytes(), client_pake, server_pake, tls_binding] {
+            bytes.extend_from_slice(&(field.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(field);
+        }
+        Self(bytes)
+    }
+}
+
+pub struct SessionKey(hmac::Key);
+
+impl SessionKey {
+    pub fn prove(&self, role: Role, transcript: &Transcript) -> Vec<u8> {
+        hmac::sign(&self.0, &proof_input(role, transcript)).as_ref().to_vec()
+    }
+
+    // Constant-time check of the proof `role` sent.
+    pub fn verify(&self, role: Role, transcript: &Transcript, proof: &[u8]) -> bool {
+        hmac::verify(&self.0, &proof_input(role, transcript), proof).is_ok()
+    }
+}
+
+fn proof_input(role: Role, transcript: &Transcript) -> Vec<u8> {
+    let mut input = role.label().to_vec();
+    input.push(b':');
+    input.extend_from_slice(&transcript.0);
+    input
+}
+
+pub fn tls_fingerprint(cert_der: &[u8]) -> Vec<u8> {
+    digest::digest(&digest::SHA256, cert_der).as_ref().to_vec()
+}
+
+// Constant-time comparison for the browser login passphrase and session cookie.
+// Both sides are hashed first so the comparison doesn't leak the length either.
+pub fn secrets_match(expected: &str, given: &str) -> bool {
+    let expected = digest::digest(&digest::SHA256, expected.as_bytes());
+    let given = digest::digest(&digest::SHA256, given.as_bytes());
+    expected.as_ref().ct_eq(given.as_ref()).into()
+}
+
+// 12 characters from a 31-symbol alphabet (~59 bits), grouped for readability.
+pub fn generate_passphrase() -> String {
+    let mut rng = rand::thread_rng();
+    let mut passphrase = String::with_capacity(14);
+    for i in 0..12 {
+        if i > 0 && i % 4 == 0 {
+            passphrase.push('-');
+        }
+        passphrase.push(PASSPHRASE_ALPHABET[rng.gen_range(0..PASSPHRASE_ALPHABET.len())] as char);
+    }
+    passphrase
+}
+
+pub fn weakness(passphrase: &str) -> Option<&'static str> {
+    if passphrase.chars().count() < 8 {
+        Some("it is shorter than 8 characters")
+    } else if passphrase.chars().all(|c| c.is_ascii_digit()) {
+        Some("it is digits only")
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Runs the handshake the way mesh.rs does and returns whether each side
+    // accepted the other's proof.
+    fn handshake(client_pw: &str, server_pw: &str, client_tls: &[u8], server_tls: &[u8]) -> (bool, bool) {
+        let client = Pake::start(Role::Client, client_pw);
+        let server = Pake::start(Role::Server, server_pw);
+        let (client_msg, server_msg) = (client.message().to_vec(), server.message().to_vec());
+
+        let server_key = server.finish(&client_msg).unwrap();
+        let server_transcript = Transcript::new("client-node", "server-node", &client_msg, &server_msg, server_tls);
+        let server_proof = server_key.prove(Role::Server, &server_transcript);
+
+        let client_key = client.finish(&server_msg).unwrap();
+        let client_transcript = Transcript::new("client-node", "server-node", &client_msg, &server_msg, client_tls);
+        let client_accepts_server = client_key.verify(Role::Server, &client_transcript, &server_proof);
+
+        let client_proof = client_key.prove(Role::Client, &client_transcript);
+        let server_accepts_client = server_key.verify(Role::Client, &server_transcript, &client_proof);
+        (client_accepts_server, server_accepts_client)
+    }
+
+    #[test]
+    fn matching_passphrase_and_tls_binding_succeeds() {
+        assert_eq!(handshake("correct horse", "correct horse", b"cert-a", b"cert-a"), (true, true));
+    }
+
+    #[test]
+    fn wrong_passphrase_fails_both_ways() {
+        assert_eq!(handshake("correct horse", "battery staple", b"cert-a", b"cert-a"), (false, false));
+    }
+
+    #[test]
+    fn open_mesh_with_empty_passphrase_works() {
+        assert_eq!(handshake("", "", b"cert-a", b"cert-a"), (true, true));
+    }
+
+    #[test]
+    fn man_in_the_middle_with_a_different_certificate_fails() {
+        // The attacker relays the SPAKE2 messages untouched but terminates TLS
+        // with their own certificate, so the client sees a different one.
+        assert_eq!(handshake("correct horse", "correct horse", b"attacker-cert", b"real-cert"), (false, false));
+    }
+
+    #[test]
+    fn proof_from_the_wrong_role_is_rejected() {
+        let client = Pake::start(Role::Client, "pw");
+        let server = Pake::start(Role::Server, "pw");
+        let (client_msg, server_msg) = (client.message().to_vec(), server.message().to_vec());
+        let key = client.finish(&server_msg).unwrap();
+        let transcript = Transcript::new("c", "s", &client_msg, &server_msg, b"");
+        // A reflected client proof must not pass as a server proof.
+        let client_proof = key.prove(Role::Client, &transcript);
+        assert!(!key.verify(Role::Server, &transcript, &client_proof));
+    }
+
+    #[test]
+    fn malformed_pake_messages_are_rejected() {
+        assert!(Pake::start(Role::Server, "pw").finish(&[]).is_none());
+        assert!(Pake::start(Role::Server, "pw").finish(&[0u8; 200]).is_none());
+        assert!(Pake::start(Role::Server, "pw").finish(&[1u8; 33]).is_none());
+    }
+
+    #[test]
+    fn transcript_fields_cannot_be_shifted_between_each_other() {
+        let a = Transcript::new("ab", "c", b"", b"", b"");
+        let b = Transcript::new("a", "bc", b"", b"", b"");
+        assert_ne!(a.0, b.0);
+    }
+
+    #[test]
+    fn secret_comparison() {
+        assert!(secrets_match("abcd-efgh", "abcd-efgh"));
+        assert!(!secrets_match("abcd-efgh", "abcd-efgi"));
+        assert!(!secrets_match("abcd-efgh", ""));
+    }
+
+    #[test]
+    fn generated_passphrases_are_well_formed_and_distinct() {
+        let a = generate_passphrase();
+        let b = generate_passphrase();
+        assert_eq!(a.len(), 14);
+        assert!(a.split('-').all(|g| g.len() == 4 && g.bytes().all(|c| PASSPHRASE_ALPHABET.contains(&c))));
+        assert_ne!(a, b);
+        assert!(weakness(&a).is_none());
+    }
+
+    #[test]
+    fn weak_passphrases_are_flagged() {
+        assert!(weakness("123456").is_some());
+        assert!(weakness("12345678").is_some());
+        assert!(weakness("short").is_some());
+        assert!(weakness("a decent passphrase").is_none());
+    }
 }

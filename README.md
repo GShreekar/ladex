@@ -1,10 +1,10 @@
 # LADEX - Local Area Data Exchange
 
-A fast and secure peer-to-peer file transfer tool built with Rust that enables seamless file sharing over local networks without requiring internet connectivity. LADEX provides a beautiful web interface with optional authentication for secure transfers.
+A fast and secure peer-to-peer file transfer tool built with Rust that enables seamless file sharing over local networks without requiring internet connectivity. LADEX provides a beautiful web interface with passphrase protection for secure transfers.
 
 ## Features
 
-- **Optional Authentication**: Secure access with generated or custom security codes
+- **Passphrase Protection**: One passphrase (generated or your own) gates both the browser login and joining the mesh
 - **Zero Configuration**: No complex setup required - just run and share
 - **Local Network Only**: All transfers happen over your local network, ensuring privacy and speed
 - **Real-time Transfer**: WebSocket-based communication for instant file transfers
@@ -14,6 +14,7 @@ A fast and secure peer-to-peer file transfer tool built with Rust that enables s
 - **Cross-Platform**: Works on Linux, macOS, and Windows
 - **Web Interface**: Modern, responsive web UI accessible from any browser
 - **Session Security**: Server restart invalidates old authentication cookies
+- **Brute-Force Resistant**: Wrong guesses are throttled per device, and the passphrase is never sent over the network
 
 ## Supported Platforms
 
@@ -44,54 +45,63 @@ Download the latest release from [GitHub Releases](https://github.com/GShreekar/
 
 ### Starting the Server
 
-#### Basic Usage (No Authentication)
-Launch LADEX with open access:
+#### Open Access (No Passphrase)
+Anyone on the network can open the web UI and join the mesh. LADEX prints a warning:
 ```bash
 ladex
 ```
 
-#### With Authentication
-Launch LADEX with a custom 6-digit security code:
-```bash
-ladex 123456
-```
-
-Or generate a random security code automatically:
+#### With a Passphrase (Recommended)
+Generate a random passphrase (printed in the terminal, e.g. `k7mp-x2qd-r9wt`):
 ```bash
 ladex -s
 # or
 ladex --secure
 ```
 
-The server will display the generated code in the terminal.
+Or choose your own. Use something long: digits-only or short passphrases trigger a warning.
+```bash
+ladex "correct horse battery staple"
+```
 
-The server will start on `http://localhost:8080` by default. Other devices on your network can connect using your local IP address (e.g., `http://192.168.1.100:8080`).
+Other devices need the same passphrase, both to log in from a browser and to join the mesh. Devices running a different passphrase (or none) never join your mesh.
+
+The server will start on `https://localhost:8080` by default. Other devices on your network can connect using your local IP address (e.g., `https://192.168.1.100:8080`).
 
 ### Authentication Flow
 
-When authentication is enabled:
-1. **Server displays code**: The terminal shows the 6-digit security code
-2. **Users enter code**: First-time visitors must enter the code on the login page
-3. **Session management**: Authenticated users stay logged in until server restart
-4. **Logout option**: Users can manually logout using the logout button
+When a passphrase is set:
+1. **Server shows the passphrase**: for `-s`, the terminal prints it once
+2. **Users enter it**: first-time visitors must enter it on the login page
+3. **Throttling**: after 5 wrong guesses an address is locked out for 30 seconds, doubling with each further failure up to 1 hour. There is also a cap across all addresses, so guessing from several devices doesn't help
+4. **Session management**: Authenticated users stay logged in until server restart
+5. **Logout option**: Users can manually logout using the logout button
+
+### Security Model
+
+- **Mesh handshake**: nodes prove they know the passphrase with a SPAKE2 password-authenticated key exchange. The passphrase, and anything derived from it, never crosses the network, so recording traffic or discovery announcements reveals nothing that can be cracked offline. An attacker gets at most one guess per connection.
+- **Man-in-the-middle protection**: the handshake is bound to the TLS certificate each node actually connected to. Someone relaying or terminating the connection with their own certificate can't complete it without the passphrase.
+- **Wrong guesses are throttled** at both the browser login and the mesh handshake.
+- **Open mode** (no passphrase) has none of these protections. Use it only on networks you trust.
+- **`--no-tls`** turns off encryption and the man-in-the-middle protection; the passphrase itself is still never sent.
 
 ### Basic Operations
 
 1. **Open your browser** and navigate to the server address
-2. **Enter security code** (if authentication is enabled)
-3. **Connect peers** by sharing the URL and security code with other devices
+2. **Enter the passphrase** (if one is set)
+3. **Connect peers** by sharing the URL and passphrase with other devices
 4. **Send files** by dragging and dropping or using the file picker
 5. **Send folders** by selecting entire directories (automatically zipped)
 6. **Send messages** using the text input field
 7. **Monitor transfers** with the real-time progress indicators
-8. **Logout** when finished (authentication mode only)
+8. **Logout** when finished (passphrase mode only)
 
 ## Command Line Options
 
 ```bash
-ladex [SECURITY_CODE]  # Launch with custom 6-digit security code
-ladex -s, --secure     # Launch with auto-generated security code
-ladex                  # Launch without authentication (open access)
+ladex [PASSPHRASE]     # Launch with your own passphrase
+ladex -s, --secure     # Launch with a generated passphrase
+ladex                  # Launch without a passphrase (open access, prints a warning)
 ```
 
 ## Build from Source

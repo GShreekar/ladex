@@ -280,9 +280,10 @@
         <h1 class="login-title">LADEX</h1>
         <form class="login-form" onsubmit="handleLogin(event)">
             <div class="input-group">
-                <label for="code">Security Code</label>
-                <input type="text" id="code" name="code" maxlength="6" pattern="[0-9]{6}" 
-                       placeholder="• • • • • •" required autocomplete="off">
+                <label for="code">Passphrase</label>
+                <input type="password" id="code" name="passphrase" maxlength="256"
+                       placeholder="Enter passphrase" required autocomplete="off"
+                       autocapitalize="off" autocorrect="off" spellcheck="false">
             </div>
             <button type="submit" class="login-btn" id="login-btn">Access System</button>
             <div id="loading" class="loading">◉ Authenticating...</div>
@@ -303,7 +304,6 @@
             loginBtn.disabled = true;
             
             try {
-                console.log('Attempting authentication with code:', code);
                 const response = await fetch('/auth', {
                     method: 'POST',
                     headers: {
@@ -311,7 +311,7 @@
                         'Cache-Control': 'no-cache'
                     },
                     cache: 'no-cache',
-                    body: JSON.stringify({ code: code }),
+                    body: JSON.stringify({ passphrase: code }),
                 });
                 
                 console.log('Auth response status:', response.status);
@@ -328,7 +328,7 @@
                     }, 1000);
                 } else {
                     console.log('Authentication failed:', result.message);
-                    errorDiv.textContent = `⚠ ${result.message || 'Invalid security code'}`;
+                    errorDiv.textContent = `⚠ ${result.message || 'Invalid passphrase'}`;
                     errorDiv.style.display = 'block';
                     loadingDiv.style.display = 'none';
                     loginBtn.disabled = false;
@@ -349,18 +349,6 @@
 
         document.getElementById('code').focus();
         
-        document.getElementById('code').addEventListener('input', function(e) {
-            let value = e.target.value.replace(/[^0-9]/g, '');
-            
-            if (value.length > 0) {
-                e.target.style.letterSpacing = '0.3em';
-            } else {
-                e.target.style.letterSpacing = '0.2em';
-            }
-            
-            e.target.value = value;
-        });
-
         document.getElementById('code').addEventListener('focus', function() {
             this.parentElement.style.transform = 'scale(1.02)';
             this.parentElement.style.transition = 'transform 0.3s ease';

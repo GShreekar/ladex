@@ -22,11 +22,10 @@
 //     announces.  We also double-check node_id in the listen loop as
 //     defense-in-depth (some OS/driver combos ignore the loop flag).
 //
-//   • The passphrase_hash in the announce packet is a pre-filter ONLY —
-//     it reduces noise on shared networks.  It is NOT a security boundary.
-//     The real auth handshake is in the mesh WebSocket (Phase 7).
-//     Until Phase 7 is implemented, this field is always an empty string
-//     and the filter is skipped entirely (see listen_loop).
+//   • Announces carry no secret: they are cleartext UDP that anyone on the LAN
+//     can read.  `secured` only says whether a passphrase is required, so open
+//     and secured meshes don't try to join each other.  The passphrase itself
+//     is verified by the SPAKE2 handshake in mesh.rs.
 //
 //   • Staleness: if we stop receiving announces from a node for 10 seconds
 //     (5 missed intervals), we treat it as gone and tear down the mesh
@@ -36,7 +35,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -44,9 +43,26 @@ use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
 
 use crate::mesh;
-use crate::auth;
 use crate::NodeState;
 use crate::types::hostname;
+
+// After a failed authentication, wait before dialing that node again:
+// 15s, 30s, 60s, ... capped at 10 minutes.
+const AUTH_BACKOFF_BASE: Duration = Duration::from_secs(15);
+const AUTH_BACKOFF_MAX: Duration = Duration::from_secs(600);
+
+type AuthBackoff = Arc<Mutex<HashMap<String, (u32, Instant)>>>;
+
+fn backoff_active(backoff: &AuthBackoff, node_id: &str) -> bool {
+    backoff.lock().unwrap().get(node_id).is_some_and(|(_, until)| *until > Instant::now())
+}
+
+fn record_auth_failure(backoff: &AuthBackoff, node_id: &str) {
+    let mut map = backoff.lock().unwrap();
+    let failures = map.get(node_id).map_or(0, |(n, _)| *n) + 1;
+    let delay = AUTH_BACKOFF_BASE.saturating_mul(1 << (failures - 1).min(10)).min(AUTH_BACKOFF_MAX);
+    map.insert(node_id.to_string(), (failures, Instant::now() + delay));
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -91,10 +107,8 @@ pub struct AnnouncePacket {
     /// Protocol version.  Packets with a different version are silently ignored.
     pub protocol_version: u32,
 
-    /// SHA-1 hex of the passphrase (pre-filter only — not a security boundary).
-    /// Empty string when no passphrase is configured; until Phase 7 lands,
-    /// the listen loop skips this check entirely.
-    pub passphrase_hash: String,
+    /// Whether this node requires a passphrase.  Not a secret.
+    pub secured: bool,
 }
 
 impl AnnouncePacket {
@@ -176,7 +190,6 @@ impl DiscoveryService {
     pub async fn listen_loop(
         &self,
         state: NodeState,
-        passphrase_hash: String, // Phase 7: empty until implemented
     ) -> anyhow::Result<()> {
         let mut buf = [0u8; 2048];
 
@@ -185,6 +198,7 @@ impl DiscoveryService {
         // correlate with mesh_peers during the staleness sweep.
         let seen: Arc<RwLock<HashMap<String, (Instant, SocketAddr)>>> =
             Arc::new(RwLock::new(HashMap::new()));
+        let auth_backoff: AuthBackoff = Arc::new(Mutex::new(HashMap::new()));
 
         // Spawn the staleness sweeper as a sibling task.
         let seen_clone = seen.clone();
@@ -213,20 +227,9 @@ impl DiscoveryService {
                 continue;
             }
 
-            // Phase 7: passphrase pre-filter (check 1 of 3).
-            // Enforces that secured and unsecured meshes never mix:
-            //   - If our hash is empty and packet's is not (or vice versa) → skip.
-            //   - If both are empty → no-passphrase mesh, allow.
-            //   - If both non-empty but different → skip.
-            // The Hello/HelloAck check (check 2) enforces this again in the TCP handshake.
-            if !auth::hashes_match(
-                &passphrase_hash,
-                &packet.passphrase_hash,
-            ) {
-                tracing::debug!(
-                    "Discovery: ignoring {} — passphrase mismatch",
-                    packet.node_id
-                );
+            // Secured and open meshes never mix.
+            if packet.secured != state.passphrase.is_some() {
+                tracing::debug!("Discovery: ignoring {} — security mode mismatch", packet.node_id);
                 continue;
             }
 
@@ -251,6 +254,10 @@ impl DiscoveryService {
                 }
             }
 
+            if backoff_active(&auth_backoff, &packet.node_id) {
+                continue;
+            }
+
             // Deduplication tie-break:
             //   smaller node_id initiates immediately.
             //   larger node_id waits 200ms then checks if a connection appeared.
@@ -259,6 +266,7 @@ impl DiscoveryService {
             let peer_http_port = packet.http_port;
             let state_spawn = state.clone();
             let my_node_id = state.node_id.clone();
+            let auth_backoff = auth_backoff.clone();
 
             tokio::spawn(async move {
                 if my_node_id > peer_node_id {
@@ -288,14 +296,20 @@ impl DiscoveryService {
                     peer_http_port
                 );
 
-                if let Err(e) =
-                    mesh::connect_to_peer(peer_ip, peer_http_port, state_spawn).await
-                {
-                    tracing::warn!(
-                        "Discovery: mesh connect to {}:{} failed: {e}",
-                        peer_ip,
-                        peer_http_port
-                    );
+                match mesh::connect_to_peer(peer_ip, peer_http_port, state_spawn).await {
+                    Ok(()) => {
+                        auth_backoff.lock().unwrap().remove(&peer_node_id);
+                    }
+                    Err(e) => {
+                        if e.downcast_ref::<mesh::AuthFailure>().is_some() {
+                            record_auth_failure(&auth_backoff, &peer_node_id);
+                        }
+                        tracing::warn!(
+                            "Discovery: mesh connect to {}:{} failed: {e}",
+                            peer_ip,
+                            peer_http_port
+                        );
+                    }
                 }
             });
         }
@@ -360,12 +374,52 @@ pub fn build_announce(state: &NodeState, http_port: u16) -> AnnouncePacket {
         node_name: hostname(),
         http_port,
         protocol_version: crate::mesh::PROTOCOL_VERSION,
-        // Phase 7: compute PBKDF2-SHA256 of passphrase here.
-        // Until then, always empty string — the listen loop skips the check.
-        passphrase_hash: state
-            .passphrase_hash
-            .clone()
-            .unwrap_or_default(),
+        secured: state.passphrase.is_some(),
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn backoff_secs(backoff: &AuthBackoff, node_id: &str) -> u64 {
+        backoff.lock().unwrap()[node_id].1.duration_since(Instant::now()).as_secs()
+    }
+
+    #[test]
+    fn auth_backoff_doubles_and_is_capped() {
+        let backoff: AuthBackoff = Arc::new(Mutex::new(HashMap::new()));
+        assert!(!backoff_active(&backoff, "node"));
+
+        record_auth_failure(&backoff, "node");
+        assert!(backoff_active(&backoff, "node"));
+        assert!(backoff_secs(&backoff, "node") <= 15);
+
+        record_auth_failure(&backoff, "node");
+        assert!(backoff_secs(&backoff, "node") > 15 && backoff_secs(&backoff, "node") <= 30);
+
+        for _ in 0..20 {
+            record_auth_failure(&backoff, "node");
+        }
+        assert!(backoff_secs(&backoff, "node") <= AUTH_BACKOFF_MAX.as_secs());
+        assert!(!backoff_active(&backoff, "other-node"));
+    }
+
+    #[test]
+    fn announce_carries_only_public_fields() {
+        let packet = AnnouncePacket {
+            packet_type: "ladex_announce".into(),
+            node_id: "node_1".into(),
+            node_name: "laptop".into(),
+            http_port: 8080,
+            protocol_version: crate::mesh::PROTOCOL_VERSION,
+            secured: true,
+        };
+        let json = serde_json::to_value(&packet).unwrap();
+        let mut keys: Vec<_> = json.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["http_port", "node_id", "node_name", "protocol_version", "secured", "type"]);
+        assert!(packet.is_valid("node_2"));
+    }
+}

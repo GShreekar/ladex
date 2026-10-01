@@ -77,7 +77,7 @@ pub struct PeerInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthRequest {
-    pub code: String,
+    pub passphrase: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

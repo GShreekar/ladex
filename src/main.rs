@@ -5,6 +5,7 @@ use tokio::sync::RwLock;
 use warp::Filter;
 use clap::Parser;
 use rand::Rng;
+use std::time::Duration;
 
 mod types;
 mod websocket;
@@ -15,6 +16,8 @@ mod state;
 mod auth;
 mod tls;
 mod mdns;
+mod ratelimit;
+mod server;
 
 use types::*;
 use include_dir::{include_dir, Dir};
@@ -42,13 +45,12 @@ type Messages   = Arc<RwLock<Vec<types::TextMessage>>>;
 #[command(name = "ladex")]
 #[command(about = "LADEX - Local Area Data Exchange", long_about = None)]
 struct Args {
-    /// Optional shared passphrase for joining the mesh.
-    /// Replaces the old numeric security_code.  If omitted, no auth is required.
+    /// Passphrase required both to log in from a browser and to join the mesh.
+    /// If omitted, anyone on the network can do either.
     passphrase: Option<String>,
 
-    /// Auto-generate a random passphrase and print it (replaces --secure).
-    /// Equivalent to the old --secure flag for backward compat.
-    #[arg(short = 's', long = "secure")]
+    /// Generate a random passphrase and print it.
+    #[arg(short = 's', long = "secure", conflicts_with = "passphrase")]
     secure: bool,
 
     /// Local HTTP/WS port for this node's own browser tab.
@@ -83,15 +85,6 @@ struct Args {
     no_tls: bool,
 }
 
-fn generate_random_code() -> String {
-    let mut rng = rand::thread_rng();
-    format!("{:06}", rng.gen_range(100000..1000000))
-}
-
-fn validate_code(code: &str) -> bool {
-    code.len() == 6 && code.chars().all(|c| c.is_ascii_digit())
-}
-
 // ---------------------------------------------------------------------------
 // Phase 1 — NodeState
 //
@@ -113,9 +106,8 @@ fn validate_code(code: &str) -> bool {
 //   mesh_peers                   — Other nodes (machines) on the LAN mesh.
 //                                  Populated in Phase 3; empty until then.
 //
-//   passphrase_hash              — Replaces security_code in Phase 7.
-//                                  Until then, security_code_legacy carries
-//                                  the old numeric code so auth still works.
+//   passphrase                   — Gates both the browser login and the mesh
+//                                  handshake.  None = open node.
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
@@ -138,14 +130,20 @@ pub struct NodeState {
     pub mesh_peers: mesh::MeshPeers,
 
     // ── auth ─────────────────────────────────────────────────────────────
-    /// Legacy numeric security code (Phase 0 / pre-Phase-7 auth).
-    /// Kept alongside passphrase_hash so auth continues to work before
-    /// Phase 7 replaces the whole auth system.
-    pub security_code_legacy: Option<String>,
+    /// Shared passphrase.  Required for the browser login and proven (never
+    /// sent) in the mesh handshake.  None = open node.
+    pub passphrase: Option<String>,
 
-    /// Phase 7 passphrase hash (PBKDF2-SHA256 hex).
-    /// None until Phase 7 is implemented.
-    pub passphrase_hash: Option<String>,
+    /// Fingerprint of this node's TLS certificate, bound into the mesh
+    /// handshake so a man in the middle can't pass for this node.  Empty
+    /// when TLS is disabled.
+    pub tls_fingerprint: Vec<u8>,
+
+    /// Throttles wrong guesses at the browser login.
+    pub auth_limiter: Arc<ratelimit::AttemptLimiter>,
+
+    /// Throttles wrong guesses in the mesh handshake.
+    pub mesh_limiter: Arc<ratelimit::AttemptLimiter>,
 
     /// BUG-04 fix: random secret used ONLY for the browser HTTP auth
     /// cookie. Generated once per process, never transmitted anywhere —
@@ -203,12 +201,12 @@ fn with_auth(state: NodeState) -> impl Filter<Extract = (), Error = warp::Reject
         .and(warp::cookie::optional("auth"))
         .and(warp::any().map(move || state.clone()))
         .and_then(|auth_cookie: Option<String>, state: NodeState| async move {
-            match &state.security_code_legacy {
+            match &state.passphrase {
                 None => Ok(()),
                 Some(_) => match auth_cookie {
                     Some(cookie) => {
                         let expected_cookie = format!("authenticated:{}", state.session_token());
-                        if cookie == expected_cookie {
+                        if auth::secrets_match(&expected_cookie, &cookie) {
                             Ok(())
                         } else {
                             Err(warp::reject::custom(AuthenticationRequired))
@@ -234,7 +232,7 @@ impl warp::reject::Reject for AuthenticationRequired {}
 // LAN. Without a check here, a malicious website the user merely has open
 // in another tab could connect straight to this server, and — since the
 // product's own "PIN is optional" design makes running with no PIN the
-// common case (`security_code_legacy: None`, where `with_auth` allows
+// common case (`passphrase: None`, where `with_auth` allows
 // everything through) — freely ride the /ws protocol with no login at all,
 // or (with or without a PIN, since /mesh has its own, cookie-independent
 // auth) speak the raw mesh protocol on /mesh.
@@ -314,27 +312,30 @@ async fn main() {
 
     let args = Args::parse();
 
-    // ── passphrase / security code ───────────────────────────────────────
-    // Backward-compat: accept the old 6-digit numeric code on positional arg.
-    // Phase 7 will replace this with proper PBKDF2 hashing; for now we keep
-    // the same cookie-auth behaviour as before.
-    let security_code_legacy = if args.secure {
-        let code = generate_random_code();
-        println!("Generated security code: {code}");
-        Some(code)
-    } else if let Some(ref p) = args.passphrase {
-        // If it looks like the old 6-digit code, accept it as-is.
-        if validate_code(p) {
-            Some(p.clone())
-        } else {
-            // Non-numeric passphrase: store for Phase 7 hash; no legacy cookie auth.
-            // Until Phase 7 lands, just print a warning and skip auth.
-            eprintln!("Note: non-numeric passphrase provided — mesh auth will be enforced in Phase 7.  Running without HTTP auth for now.");
-            None
-        }
+    // ── passphrase ───────────────────────────────────────────────────────
+    // One passphrase gates both the browser login and the mesh handshake.
+    let passphrase: Option<String> = if args.secure {
+        let generated = auth::generate_passphrase();
+        println!("Generated passphrase: {generated}");
+        Some(generated)
     } else {
-        None
+        args.passphrase.clone()
     };
+    match passphrase.as_deref() {
+        Some("") => {
+            eprintln!("Error: the passphrase must not be empty.");
+            std::process::exit(2);
+        }
+        Some(p) => {
+            if let Some(reason) = auth::weakness(p) {
+                eprintln!("Warning: this passphrase is weak ({reason}). Prefer `ladex -s` for a generated one.");
+            }
+        }
+        None => eprintln!(
+            "Warning: no passphrase set — any device on this network can open the web UI and join the mesh. \
+             Use `ladex -s` to generate one."
+        ),
+    }
 
     // ── node identity ────────────────────────────────────────────────────
     // node_id identifies THIS machine on the mesh.  Different from a browser
@@ -357,18 +358,6 @@ async fn main() {
         hex::encode(bytes)
     };
 
-    // ── Phase 7: passphrase hash ─────────────────────────────────────────
-    // Compute PBKDF2-SHA256 hash now so it can be placed in AnnouncePacket
-    // and MeshMessage::Hello.  This replaces the old plain-text comparison.
-    // Empty passphrase produces an empty hash → no-passphrase mesh nodes
-    // only connect to other no-passphrase nodes.
-    let passphrase_for_hash: Option<&str> = args.passphrase.as_deref()
-        .filter(|p| !validate_code(p)); // non-numeric = new-style passphrase
-    let passphrase_hash_value = auth::derive_hash(passphrase_for_hash);
-    if !passphrase_hash_value.is_empty() {
-        tracing::info!("Phase 7: passphrase hash computed (PBKDF2-SHA256)");
-    }
-
     // ── BUG-03 fix: TLS setup ────────────────────────────────────────────
     // Must happen before `state` is built: connect_to_peer (dialed from the
     // manual-peer, discovery, and reconnect-backoff call sites below) reads
@@ -381,6 +370,7 @@ async fn main() {
     // last-resort fallback for the rare case if-addrs finds nothing.
     let primary_local_ip: Option<IpAddr> = local_ips.first().copied().or_else(get_local_ip);
 
+    let mut tls_fingerprint: Vec<u8> = Vec::new();
     let tls_server_config = if args.no_tls {
         tracing::info!("TLS: disabled via --no-tls — serving plain HTTP/WS");
         None
@@ -389,8 +379,11 @@ async fn main() {
         let mut sans: Vec<String> = vec!["localhost".to_string(), "127.0.0.1".to_string()];
         sans.extend(local_ips.iter().map(IpAddr::to_string));
         match tls::load_or_generate_cert(&sans) {
-            Ok((cert, key)) => match tls::build_server_config(cert, key) {
-                Ok(cfg) => Some(cfg),
+            Ok((cert, key)) => match tls::build_server_config(cert.clone(), key) {
+                Ok(cfg) => {
+                    tls_fingerprint = auth::tls_fingerprint(cert.as_ref());
+                    Some(cfg)
+                }
                 Err(e) => {
                     eprintln!("TLS: failed to build server config ({e}) — falling back to plain HTTP");
                     None
@@ -403,6 +396,28 @@ async fn main() {
         }
     };
     let tls_client_config = tls_server_config.as_ref().map(|_| tls::build_client_config());
+    if tls_server_config.is_none() && passphrase.is_some() {
+        eprintln!(
+            "Warning: TLS is off, so traffic is unencrypted and the mesh handshake cannot detect a \
+             man in the middle. The passphrase itself is still never sent."
+        );
+    }
+
+    // Browser logins are the main target for guessing, so they also get a cap
+    // across all addresses; mesh joins don't, because a second mesh with a
+    // different passphrase on the same network would trip it for everyone.
+    let auth_limiter = Arc::new(ratelimit::AttemptLimiter::new(ratelimit::Policy {
+        free_attempts: 5,
+        base_lockout: Duration::from_secs(30),
+        max_lockout: Duration::from_secs(3600),
+        global_cap: Some((30, Duration::from_secs(600))),
+    }));
+    let mesh_limiter = Arc::new(ratelimit::AttemptLimiter::new(ratelimit::Policy {
+        free_attempts: 5,
+        base_lockout: Duration::from_secs(10),
+        max_lockout: Duration::from_secs(600),
+        global_cap: None,
+    }));
 
     let state = NodeState {
         local_peers:          Arc::new(RwLock::new(HashMap::new())),
@@ -411,8 +426,10 @@ async fn main() {
         messages:             Arc::new(RwLock::new(Vec::new())),
         node_id:              node_id.clone(),
         mesh_peers:           Arc::new(RwLock::new(HashMap::new())),
-        security_code_legacy,
-        passphrase_hash:      Some(passphrase_hash_value),
+        passphrase,
+        tls_fingerprint,
+        auth_limiter,
+        mesh_limiter,
         http_auth_secret,
         tls_client_config,
         http_port: args.port,
@@ -452,7 +469,6 @@ async fn main() {
         let announce_packet = discovery::build_announce(&state, args.port);
         let discovery_port  = args.discovery_port;
         let state_disc      = state.clone();
-        let passphrase_hash = state.passphrase_hash.clone().unwrap_or_default();
 
         tokio::spawn(async move {
             match discovery::DiscoveryService::bind(discovery_port).await {
@@ -471,7 +487,7 @@ async fn main() {
                         }
                     });
                     // Listen loop
-                    if let Err(e) = svc_listen.listen_loop(state_listen, passphrase_hash).await {
+                    if let Err(e) = svc_listen.listen_loop(state_listen).await {
                         tracing::error!("Discovery listen loop error: {e}");
                     }
                 }
@@ -548,7 +564,7 @@ async fn main() {
         .and(warp::get())
         .and(warp::any().map(move || app_state_login.clone()))
         .and_then(|s: NodeState| async move {
-            if s.security_code_legacy.is_some() {
+            if s.passphrase.is_some() {
                 serve_login_page().await
             } else {
                 let redirect = warp::redirect::temporary(warp::http::Uri::from_static("/"));
@@ -560,7 +576,9 @@ async fn main() {
     let app_state_auth = state.clone();
     let auth_route = warp::path("auth")
         .and(warp::post())
+        .and(warp::body::content_length_limit(4096))
         .and(warp::body::json())
+        .and(warp::ext::optional::<server::PeerAddr>())
         .and(warp::any().map(move || app_state_auth.clone()))
         .and_then(handlers::authenticate);
 
@@ -616,15 +634,13 @@ async fn main() {
     // Separate from /ws intentionally: mesh peers and browser tabs have
     // different message protocols and different lifecycle semantics.
     let mesh_state = state.clone();
-    // BUG-10 fix note: warp 0.4.1 doesn't expose a remote-address filter at
-    // all (its filters::addr module is commented out in the published
-    // crate — dead code, like the `tls` feature from the BUG-03 fix), so
-    // handle_inbound can't learn a peer's address from the TCP connection
-    // itself. It relies entirely on the peer self-reporting its own
-    // ip/http_port in the Hello message instead (see MeshMessage::Hello).
+    // The peer's address comes from server.rs (warp has no remote-address
+    // filter of its own) and keys the handshake rate limiter. The peer's
+    // dialable ip/http_port still come from its self-reported Hello (BUG-10).
     let mesh_route = warp::path("mesh")
         .and(reject_browser_origin())
         .and(warp::ws())
+        .and(warp::ext::optional::<server::PeerAddr>())
         .and(warp::any().map(move || mesh_state.clone()))
         .and_then(mesh::mesh_ws_handler);
 
@@ -677,7 +693,7 @@ async fn main() {
     let local_ip = primary_local_ip.map(|ip| ip.to_string())
         .unwrap_or_else(|| "YOUR_IP".to_string());
 
-    // ── Phase 10 §10.5 / BUG-03 fix: graceful shutdown + TLS ─────────────
+    // ── Phase 10 §10.5: graceful shutdown ────────────────────────────────
     // Race the server against a SIGTERM/SIGINT signal. On receiving a
     // signal, broadcast Goodbye to all peers before exiting.
     let state_shutdown = state.clone();
@@ -688,55 +704,29 @@ async fn main() {
     // isn't universally supported.
     let mdns_handle = mdns::advertise(&local_ips, args.port, tls_enabled);
 
-    if let Some(tls_config) = tls_server_config {
-        // Public TLS proxy on args.port; warp itself only listens on
-        // loopback, one port up, unreachable from the network directly.
-        let internal_port = if args.port == u16::MAX { args.port - 1 } else { args.port + 1 };
-        let public_addr: SocketAddr = ([0, 0, 0, 0], args.port).into();
-        let internal_addr: SocketAddr = ([127, 0, 0, 1], internal_port).into();
-
-        println!("Access locally: https://localhost:{}", args.port);
-        println!("Access from network: https://{local_ip}:{}", args.port);
+    let scheme = if tls_enabled { "https" } else { "http" };
+    println!("Access locally: {scheme}://localhost:{}", args.port);
+    println!("Access from network: {scheme}://{local_ip}:{}", args.port);
+    if tls_enabled {
         println!("Note: your browser will warn about the self-signed certificate on first visit — this is expected for a LAN-local tool with no public CA. Click through (\"Advanced\" → \"Proceed\").");
-        if primary_local_ip.is_some() {
-            print_qr_code(&format!("https://{local_ip}:{}", args.port));
-        }
+    }
+    if primary_local_ip.is_some() {
+        print_qr_code(&format!("{scheme}://{local_ip}:{}", args.port));
+    }
 
-        let internal_server = warp::serve(routes).run(internal_addr);
-        tokio::spawn(internal_server);
-
-        tokio::select! {
-            result = tls::run_tls_proxy(public_addr, internal_addr, tls_config) => {
-                if let Err(e) = result {
-                    tracing::error!("TLS: proxy exited: {e}");
-                }
-            }
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!("Shutdown: SIGINT received — sending Goodbye to mesh peers");
-                mesh::broadcast_goodbye(&state_shutdown).await;
-                if let Some(handle) = mdns_handle {
-                    mdns::shutdown(handle).await;
-                }
+    let addr: SocketAddr = ([0, 0, 0, 0], args.port).into();
+    let acceptor = tls_server_config.map(tokio_rustls::TlsAcceptor::from);
+    tokio::select! {
+        result = server::serve(addr, acceptor, warp::service(routes)) => {
+            if let Err(e) = result {
+                tracing::error!("Server exited: {e}");
             }
         }
-    } else {
-        let addr: SocketAddr = ([0, 0, 0, 0], args.port).into();
-
-        println!("Access locally: http://localhost:{}", args.port);
-        println!("Access from network: http://{local_ip}:{}", args.port);
-        if primary_local_ip.is_some() {
-            print_qr_code(&format!("http://{local_ip}:{}", args.port));
-        }
-
-        let server_fut = warp::serve(routes).run(addr);
-        tokio::select! {
-            _ = server_fut => {}
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!("Shutdown: SIGINT received — sending Goodbye to mesh peers");
-                mesh::broadcast_goodbye(&state_shutdown).await;
-                if let Some(handle) = mdns_handle {
-                    mdns::shutdown(handle).await;
-                }
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("Shutdown: SIGINT received — sending Goodbye to mesh peers");
+            mesh::broadcast_goodbye(&state_shutdown).await;
+            if let Some(handle) = mdns_handle {
+                mdns::shutdown(handle).await;
             }
         }
     }
