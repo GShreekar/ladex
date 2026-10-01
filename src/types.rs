@@ -1,3 +1,4 @@
+use crate::hlc::Stamp;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -73,6 +74,11 @@ pub struct PeerInfo {
     /// localStorage. Overrides the User-Agent-derived name in the UI.
     #[serde(default)]
     pub nickname: Option<String>,
+
+    /// Orders updates to this peer across nodes (see hlc.rs). Replaces the
+    /// wall-clock `connected_at`/`left_at` as the merge key.
+    #[serde(default)]
+    pub version: Stamp,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,10 +101,15 @@ pub struct FileMetadata {
     pub uploader_id: SessionId,
     pub hosts: HashSet<SessionId>,
     pub uploaded_at: chrono::DateTime<chrono::Utc>,
-    /// Unix-millisecond timestamp used for last-write-wins merge (Phase 4).
-    /// Populated on file upload; preserved across catalog sync.
+    /// Unix-millisecond wall-clock time of creation, for display only.
+    /// Merging uses `version`.
     #[serde(default)]
     pub created_at: u64,
+
+    /// Stamp of the latest change to this entry (create, delete, new host,
+    /// checksum). The entry with the greater stamp wins a merge; see hlc.rs.
+    #[serde(default)]
+    pub version: Stamp,
 
     // ── Phase 4: tombstone support ─────────────────────────────────────────
     /// True when this file has been deleted.  Tombstones propagate across the
@@ -106,8 +117,7 @@ pub struct FileMetadata {
     /// memory after `deleted_at` is 60+ seconds old (see `state::prune_tombstones`).
     #[serde(default)]
     pub deleted: bool,
-    /// Unix-millisecond timestamp of deletion.  Used as the LWW key for
-    /// tombstones (always > `created_at` for the same file).
+    /// Unix-millisecond wall-clock time of deletion, for display only.
     #[serde(default)]
     pub deleted_at: u64,
 
@@ -125,6 +135,23 @@ pub struct FileMetadata {
     /// decides whether to respond to a download request with a normal
     /// single-file stream or a folder-manifest stream based on this flag,
     /// same as it already decides FSAA vs Blob-fallback.
+    #[serde(default)]
+    pub is_folder: bool,
+}
+
+/// What a browser tab may say about a file it shares. The node fills in
+/// everything else (uploader, hosts, timestamps), so a tab can't claim to be
+/// someone else or backdate an entry. Unknown fields sent by older pages are
+/// ignored.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileUploadRequest {
+    pub id: String,
+    pub name: String,
+    pub size: u64,
+    #[serde(default)]
+    pub mime_type: String,
+    #[serde(default)]
+    pub sha256: Option<String>,
     #[serde(default)]
     pub is_folder: bool,
 }
@@ -167,7 +194,7 @@ pub enum ClientMessage {
     #[serde(rename = "file_upload")]
     FileUpload {
         session_id: SessionId,
-        file: FileMetadata,
+        file: FileUploadRequest,
     },
 
     /// Peer wants to download a file — server picks a host and tells it to

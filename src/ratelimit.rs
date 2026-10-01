@@ -169,7 +169,9 @@ mod tests {
         let mut lockouts = Vec::new();
         for _ in 0..8 {
             // Force each attempt through by clearing the lock, keeping the count.
-            limiter.inner.lock().unwrap().by_ip.get_mut(&IP).map(|e| e.locked_until = None);
+            if let Some(entry) = limiter.inner.lock().unwrap().by_ip.get_mut(&IP) {
+                entry.locked_until = None;
+            }
             let _ = limiter.begin(IP);
             let until = limiter.inner.lock().unwrap().by_ip[&IP].locked_until;
             lockouts.push(until.map(|u| u.duration_since(Instant::now()).as_secs()));

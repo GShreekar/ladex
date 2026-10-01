@@ -22,7 +22,7 @@
 // ============================================================================
 
 use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::net::TcpStream;
@@ -79,58 +79,135 @@ fn config_dir() -> PathBuf {
     PathBuf::from(home).join(".ladex")
 }
 
-/// Loads a cached self-signed cert/key pair if it already covers exactly
-/// `sans`, else generates a fresh pair and caches it to disk for next run.
-pub fn load_or_generate_cert(sans: &[String]) -> anyhow::Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
-    let dir = config_dir();
-    let cert_path = dir.join("cert.der");
-    let key_path = dir.join("key.der");
-    let sans_path = dir.join("cert.sans");
+// How many addresses the certificate remembers beyond the current ones, so a
+// DHCP lease that flips between a few addresses doesn't mint a new certificate
+// (and a new browser warning) each time.
+const MAX_REMEMBERED_ADDRESSES: usize = 16;
 
-    if let (Ok(cert_bytes), Ok(key_bytes), Ok(cached_sans)) =
-        (std::fs::read(&cert_path), std::fs::read(&key_path), std::fs::read_to_string(&sans_path))
+struct Cached {
+    cert: Vec<u8>,
+    key: Vec<u8>,
+    sans: Vec<String>,
+}
+
+fn read_cached(dir: &Path) -> Option<Cached> {
+    Some(Cached {
+        cert: std::fs::read(dir.join("cert.der")).ok()?,
+        key: std::fs::read(dir.join("key.der")).ok()?,
+        sans: std::fs::read_to_string(dir.join("cert.sans")).ok()?.lines().map(String::from).collect(),
+    })
+}
+
+// The private key is created with owner-only permissions from the start,
+// instead of being written world-readable and tightened afterwards.
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
     {
-        let mut cached: Vec<&str> = cached_sans.lines().collect();
-        let mut wanted: Vec<&str> = sans.iter().map(String::as_str).collect();
-        cached.sort_unstable();
-        wanted.sort_unstable();
-        if cached == wanted {
-            tracing::info!("TLS: reusing cached certificate ({} SAN entries)", sans.len());
-            return Ok((
-                CertificateDer::from(cert_bytes),
-                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_bytes)),
-            ));
-        }
-        tracing::info!("TLS: local network addresses changed — regenerating certificate");
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        // A file left over from an older version may have been created more
+        // permissively; tighten it before any key bytes are written.
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(bytes)
+}
 
-    tracing::info!("TLS: generating a new self-signed certificate ({} SAN entries)", sans.len());
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir)
+}
+
+/// The names the certificate must cover, plus recently used addresses that are
+/// no longer current. `wanted` always comes first.
+fn certificate_names(wanted: &[String], previous: &[String]) -> Vec<String> {
+    let mut names = wanted.to_vec();
+    let remembered = previous
+        .iter()
+        .filter(|name| name.parse::<IpAddr>().is_ok() && !names.contains(name))
+        .take(MAX_REMEMBERED_ADDRESSES)
+        .cloned()
+        .collect::<Vec<_>>();
+    names.extend(remembered);
+    names
+}
+
+fn generate(names: &[String]) -> anyhow::Result<(CertificateDer<'static>, Vec<u8>)> {
     let key_pair = rcgen::KeyPair::generate()?;
-    let mut params = rcgen::CertificateParams::new(sans.to_vec())?;
+    let mut params = rcgen::CertificateParams::new(names.to_vec())?;
     params.distinguished_name = rcgen::DistinguishedName::new();
     params.distinguished_name.push(rcgen::DnType::CommonName, "LADEX");
     let cert = params.self_signed(&key_pair)?;
-
-    let cert_der: CertificateDer<'static> = cert.der().clone();
-    let key_bytes = key_pair.serialize_der();
-
-    if std::fs::create_dir_all(&dir).is_ok() {
-        let _ = std::fs::write(&cert_path, &cert_der);
-        let _ = std::fs::write(&key_path, &key_bytes);
-        let _ = std::fs::write(&sans_path, sans.join("\n"));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
-        }
-    } else {
-        tracing::warn!("TLS: could not create {} — certificate won't be cached across runs", dir.display());
-    }
-
-    Ok((cert_der, PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_bytes))))
+    Ok((cert.der().clone(), key_pair.serialize_der()))
 }
 
-pub fn build_server_config(
+/// Builds the server's TLS configuration from the cached certificate when it
+/// still covers every name in `wanted`, otherwise from a freshly generated one
+/// (cached for next time). Also returns the certificate's SHA-256 fingerprint.
+///
+/// Browsers only ever see a self-signed certificate here, so they warn on
+/// first visit; keeping the certificate stable means a device that has
+/// accepted it once isn't asked again, and the printed fingerprint lets a user
+/// check they accepted the right one.
+pub fn prepare_server_identity(wanted: &[String]) -> anyhow::Result<(Arc<rustls::ServerConfig>, Vec<u8>)> {
+    let dir = config_dir();
+    let cached = read_cached(&dir);
+
+    if let Some(c) = &cached {
+        if wanted.iter().all(|name| c.sans.contains(name)) {
+            let cert = CertificateDer::from(c.cert.clone());
+            let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(c.key.clone()));
+            match build_server_config(cert, key) {
+                Ok(config) => {
+                    tracing::info!("TLS: reusing cached certificate ({} names)", c.sans.len());
+                    // Tighten permissions on a key written by an older version.
+                    let _ = write_private(&dir.join("key.der"), &c.key);
+                    return Ok((config, crate::auth::tls_fingerprint(&c.cert)));
+                }
+                Err(e) => tracing::warn!("TLS: cached certificate is unusable ({e}) — generating a new one"),
+            }
+        } else {
+            tracing::info!("TLS: local network addresses changed — generating a new certificate");
+        }
+    }
+
+    let names = certificate_names(wanted, cached.as_ref().map_or(&[][..], |c| &c.sans));
+    tracing::info!("TLS: generating a new self-signed certificate ({} names)", names.len());
+    let (cert, key) = generate(&names)?;
+
+    match create_private_dir(&dir)
+        .and_then(|_| write_private(&dir.join("key.der"), &key))
+        .and_then(|_| std::fs::write(dir.join("cert.der"), &cert))
+        .and_then(|_| std::fs::write(dir.join("cert.sans"), names.join("\n")))
+    {
+        Ok(()) => {}
+        Err(e) => tracing::warn!("TLS: could not save the certificate to {} ({e}) — it won't be reused next run", dir.display()),
+    }
+
+    let fingerprint = crate::auth::tls_fingerprint(cert.as_ref());
+    let config = build_server_config(cert, PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key)))?;
+    Ok((config, fingerprint))
+}
+
+/// "AB:CD:EF:…" — the form browsers show in their certificate details.
+pub fn format_fingerprint(fingerprint: &[u8]) -> String {
+    fingerprint.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(":")
+}
+
+fn build_server_config(
     cert: CertificateDer<'static>,
     key: PrivateKeyDer<'static>,
 ) -> anyhow::Result<Arc<rustls::ServerConfig>> {
@@ -214,6 +291,7 @@ pub async fn connect_wss(
     port: u16,
     path: &str,
     client_config: Arc<rustls::ClientConfig>,
+    ws_config: tokio_tungstenite::tungstenite::protocol::WebSocketConfig,
 ) -> anyhow::Result<(
     tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
     tokio_tungstenite::tungstenite::handshake::client::Response,
@@ -232,6 +310,66 @@ pub async fn connect_wss(
         .map(|cert| crate::auth::tls_fingerprint(cert.as_ref()))
         .ok_or_else(|| anyhow::anyhow!("server presented no certificate"))?;
     let url = format!("wss://{addr}:{port}{path}");
-    let (ws_stream, response) = tokio_tungstenite::client_async(&url, tls_stream).await?;
+    let (ws_stream, response) = tokio_tungstenite::client_async_with_config(&url, tls_stream, Some(ws_config)).await?;
     Ok((ws_stream, response, server_fingerprint))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn old_addresses_are_remembered_after_the_current_ones() {
+        let all = certificate_names(
+            &names(&["localhost", "192.168.1.9"]),
+            &names(&["localhost", "192.168.1.5", "10.0.0.2", "ladex.local"]),
+        );
+        // Old hostnames are not carried over (they are already in `wanted` or no longer advertised).
+        assert_eq!(all, names(&["localhost", "192.168.1.9", "192.168.1.5", "10.0.0.2"]));
+    }
+
+    #[test]
+    fn remembered_addresses_are_bounded() {
+        let previous: Vec<String> = (0..100).map(|i| format!("10.0.{i}.1")).collect();
+        let all = certificate_names(&names(&["localhost"]), &previous);
+        assert_eq!(all.len(), 1 + MAX_REMEMBERED_ADDRESSES);
+    }
+
+    #[test]
+    fn fingerprints_print_like_a_browser_shows_them() {
+        assert_eq!(format_fingerprint(&[0x0a, 0xff, 0x00]), "0A:FF:00");
+    }
+
+    #[test]
+    fn a_generated_certificate_covers_every_name_and_loads() {
+        install_crypto_provider();
+        let wanted = names(&["localhost", "127.0.0.1", "ladex.local", "192.168.1.9"]);
+        let (cert, key) = generate(&wanted).unwrap();
+        assert!(build_server_config(cert, PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key))).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_private_key_is_never_group_or_world_readable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("ladex-test-{}", std::process::id()));
+        create_private_dir(&dir).unwrap();
+        let path = dir.join("key.der");
+        // A file from an older version, created too permissively.
+        std::fs::write(&path, b"old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_private(&path, b"key").unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+
+        let fresh = dir.join("fresh.der");
+        write_private(&fresh, b"key").unwrap();
+        assert_eq!(std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777, 0o600);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

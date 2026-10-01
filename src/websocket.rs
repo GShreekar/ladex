@@ -9,16 +9,42 @@
 // Phase 5: TransferDeclined — receiver signals rejection; routed back to sender.
 // ============================================================================
 
-use crate::{mesh, state};
+use crate::sessions::SessionHandle;
 use crate::types::*;
+use crate::validate;
 use crate::NodeState;
+use crate::{mesh, state};
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::mpsc;
+use std::time::Duration;
+use tokio::sync::{broadcast::error::RecvError, mpsc};
 use warp::ws::{Message, WebSocket, Ws};
 use warp::{Rejection, Reply};
 
-pub async fn websocket_handler(ws: Ws, state: NodeState) -> Result<impl Reply, Rejection> {
-    Ok(ws.on_upgrade(move |socket| handle_websocket(socket, state)))
+// Browser tabs only send small JSON control messages (the biggest are SDP
+// blobs of a few KB), so anything near this size is not a legitimate client.
+const MAX_WS_MESSAGE_BYTES: usize = 256 * 1024;
+const MAX_FILES_PER_SESSION: usize = 1000;
+
+/// Who currently holds a browser `session_id` on this node, so another
+/// connection can't take it over and act as that device.
+#[derive(Debug, Clone)]
+pub struct ConnOwner {
+    pub conn_id: u64,
+    /// Login session of the owning connection; None on a node without a passphrase.
+    pub auth_id: Option<String>,
+}
+
+struct Connection {
+    id: u64,
+    auth_id: Option<String>,
+    /// The `session_id` this connection joined as; every later message must carry it.
+    session_id: Option<SessionId>,
+    tx: PeerSender,
+}
+
+pub async fn websocket_handler(auth: Option<SessionHandle>, ws: Ws, state: NodeState) -> Result<impl Reply, Rejection> {
+    let ws = ws.max_message_size(MAX_WS_MESSAGE_BYTES).max_frame_size(MAX_WS_MESSAGE_BYTES);
+    Ok(ws.on_upgrade(move |socket| handle_websocket(socket, state, auth)))
 }
 
 // ---------------------------------------------------------------------------
@@ -26,11 +52,10 @@ pub async fn websocket_handler(ws: Ws, state: NodeState) -> Result<impl Reply, R
 // ---------------------------------------------------------------------------
 
 /// F5: the client already truncates nicknames to 40 chars, but a
-/// non-browser client (or a modified one) could send anything — cap it
-/// server-side too. Char-based, not byte-based, so this never splits a
-/// multi-byte UTF-8 sequence.
+/// non-browser client (or a modified one) could send anything — clean and
+/// cap it server-side too.
 fn cap_nickname(nickname: String) -> String {
-    nickname.chars().take(60).collect()
+    validate::clean_label(&nickname, validate::MAX_NICKNAME_CHARS)
 }
 
 pub async fn broadcast(state: &NodeState, msg: ServerMessage) {
@@ -56,10 +81,15 @@ pub async fn send_to(state: &NodeState, target: &SessionId, msg: ServerMessage) 
 // WebSocket lifecycle
 // ---------------------------------------------------------------------------
 
-pub async fn handle_websocket(ws: WebSocket, state: NodeState) {
+pub async fn handle_websocket(ws: WebSocket, state: NodeState, auth: Option<SessionHandle>) {
     let (mut ws_tx, mut ws_rx) = ws.split();
-    let mut session_id: Option<SessionId> = None;
     let (peer_tx, mut peer_rx) = mpsc::unbounded_channel::<ServerMessage>();
+    let mut conn = Connection {
+        id: state.next_connection_id(),
+        auth_id: auth.as_ref().map(|a| a.id.clone()),
+        session_id: None,
+        tx: peer_tx.clone(),
+    };
 
     let outgoing_task = tokio::spawn(async move {
         while let Some(msg) = peer_rx.recv().await {
@@ -68,26 +98,97 @@ pub async fn handle_websocket(ws: WebSocket, state: NodeState) {
         }
     });
 
-    while let Some(result) = ws_rx.next().await {
-        match result {
-            Ok(msg) => {
-                if let Ok(text) = msg.to_str() {
-                    if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(text) {
-                        if let Err(e) = handle_client_message(client_msg, &state, &mut session_id, &peer_tx).await {
-                            let _ = peer_tx.send(ServerMessage::Error { message: e.to_string() });
-                        }
-                    }
+    // The connection ends with its login session: on revocation, on logout,
+    // or when the session expires.
+    let mut ended = state.sessions.subscribe_ended();
+    let expiry = async {
+        match &auth {
+            Some(a) => tokio::time::sleep_until(tokio::time::Instant::from_std(a.expires_at)).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(expiry);
+
+    let mut signed_out = false;
+    loop {
+        tokio::select! {
+            incoming = ws_rx.next() => {
+                let Some(Ok(msg)) = incoming else { break };
+                if !still_owns_session(&state, &conn).await {
+                    break; // the same login joined again from a newer connection
+                }
+                let Ok(text) = msg.to_str() else { continue };
+                let Ok(client_msg) = serde_json::from_str::<ClientMessage>(text) else { continue };
+                if let Err(e) = handle_client_message(client_msg, &state, &mut conn).await {
+                    let _ = peer_tx.send(ServerMessage::Error { message: e.to_string() });
                 }
             }
-            Err(_) => break,
+            ended_id = ended.recv(), if conn.auth_id.is_some() => {
+                let ours = match &ended_id {
+                    Ok(id) => Some(id) == conn.auth_id.as_ref(),
+                    Err(RecvError::Lagged(_)) => !state.sessions.is_active(conn.auth_id.as_deref().unwrap_or("")),
+                    Err(RecvError::Closed) => true,
+                };
+                if ours {
+                    signed_out = true;
+                    break;
+                }
+            }
+            _ = &mut expiry => {
+                signed_out = true;
+                break;
+            }
         }
     }
 
-    if let Some(id) = &session_id {
-        { let mut s = state.local_senders.write().await; s.remove(id); }
-        cleanup_peer(&state, id).await;
+    if signed_out {
+        let _ = peer_tx.send(ServerMessage::Error { message: "This device was signed out.".to_string() });
+        tokio::time::sleep(Duration::from_millis(150)).await; // let the notice go out
+    }
+
+    if let Some(id) = &conn.session_id {
+        // A newer connection may have taken this id over; it keeps it.
+        let owned = {
+            let mut owners = state.session_owners.write().await;
+            let owned = owners.get(id).is_some_and(|o| o.conn_id == conn.id);
+            if owned { owners.remove(id); }
+            owned
+        };
+        if owned {
+            { let mut s = state.local_senders.write().await; s.remove(id); }
+            cleanup_peer(&state, id).await;
+        }
     }
     outgoing_task.abort();
+}
+
+async fn still_owns_session(state: &NodeState, conn: &Connection) -> bool {
+    match &conn.session_id {
+        None => true,
+        Some(id) => state.session_owners.read().await.get(id).is_some_and(|o| o.conn_id == conn.id),
+    }
+}
+
+/// The `session_id` a message says it comes from. Every client message carries one.
+fn claimed_session(msg: &ClientMessage) -> &SessionId {
+    match msg {
+        ClientMessage::Join { session_id, .. }
+        | ClientMessage::SetNickname { session_id, .. }
+        | ClientMessage::FileUpload { session_id, .. }
+        | ClientMessage::RequestDownload { session_id, .. }
+        | ClientMessage::FileDownloaded { session_id, .. }
+        | ClientMessage::WebRTCOffer { session_id, .. }
+        | ClientMessage::WebRTCAnswer { session_id, .. }
+        | ClientMessage::ICECandidate { session_id, .. }
+        | ClientMessage::RequestDownloadFrom { session_id, .. }
+        | ClientMessage::TransferDeclined { session_id, .. }
+        | ClientMessage::Ping { session_id }
+        | ClientMessage::TextMessage { session_id, .. }
+        | ClientMessage::FileChecksumUpdate { session_id, .. }
+        | ClientMessage::DeleteFile { session_id, .. }
+        | ClientMessage::OfferFileTo { session_id, .. }
+        | ClientMessage::DeclineFileOffer { session_id, .. } => session_id,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -97,25 +198,56 @@ pub async fn handle_websocket(ws: WebSocket, state: NodeState) {
 async fn handle_client_message(
     msg: ClientMessage,
     state: &NodeState,
-    session_id: &mut Option<SessionId>,
-    peer_tx: &PeerSender,
+    conn: &mut Connection,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // A connection acts as exactly one device: the one it joined as. Without
+    // this, any tab could send messages in another tab's name (delete its
+    // files, answer its downloads, ...) just by writing its session id.
+    if !matches!(msg, ClientMessage::Join { .. }) {
+        match &conn.session_id {
+            None => return Err("send join first".into()),
+            Some(bound) if bound != claimed_session(&msg) => return Err("session id does not match this connection".into()),
+            Some(_) => {}
+        }
+    }
+    let peer_tx = conn.tx.clone();
+    let bound = conn.session_id.clone().unwrap_or_default();
+
     match msg {
         // ── Join ─────────────────────────────────────────────────────────
         ClientMessage::Join { session_id: id, user_agent, nickname } => {
-            *session_id = Some(id.clone());
+            if !validate::is_valid_id(&id) {
+                return Err("invalid session id".into());
+            }
+            if conn.session_id.as_ref().is_some_and(|bound| *bound != id) {
+                return Err("this connection already joined as another device".into());
+            }
+            {
+                // The same login (or, on an open node, anyone) may rejoin a
+                // known id, e.g. after a reconnect; a different login may not.
+                let mut owners = state.session_owners.write().await;
+                if let Some(owner) = owners.get(&id) {
+                    let same_login = owner.auth_id == conn.auth_id;
+                    if owner.conn_id != conn.id && !same_login {
+                        return Err("that device id is already in use".into());
+                    }
+                }
+                owners.insert(id.clone(), ConnOwner { conn_id: conn.id, auth_id: conn.auth_id.clone() });
+            }
+            conn.session_id = Some(id.clone());
             { let mut s = state.local_senders.write().await; s.insert(id.clone(), peer_tx.clone()); }
 
             let peer = PeerInfo {
                 session_id: id.clone(),
                 connected_at: chrono::Utc::now(),
-                user_agent,
+                user_agent: user_agent.map(|ua| validate::clean_label(&ua, validate::MAX_USER_AGENT_CHARS)),
                 hosting_node_id: Some(state.node_id.clone()),
                 node_rtt_ms: None,
                 left: false,
                 left_at: None,
                 hosting_node_name: Some(state.node_name.clone()),
                 nickname: nickname.map(cap_nickname).filter(|n| !n.is_empty()),
+                version: state.clock.now(),
             };
 
             let peers_count = {
@@ -149,13 +281,9 @@ async fn handle_client_message(
                     Some(peer) => {
                         let nickname = cap_nickname(nickname);
                         peer.nickname = if nickname.is_empty() { None } else { Some(nickname) };
-                        // Bump connected_at so this update actually wins the
-                        // LWW comparison on other mesh nodes — merge_peers
-                        // requires a strictly newer timestamp to apply an
-                        // update, and a nickname change alone wouldn't
-                        // produce one otherwise (see BUG-08's fix for the
-                        // same principle applied to departures).
-                        peer.connected_at = chrono::Utc::now();
+                        // A new version makes this update win the merge on
+                        // other mesh nodes.
+                        peer.version = state.clock.now();
                         Some(peer.clone())
                     }
                     None => None,
@@ -168,39 +296,63 @@ async fn handle_client_message(
         }
 
         // ── File upload ───────────────────────────────────────────────────
-        // BUG-07 fix: a browser tab resends file_upload for every
-        // locally-held file after every WS reconnect (see app.js
-        // connectWebSocket()), always with `hosts: [own session_id]` since
-        // the tab only knows about itself. Treating that as a fresh upload
-        // — as a blind `files.insert()` did — replaced the whole catalog
-        // entry and wiped out every OTHER peer that had since become a
-        // host via file_downloaded, plus any sha256 computed after the
-        // original upload. If an id we already know about comes back in,
-        // this is a re-registration of the same file, not a new one: merge
-        // hosts and sha256 into the existing entry instead of replacing it.
-        ClientMessage::FileUpload { session_id: _, mut file } => {
-            let file_for_mesh = {
+        // The tab only says what the file is; the uploader, host list and
+        // timestamps are ours to fill in, so a tab can't claim someone else's
+        // file, list other devices as hosts, or backdate an entry.
+        //
+        // BUG-07 fix: a browser tab resends file_upload for every file it
+        // holds after every WS reconnect (see app.js connectWebSocket()),
+        // including files it downloaded from others. An id we already know
+        // is a re-registration, not a new file: it only adds this device as a
+        // host instead of replacing the entry, which would wipe out the other
+        // hosts and any checksum computed since.
+        ClientMessage::FileUpload { session_id: _, file: request } => {
+            let request = validate::file_request(request)?;
+            let version = state.clock.now();
+            let to_mesh: Option<FileMetadata> = {
                 let mut files = state.files.write().await;
-                if let Some(existing) = files.get_mut(&file.id) {
-                    existing.hosts.extend(file.hosts.drain());
-                    if file.sha256.is_some() {
-                        existing.sha256 = file.sha256.take();
+                match files.get_mut(&request.id) {
+                    Some(existing) if existing.deleted && existing.uploader_id != bound => None,
+                    Some(existing) => {
+                        existing.hosts.insert(bound.clone());
+                        if existing.uploader_id == bound {
+                            if request.sha256.is_some() {
+                                existing.sha256 = request.sha256;
+                            }
+                            // Only the one who shared it may share it again after unsharing.
+                            existing.deleted = false;
+                            existing.deleted_at = 0;
+                        }
+                        existing.version = version;
+                        Some(existing.clone())
                     }
-                    // A file id is only ever reused by the peer that
-                    // originally minted it re-registering it — never
-                    // treat that as resurrecting a deletion made by
-                    // someone else in the meantime.
-                    if existing.deleted {
-                        existing.deleted = false;
-                        existing.deleted_at = 0;
+                    None => {
+                        state::evict_old_tombstones(&mut files, state::MAX_CATALOG_ENTRIES);
+                        if files.len() >= state::MAX_CATALOG_ENTRIES {
+                            return Err("The shared file list is full".into());
+                        }
+                        let shared_by_session = files.values().filter(|f| !f.deleted && f.uploader_id == bound).count();
+                        if shared_by_session >= MAX_FILES_PER_SESSION {
+                            return Err("This device is sharing too many files".into());
+                        }
+                        let entry = FileMetadata {
+                            id: request.id.clone(),
+                            name: request.name,
+                            size: request.size,
+                            mime_type: request.mime_type,
+                            uploader_id: bound.clone(),
+                            hosts: [bound.clone()].into(),
+                            uploaded_at: chrono::Utc::now(),
+                            created_at: version.wall,
+                            deleted: false,
+                            deleted_at: 0,
+                            version,
+                            sha256: request.sha256,
+                            is_folder: request.is_folder,
+                        };
+                        files.insert(entry.id.clone(), entry.clone());
+                        Some(entry)
                     }
-                    existing.clone()
-                } else {
-                    if file.created_at == 0 { file.created_at = chrono::Utc::now().timestamp_millis() as u64; }
-                    file.deleted = false;
-                    file.deleted_at = 0;
-                    files.insert(file.id.clone(), file.clone());
-                    file
                 }
             };
 
@@ -209,7 +361,9 @@ async fn handle_client_message(
                 files.values().filter(|f| !f.deleted).cloned().collect()
             };
             broadcast(state, ServerMessage::FileListUpdate { files }).await;
-            state::push_file_to_mesh(&state.mesh_peers, file_for_mesh).await;
+            if let Some(file) = to_mesh {
+                state::push_file_to_mesh(&state.mesh_peers, file).await;
+            }
         }
 
         // ── Phase 6: Client-side host selection ──────────────────────────
@@ -291,13 +445,20 @@ async fn handle_client_message(
         }
 
         // ── File downloaded → register new host ──────────────────────────
-        ClientMessage::FileDownloaded { session_id: downloader_id, file_id } => {
+        ClientMessage::FileDownloaded { session_id: _, file_id } => {
             let updated_file = {
                 let mut files = state.files.write().await;
-                if let Some(file) = files.get_mut(&file_id) {
-                    file.hosts.insert(downloader_id);
-                    Some(file.clone())
-                } else { None }
+                match files.get_mut(&file_id) {
+                    Some(file) if !file.deleted => {
+                        if file.hosts.insert(bound.clone()) {
+                            file.version = state.clock.now();
+                            Some(file.clone())
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
             };
             let files: Vec<FileMetadata> = {
                 let files = state.files.read().await;
@@ -355,6 +516,7 @@ async fn handle_client_message(
 
         // ── Text messaging ────────────────────────────────────────────────
         ClientMessage::TextMessage { session_id: sender_id, content } => {
+            let content = validate::clean_message(&content).ok_or("message is empty")?;
             let now_ms = chrono::Utc::now().timestamp_millis() as u64;
             let message = TextMessage {
                 id: format!("msg_{}_{}", sender_id, now_ms),
@@ -367,7 +529,7 @@ async fn handle_client_message(
             {
                 let mut messages = state.messages.write().await;
                 messages.push(message.clone());
-                messages.sort_by_key(|m| m.created_at);
+                messages.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
                 state::prune_messages(&mut messages); // BUG-13 fix
             }
             broadcast(state, ServerMessage::TextMessage { message: message.clone() }).await;
@@ -375,15 +537,25 @@ async fn handle_client_message(
         }
 
         // ── Phase 11.3: checksum update ───────────────────────────────────
+        // Only the uploader computes the checksum, and receivers trust it to
+        // verify downloads, so nobody else may change it.
         ClientMessage::FileChecksumUpdate { session_id: _, file_id, sha256 } => {
-            // Patch the sha256 field on the existing catalog entry.
+            if !validate::is_valid_sha256(&sha256) {
+                return Err("invalid checksum".into());
+            }
             let patched: Option<FileMetadata> = {
                 let mut files = state.files.write().await;
-                if let Some(file) = files.get_mut(&file_id) {
-                    file.sha256 = Some(sha256.clone());
-                    Some(file.clone())
-                } else {
-                    None
+                match files.get_mut(&file_id) {
+                    Some(file) if file.uploader_id == bound && !file.deleted => {
+                        file.sha256 = Some(sha256.clone());
+                        file.version = state.clock.now();
+                        Some(file.clone())
+                    }
+                    Some(_) => {
+                        tracing::warn!("FileChecksumUpdate: {bound} is not the uploader of {file_id}");
+                        None
+                    }
+                    None => None,
                 }
             };
             if let Some(file) = patched {
@@ -397,7 +569,7 @@ async fn handle_client_message(
                 // Propagate updated FileMetadata to mesh peers
                 state::push_file_to_mesh(&state.mesh_peers, file).await;
             } else {
-                tracing::warn!("FileChecksumUpdate: unknown file_id {file_id}");
+                tracing::warn!("FileChecksumUpdate: ignored for {file_id}");
             }
         }
 
@@ -415,8 +587,9 @@ async fn handle_client_message(
                         None
                     }
                     Some(file) => {
+                        file.version = state.clock.now();
                         file.deleted = true;
-                        file.deleted_at = chrono::Utc::now().timestamp_millis() as u64;
+                        file.deleted_at = file.version.wall;
                         Some(file.clone())
                     }
                     None => None,
@@ -472,18 +645,19 @@ async fn cleanup_peer(state: &NodeState, session_id: &SessionId) {
         peers.len()
     };
 
-    let now_ms = chrono::Utc::now().timestamp_millis() as u64;
-    let mut tombstoned_files: Vec<FileMetadata> = Vec::new();
+    // Every file this device hosted loses a host; those left with none are
+    // tombstoned. All of them get a new version so other nodes hear about it.
+    let mut changed_files: Vec<FileMetadata> = Vec::new();
     {
         let mut files = state.files.write().await;
         for file in files.values_mut() {
-            if !file.hosts.contains(session_id) { continue; }
-            file.hosts.remove(session_id);
+            if !file.hosts.remove(session_id) { continue; }
+            file.version = state.clock.now();
             if file.hosts.is_empty() && !file.deleted {
                 file.deleted = true;
-                file.deleted_at = now_ms;
-                tombstoned_files.push(file.clone());
+                file.deleted_at = file.version.wall;
             }
+            changed_files.push(file.clone());
         }
     }
 
@@ -495,8 +669,6 @@ async fn cleanup_peer(state: &NodeState, session_id: &SessionId) {
     };
     broadcast(state, ServerMessage::FileListUpdate { files }).await;
 
-    for tombstone in tombstoned_files {
-        state::push_file_to_mesh(&state.mesh_peers, tombstone).await;
-    }
-    state::push_peer_left_to_mesh(&state.mesh_peers, session_id.clone()).await;
+    state::push_files_to_mesh(&state.mesh_peers, changed_files).await;
+    state::push_peer_left_to_mesh(&state.mesh_peers, session_id.clone(), state.clock.now()).await;
 }

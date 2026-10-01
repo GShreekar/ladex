@@ -66,7 +66,10 @@ ladex "correct horse battery staple"
 
 Other devices need the same passphrase, both to log in from a browser and to join the mesh. Devices running a different passphrase (or none) never join your mesh.
 
-The server will start on `https://localhost:8080` by default. Other devices on your network can connect using your local IP address (e.g., `https://192.168.1.100:8080`).
+The server prints two addresses:
+
+- **On this machine:** `http://localhost:8081` (the main port + 1, or `--local-port`). Browsers treat `localhost` as secure even without TLS, so there is **no certificate warning**.
+- **From other devices:** `https://192.168.1.100:8080`. Other devices' browsers warn that the certificate is self-signed. Check that the SHA-256 fingerprint in the browser's certificate details matches the one LADEX printed before you accept it. The certificate is kept between runs, so each device only needs to accept it once (it is regenerated only when this machine gets an address it doesn't cover yet).
 
 ### Authentication Flow
 
@@ -74,14 +77,17 @@ When a passphrase is set:
 1. **Server shows the passphrase**: for `-s`, the terminal prints it once
 2. **Users enter it**: first-time visitors must enter it on the login page
 3. **Throttling**: after 5 wrong guesses an address is locked out for 30 seconds, doubling with each further failure up to 1 hour. There is also a cap across all addresses, so guessing from several devices doesn't help
-4. **Session management**: Authenticated users stay logged in until server restart
-5. **Logout option**: Users can manually logout using the logout button
+4. **Per-device sessions**: every device that logs in gets its own session (24 hours, or until the node restarts). Logging out ends only that device's session
+5. **Signed-in devices**: the shield button lists the devices that are signed in. Any device can sign itself out; the machine running LADEX (opened at `http://localhost`) can sign out any of them, which also closes their open connection
 
 ### Security Model
 
 - **Mesh handshake**: nodes prove they know the passphrase with a SPAKE2 password-authenticated key exchange. The passphrase, and anything derived from it, never crosses the network, so recording traffic or discovery announcements reveals nothing that can be cracked offline. An attacker gets at most one guess per connection.
 - **Man-in-the-middle protection**: the handshake is bound to the TLS certificate each node actually connected to. Someone relaying or terminating the connection with their own certificate can't complete it without the passphrase.
 - **Wrong guesses are throttled** at both the browser login and the mesh handshake.
+- **Each browser connection is one device.** A connection can only act as the device it joined as, so one signed-in device can't delete another's files or answer another's downloads. The node, not the browser, decides who uploaded a file and who hosts it.
+- **Nothing from another device is trusted.** File names, sizes and types are cleaned on the node and again on the receiving browser (no path tricks, no look-alike extensions via invisible characters, no Windows device names). A sender can't write more data than it announced, a received folder never overwrites existing files in the folder you chose (clashes become `name (1).ext`), and a resumed download can only continue from bytes you really have.
+- **Clocks can be wrong.** Shared files and devices are ordered with logical clocks, so a device with a wrong clock can't win conflicts or bring back something that was unshared. Updates stamped more than an hour ahead of a device's clock are ignored, and LADEX warns when a peer's clock is more than two minutes off.
 - **Open mode** (no passphrase) has none of these protections. Use it only on networks you trust.
 - **`--no-tls`** turns off encryption and the man-in-the-middle protection; the passphrase itself is still never sent.
 
@@ -96,12 +102,20 @@ When a passphrase is set:
 7. **Monitor transfers** with the real-time progress indicators
 8. **Logout** when finished (passphrase mode only)
 
+## Testing
+
+```bash
+cargo test             # unit tests (merging, sessions, handshake, validation, ...)
+node --test tests/js/  # browser-side receive policy; shares test cases with the Rust side
+```
+
 ## Command Line Options
 
 ```bash
 ladex [PASSPHRASE]     # Launch with your own passphrase
 ladex -s, --secure     # Launch with a generated passphrase
 ladex                  # Launch without a passphrase (open access, prints a warning)
+ladex --local-port N   # Port for the localhost-only HTTP listener (default: port + 1)
 ```
 
 ## Build from Source

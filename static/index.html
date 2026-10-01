@@ -29,6 +29,11 @@
                         <path d="M3,11H11V3H3M3,21H11V13H3M13,21H21V13H13M13,3V11H21V3"/>
                     </svg>
                 </button>
+                <button id="sessions-btn" class="icon-btn" title="Signed-in devices" style="display: none;">
+                    <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
+                        <path d="M12,1L3,5V11C3,16.55 6.84,21.74 12,23C17.16,21.74 21,16.55 21,11V5L12,1M12,11.99H19C18.47,16.11 15.72,19.78 12,20.93V12H5V6.3L12,3.19V11.99Z"/>
+                    </svg>
+                </button>
                 <button id="logout-btn" class="icon-btn" title="Logout" style="display: none;">
                     <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
                         <path d="M17,7L15.59,8.41L18.17,11H8V13H18.17L15.59,15.59L17,17L22,12L17,7M4,5H12V3H4C2.89,3 2,3.89 2,5V19A2,2 0 0,0 4,21H12V19H4V5Z"/>
@@ -124,6 +129,18 @@
         </div>
     </div>
 
+    <!-- S5: devices signed in with the passphrase; each can be signed out separately -->
+    <div id="sessions-modal" class="modal">
+        <div class="modal-content sessions-modal">
+            <div class="modal-header">
+                <h3>Signed-in Devices</h3>
+                <button id="close-sessions" class="close-btn">&times;</button>
+            </div>
+            <p id="sessions-hint" class="sessions-hint"></p>
+            <div id="sessions-list" class="sessions-list"></div>
+        </div>
+    </div>
+
     <div id="messages-modal" class="modal">
         <div class="modal-content messages-modal">
             <div class="modal-header">
@@ -152,47 +169,8 @@
     <script src="static/jszip.min.js"></script>
     <script src="static/qrcode.js"></script>
     <script src="static/hash-wasm-sha256.js"></script>
-    <script src="static/app.js?v=13"></script>
-    <script>
-        document.addEventListener('DOMContentLoaded', function() {
-            const logoutBtn = document.getElementById('logout-btn');
-            
-            // More robust authentication check
-            console.log('Checking authentication status...');
-            fetch('/auth-status', { 
-                method: 'GET',
-                cache: 'no-cache',
-                headers: {
-                    'Cache-Control': 'no-cache'
-                }
-            })
-            .then(response => response.json())
-            .then(data => {
-                console.log('Auth check response:', data);
-                if (data.authenticated) {
-                    console.log('User is authenticated - showing logout button');
-                    logoutBtn.style.display = 'block';
-                    logoutBtn.addEventListener('click', function() {
-                        console.log('Logout button clicked');
-                        fetch('/logout', { 
-                            method: 'POST',
-                            cache: 'no-cache',
-                            headers: {
-                                'Cache-Control': 'no-cache'
-                            }
-                        }).finally(() => {
-                            console.log('Redirecting to login...');
-                            window.location.href = '/login';
-                        });
-                    });
-                } else {
-                    console.log('User not authenticated - logout button hidden');
-                }
-            })
-            .catch(error => {
-                console.log('Auth check failed:', error);
-            });
-        });
-    </script>
+    <script src="static/receive-policy.js?v=1"></script>
+    <script src="static/app.js?v=14"></script>
+    <script src="static/sessions.js?v=1"></script>
 </body>
 </html>

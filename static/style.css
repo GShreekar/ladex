@@ -1462,3 +1462,47 @@ body.drag-over::after {
     align-self: flex-start;
 }
 .banner-dismiss:hover { opacity: 1; }
+
+/* S5: signed-in devices modal */
+.sessions-modal {
+    max-width: 560px;
+    margin: 8% auto;
+    padding: 0 0 24px;
+}
+
+.sessions-hint {
+    color: rgba(120, 219, 226, 0.8);
+    font-size: 0.9em;
+    margin: 16px 24px 12px;
+}
+
+.sessions-list {
+    margin: 0 24px;
+    max-height: 50vh;
+    overflow-y: auto;
+}
+
+.session-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 0;
+    border-bottom: 1px solid rgba(120, 119, 198, 0.2);
+}
+
+.session-info {
+    min-width: 0;
+}
+
+.session-name {
+    color: #e2e8f0;
+    font-weight: 600;
+}
+
+.session-meta {
+    margin-top: 2px;
+    font-size: 0.8em;
+    color: rgba(120, 219, 226, 0.6);
+    word-break: break-word;
+}

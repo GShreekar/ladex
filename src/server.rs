@@ -2,8 +2,9 @@
 //
 // warp 0.4's own server doesn't expose the client's address to filters, and the
 // old TLS proxy in front of it hid every client behind 127.0.0.1. Serving the
-// connections ourselves lets us attach the real peer address to each request as
-// a `PeerAddr` extension, which the rate limiters need.
+// connections ourselves lets us attach the real peer address (and whether the
+// connection is TLS) to each request as a `PeerAddr` extension, which the rate
+// limiters, session management and the cookie's `Secure` flag need.
 
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
@@ -14,25 +15,47 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tower_service::Service;
+use warp::Reply;
 
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug)]
-pub struct PeerAddr(pub SocketAddr);
+pub struct PeerAddr {
+    pub addr: SocketAddr,
+    pub tls: bool,
+}
 
 // Key used for rate limiting; requests without an address share one bucket.
 pub fn peer_ip(peer: Option<PeerAddr>) -> IpAddr {
-    peer.map(|p| p.0.ip()).unwrap_or(IpAddr::from([0, 0, 0, 0]))
+    peer.map(|p| p.addr.ip()).unwrap_or(IpAddr::from([0, 0, 0, 0]))
 }
 
-pub async fn serve<S>(addr: SocketAddr, tls: Option<TlsAcceptor>, routes: S) -> anyhow::Result<()>
+pub fn is_tls(peer: Option<PeerAddr>) -> bool {
+    peer.is_some_and(|p| p.tls)
+}
+
+// Requests whose Host header isn't one of these are refused. Needed on the
+// plain-HTTP loopback listener: without TLS, a web page on another site could
+// point its own domain at 127.0.0.1 (DNS rebinding) and talk to this node as
+// if it were same-origin. Its Host header would still be that other domain.
+pub type AllowedHosts = Vec<String>;
+
+fn host_allowed(allowed: &AllowedHosts, host: Option<&hyper::header::HeaderValue>) -> bool {
+    host.and_then(|h| h.to_str().ok()).is_some_and(|h| allowed.iter().any(|a| a.eq_ignore_ascii_case(h)))
+}
+
+pub async fn serve<S>(
+    listener: TcpListener,
+    tls: Option<TlsAcceptor>,
+    allowed_hosts: Option<AllowedHosts>,
+    routes: S,
+) -> anyhow::Result<()>
 where
     S: Service<hyper::Request<Incoming>, Response = warp::reply::Response, Error = Infallible> + Clone + Send + 'static,
     S::Future: Send,
 {
-    let listener = TcpListener::bind(addr).await?;
-    tracing::info!("Serving on {addr} ({})", if tls.is_some() { "TLS" } else { "plain HTTP" });
+    tracing::info!("Serving on {} ({})", listener.local_addr()?, if tls.is_some() { "TLS" } else { "plain HTTP" });
 
     loop {
         let (tcp, peer) = match listener.accept().await {
@@ -45,12 +68,22 @@ where
         let _ = tcp.set_nodelay(true);
         let tls = tls.clone();
         let routes = routes.clone();
+        let allowed_hosts = allowed_hosts.clone();
+        let is_tls = tls.is_some();
 
         tokio::spawn(async move {
             let service = hyper::service::service_fn(move |mut req: hyper::Request<Incoming>| {
-                req.extensions_mut().insert(PeerAddr(peer));
+                req.extensions_mut().insert(PeerAddr { addr: peer, tls: is_tls });
                 let mut routes = routes.clone();
-                async move { routes.call(req).await }
+                let allowed_hosts = allowed_hosts.clone();
+                async move {
+                    if let Some(allowed) = &allowed_hosts {
+                        if !host_allowed(allowed, req.headers().get(hyper::header::HOST)) {
+                            return Ok(warp::reply::with_status("Unexpected Host header", hyper::StatusCode::MISDIRECTED_REQUEST).into_response());
+                        }
+                    }
+                    routes.call(req).await
+                }
             });
             let mut http = hyper::server::conn::http1::Builder::new();
             http.timer(TokioTimer::new()).header_read_timeout(HEADER_READ_TIMEOUT);
@@ -76,5 +109,36 @@ where
                 tracing::debug!("Connection with {peer} ended: {e}");
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hyper::header::HeaderValue;
+
+    fn allowed() -> AllowedHosts {
+        vec!["localhost:8081".into(), "127.0.0.1:8081".into()]
+    }
+
+    #[test]
+    fn only_listed_hosts_pass() {
+        let ok = HeaderValue::from_static("localhost:8081");
+        let upper = HeaderValue::from_static("LOCALHOST:8081");
+        let rebinding = HeaderValue::from_static("attacker.example:8081");
+        let wrong_port = HeaderValue::from_static("localhost:9999");
+        assert!(host_allowed(&allowed(), Some(&ok)));
+        assert!(host_allowed(&allowed(), Some(&upper)));
+        assert!(!host_allowed(&allowed(), Some(&rebinding)));
+        assert!(!host_allowed(&allowed(), Some(&wrong_port)));
+        assert!(!host_allowed(&allowed(), None));
+    }
+
+    #[test]
+    fn requests_without_a_peer_share_one_rate_limit_bucket() {
+        assert_eq!(peer_ip(None), IpAddr::from([0, 0, 0, 0]));
+        let peer = PeerAddr { addr: "192.168.1.5:50000".parse().unwrap(), tls: true };
+        assert_eq!(peer_ip(Some(peer)), IpAddr::from([192, 168, 1, 5]));
+        assert!(is_tls(Some(peer)) && !is_tls(None));
     }
 }

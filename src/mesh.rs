@@ -13,6 +13,7 @@
 use crate::types::*;
 use crate::auth::{Pake, Role, Transcript};
 use crate::server::{peer_ip, PeerAddr};
+use crate::validate;
 use crate::{state, NodeState};
 
 use futures_util::stream::SplitStream;
@@ -28,13 +29,20 @@ use warp::{Rejection, Reply};
 
 // v2: the passphrase hash is gone from Hello and discovery; peers authenticate
 // with a SPAKE2 exchange instead.
-pub const PROTOCOL_VERSION: u32 = 2;
+// v3: catalog and peer entries are ordered by hybrid-logical-clock `version`
+// instead of wall-clock time, and the handshake carries each side's clock.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 // Phase 10 timing constants
 const HEARTBEAT_INTERVAL:  Duration = Duration::from_secs(5);
 const HEARTBEAT_TIMEOUT:   Duration = Duration::from_secs(15);
 const RECONNECT_GIVE_UP:   Duration = Duration::from_secs(600); // 10 min
 const HANDSHAKE_TIMEOUT:   Duration = Duration::from_secs(10);
+// Mesh messages are full catalog / chat snapshots, so allow far more than a
+// browser tab may send, but not the library default of 64 MiB.
+const MAX_MESH_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+// Clocks further apart than this are reported at handshake time.
+const CLOCK_SKEW_WARN_MS: i64 = 2 * 60 * 1000;
 
 // Rejection reasons the dialing side treats as authentication failures and
 // backs off from, rather than retrying every few seconds.
@@ -90,6 +98,9 @@ pub enum MeshMessage {
         secured:          bool,
         /// Hex SPAKE2 message (client side).
         pake:             String,
+        /// Sender's wall clock (ms since the epoch), to spot badly set clocks.
+        #[serde(default)]
+        now_ms:           u64,
         /// BUG-10 fix: the sender's own HTTP/mesh listening port. An
         /// inbound connection only reveals the *ephemeral* source port of
         /// the TCP connection the peer dialed with — not the port its own
@@ -121,6 +132,8 @@ pub enum MeshMessage {
         /// Hex server proof over the handshake transcript; empty when rejected.
         #[serde(default)]
         proof:     String,
+        #[serde(default)]
+        now_ms:    u64,
     },
     /// Client's proof that it derived the same key; the server registers the
     /// peer only after verifying it.
@@ -151,6 +164,19 @@ pub enum MeshMessage {
 // ---------------------------------------------------------------------------
 // Public helpers
 // ---------------------------------------------------------------------------
+
+/// Tell the user when an authenticated peer's clock is far from ours.
+async fn note_clock_skew(state: &NodeState, peer_name: &str, peer_now_ms: u64) {
+    if peer_now_ms == 0 {
+        return;
+    }
+    let skew_ms = peer_now_ms as i64 - crate::hlc::wall_clock_ms() as i64;
+    if skew_ms.abs() > CLOCK_SKEW_WARN_MS {
+        let direction = if skew_ms > 0 { "ahead of" } else { "behind" };
+        let problem = format!("its clock is {} {direction} this device's", crate::hlc::describe_ms(skew_ms.unsigned_abs()));
+        state::report_clock_problem(state, peer_name, &problem).await;
+    }
+}
 
 /// Remove a peer from mesh_peers and run Phase 10 state cleanup.
 pub async fn remove_mesh_peer(state: &NodeState, peer_node_id: &NodeId) {
@@ -184,6 +210,7 @@ async fn peer_departed_cleanup(state: &NodeState, departed_node_id: &NodeId) {
                 peer.node_rtt_ms = None;
                 peer.left = true;
                 peer.left_at = Some(now);
+                peer.version = state.clock.now();
                 changed.push(peer.clone());
             }
         }
@@ -205,7 +232,6 @@ async fn peer_departed_cleanup(state: &NodeState, departed_node_id: &NodeId) {
     // Tombstone files whose only remaining host session belongs to the departed node.
     // We can't perfectly know which sessions belonged to which node here (sessions
     // are purged on WS disconnect), but we mark files whose host set is now empty.
-    let now_ms = chrono::Utc::now().timestamp_millis() as u64;
     let tombstoned: Vec<FileMetadata> = {
         let mut files = state.files.write().await;
         let mut ts = Vec::new();
@@ -215,16 +241,15 @@ async fn peer_departed_cleanup(state: &NodeState, departed_node_id: &NodeId) {
             // (In a real multi-node scenario sessions for the departed node
             //  were already cleaned up by cleanup_peer in websocket.rs.)
             if file.hosts.is_empty() {
+                file.version = state.clock.now();
                 file.deleted = true;
-                file.deleted_at = now_ms;
+                file.deleted_at = file.version.wall;
                 ts.push(file.clone());
             }
         }
         ts
     };
-    for ts_file in tombstoned {
-        state::push_file_to_mesh(&state.mesh_peers, ts_file).await;
-    }
+    state::push_files_to_mesh(&state.mesh_peers, tombstoned).await;
 
     // Refresh local tab file list
     let files: Vec<FileMetadata> = {
@@ -354,6 +379,7 @@ pub fn spawn_heartbeat(
 
 pub async fn mesh_ws_handler(ws: Ws, peer: Option<PeerAddr>, state: NodeState) -> Result<impl Reply, Rejection> {
     let remote_ip = peer_ip(peer);
+    let ws = ws.max_message_size(MAX_MESH_MESSAGE_BYTES).max_frame_size(MAX_MESH_MESSAGE_BYTES);
     Ok(ws.on_upgrade(move |socket| handle_inbound(socket, remote_ip, state)))
 }
 
@@ -388,7 +414,10 @@ async fn handle_inbound(ws: WebSocket, remote_ip: IpAddr, state: NodeState) {
             Ok((pake, proof)) => (true, None, pake, proof),
             Err(reason) => (false, Some(reason), String::new(), String::new()),
         };
-        let ack = MeshMessage::HelloAck { accepted, reason, node_id: state.node_id.clone(), node_name, pake, proof };
+        let ack = MeshMessage::HelloAck {
+            accepted, reason, node_id: state.node_id.clone(), node_name, pake, proof,
+            now_ms: crate::hlc::wall_clock_ms(),
+        };
         let json = serde_json::to_string(&ack).unwrap_or_default();
         let _ = ws_tx.send(Message::text(json)).await;
     }
@@ -403,12 +432,14 @@ async fn handle_inbound(ws: WebSocket, remote_ip: IpAddr, state: NodeState) {
         }
     };
 
-    let (peer_node_id, peer_node_name, peer_protocol_version, peer_secured, peer_pake, peer_http_port, peer_ip) =
+    let (peer_node_id, peer_node_name, peer_protocol_version, peer_secured, peer_pake, peer_http_port, peer_ip, peer_now_ms) =
         match recv_handshake_message(&mut ws_rx).await {
-            Some(MeshMessage::Hello { node_id, node_name, protocol_version, secured, pake, http_port, ip }) =>
-                (node_id, node_name, protocol_version, secured, pake, http_port, ip),
+            Some(MeshMessage::Hello { node_id, node_name, protocol_version, secured, pake, http_port, ip, now_ms }) =>
+                (node_id, node_name, protocol_version, secured, pake, http_port, ip, now_ms),
             _ => return,
         };
+    // Names come from the peer; keep them short and printable before they are stored or shown.
+    let peer_node_name = validate::clean_label(&peer_node_name, validate::MAX_NODE_NAME_CHARS);
 
     if peer_node_id == state.node_id {
         send_ack(&mut ws_tx, &state, our_node_name, Err("self-connection rejected".into())).await;
@@ -454,6 +485,7 @@ async fn handle_inbound(ws: WebSocket, remote_ip: IpAddr, state: NodeState) {
         return;
     }
     state.mesh_limiter.succeed(remote_ip, ticket);
+    note_clock_skew(&state, &peer_node_name, peer_now_ms).await;
 
     // The peer may have connected to us in the meantime, from its own dial.
     if state.mesh_peers.read().await.contains_key(&peer_node_id) {
@@ -504,6 +536,14 @@ type MeshSource = std::pin::Pin<Box<dyn futures_util::Stream<
     Item = Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>,
 > + Send>>;
 
+fn mesh_ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+        max_message_size: Some(MAX_MESH_MESSAGE_BYTES),
+        max_frame_size: Some(MAX_MESH_MESSAGE_BYTES),
+        ..Default::default()
+    }
+}
+
 pub async fn connect_to_peer(addr: IpAddr, http_port: u16, state: NodeState) -> anyhow::Result<()> {
     let tls_client_config = state.tls_client_config.clone();
     let url = format!("{}://{addr}:{http_port}/mesh", if tls_client_config.is_some() { "wss" } else { "ws" });
@@ -513,13 +553,13 @@ pub async fn connect_to_peer(addr: IpAddr, http_port: u16, state: NodeState) -> 
     // has nothing to bind to and a man in the middle can't be ruled out.
     let (mut tt_tx, mut tt_rx, server_fingerprint): (MeshSink, MeshSource, Vec<u8>) =
         if let Some(client_config) = tls_client_config {
-            let (ws_stream, _, fingerprint) = crate::tls::connect_wss(addr, http_port, "/mesh", client_config)
+            let (ws_stream, _, fingerprint) = crate::tls::connect_wss(addr, http_port, "/mesh", client_config, mesh_ws_config())
                 .await
                 .map_err(|e| anyhow::anyhow!("WSS connect to {url} failed: {e}"))?;
             let (tx, rx) = ws_stream.split();
             (Box::pin(tx), Box::pin(rx), fingerprint)
         } else {
-            let (ws_stream, _) = tokio_tungstenite::connect_async(&url)
+            let (ws_stream, _) = tokio_tungstenite::connect_async_with_config(&url, Some(mesh_ws_config()), false)
                 .await
                 .map_err(|e| anyhow::anyhow!("WS connect to {url} failed: {e}"))?;
             let (tx, rx) = ws_stream.split();
@@ -536,18 +576,19 @@ pub async fn connect_to_peer(addr: IpAddr, http_port: u16, state: NodeState) -> 
         protocol_version: PROTOCOL_VERSION,
         secured:          state.passphrase.is_some(),
         pake:             hex::encode(&client_pake),
+        now_ms:           crate::hlc::wall_clock_ms(),
         http_port:        state.http_port,
         ip:               state.local_ip.map(|ip| ip.to_string()).unwrap_or_default(),
     };
     tt_tx.send(tokio_tungstenite::tungstenite::Message::Text(serde_json::to_string(&hello)?)).await?;
 
-    let (peer_node_id, peer_node_name, server_pake, server_proof) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+    let (peer_node_id, peer_node_name, server_pake, server_proof, server_now_ms) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
         loop {
             match tt_rx.next().await {
                 Some(Ok(msg)) if msg.is_text() => {
                     return match serde_json::from_str::<MeshMessage>(msg.to_text().unwrap_or("")) {
-                        Ok(MeshMessage::HelloAck { accepted: true, node_id, node_name, pake, proof, .. }) =>
-                            Ok((node_id, node_name, pake, proof)),
+                        Ok(MeshMessage::HelloAck { accepted: true, node_id, node_name, pake, proof, now_ms, .. }) =>
+                            Ok((node_id, node_name, pake, proof, now_ms)),
                         Ok(MeshMessage::HelloAck { accepted: false, reason, .. }) => {
                             let reason = reason.unwrap_or_default();
                             let msg = format!("Peer {url} rejected Hello: {reason}");
@@ -587,6 +628,8 @@ pub async fn connect_to_peer(addr: IpAddr, http_port: u16, state: NodeState) -> 
     let confirm = MeshMessage::HelloConfirm { proof: hex::encode(key.prove(Role::Client, &transcript)) };
     tt_tx.send(tokio_tungstenite::tungstenite::Message::Text(serde_json::to_string(&confirm)?)).await?;
     tracing::info!("Mesh: {url} authenticated (peer: {peer_node_id})");
+    let peer_node_name = validate::clean_label(&peer_node_name, validate::MAX_NODE_NAME_CHARS);
+    note_clock_skew(&state, &peer_node_name, server_now_ms).await;
 
     if state.mesh_peers.read().await.contains_key(&peer_node_id) {
         tracing::warn!("Mesh: duplicate after handshake with {peer_node_id} — dropping");
@@ -799,11 +842,11 @@ async fn dispatch(msg: &MeshMessage, from_node_id: &NodeId, state: &NodeState) {
         // ── Phase 4: state sync ──────────────────────────────────────────
         MeshMessage::CatalogSync { files } => {
             tracing::debug!("Mesh CatalogSync from {from_node_id}: {} file(s)", files.len());
-            state::apply_catalog_sync(state, files.clone()).await;
+            state::apply_catalog_sync(state, files.clone(), from_node_id).await;
         }
         MeshMessage::PeerSync { peers } => {
             tracing::debug!("Mesh PeerSync from {from_node_id}: {} peer(s)", peers.len());
-            state::apply_peer_sync(state, peers.clone()).await;
+            state::apply_peer_sync(state, peers.clone(), from_node_id).await;
         }
         MeshMessage::ChatSync { messages } => {
             tracing::debug!("Mesh ChatSync from {from_node_id}: {} message(s)", messages.len());
@@ -824,47 +867,31 @@ async fn dispatch(msg: &MeshMessage, from_node_id: &NodeId, state: &NodeState) {
         //      local browser tab identified by `to_session_id` inside payload.
         //   B) to_node_id != our node_id  → forward to mesh_peers[to_node_id].
         MeshMessage::SignalRelay { to_node_id, from_node_id: from, payload } => {
-            if to_node_id == &state.node_id {
-                // Deliver to local browser tab.
-                // The payload IS a ServerMessage (webrtc_offer/answer/ice_candidate).
-                // Extract the target session_id from the payload's from_session_id
-                // field, then route via local_senders.
-                //
-                // The recipient tab is keyed by its own session_id, NOT from_session_id.
-                // We use the `to_session_id` field we embed when building SignalRelay
-                // (see websocket.rs route_signal_to_mesh).
-                let to_session_id = payload
-                    .get("to_session_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-
-                if let Some(sid) = to_session_id {
-                    let senders = state.local_senders.read().await;
-                    if let Some(sender) = senders.get(&sid) {
-                        // Deliver the inner ServerMessage JSON as-is
-                        // by deserializing from the payload value.
-                        match serde_json::from_value::<ServerMessage>(payload.clone()) {
-                            Ok(srv_msg) => { let _ = sender.send(srv_msg); }
-                            Err(e) => tracing::warn!("SignalRelay: bad payload for tab {sid}: {e}"),
-                        }
-                    } else {
-                        tracing::warn!("SignalRelay: no local tab {sid}");
-                    }
-                } else {
-                    tracing::warn!("SignalRelay to us but payload has no to_session_id");
+            // The mesh is one hop, so the relay's sender is the peer on this
+            // connection, and it is only ever addressed to us.
+            if from != from_node_id || to_node_id != &state.node_id {
+                tracing::warn!("SignalRelay from {from_node_id} with mismatched addressing — dropped");
+                return;
+            }
+            let Some(sid) = payload.get("to_session_id").and_then(|v| v.as_str()).map(String::from) else {
+                tracing::warn!("SignalRelay to us but payload has no to_session_id");
+                return;
+            };
+            let srv_msg = match serde_json::from_value::<ServerMessage>(payload.clone()) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!("SignalRelay: bad payload for tab {sid}: {e}");
+                    return;
                 }
-            } else {
-                // Forward one hop to the target node
-                let peers = state.mesh_peers.read().await;
-                if let Some(peer) = peers.get(to_node_id) {
-                    let _ = peer.sender.send(MeshMessage::SignalRelay {
-                        to_node_id:   to_node_id.clone(),
-                        from_node_id: from.clone(),
-                        payload:      payload.clone(),
-                    });
-                } else {
-                    tracing::warn!("SignalRelay: no mesh peer {to_node_id} — signal dropped");
-                }
+            };
+            if !relay_is_legitimate(state, &srv_msg, from_node_id).await {
+                tracing::warn!("SignalRelay from {from_node_id} refused: not a signaling message from one of its own devices");
+                return;
+            }
+            let senders = state.local_senders.read().await;
+            match senders.get(&sid) {
+                Some(sender) => { let _ = sender.send(srv_msg); }
+                None => tracing::warn!("SignalRelay: no local tab {sid}"),
             }
         }
 
@@ -878,6 +905,24 @@ async fn dispatch(msg: &MeshMessage, from_node_id: &NodeId, state: &NodeState) {
             tracing::warn!("Mesh: unexpected Hello/HelloAck mid-session from {from_node_id}");
         }
     }
+}
+
+/// A relay may only carry WebRTC signaling and download/offer requests, and
+/// the device it says it is from must really be hosted by the sending node.
+/// Without this a peer could push any message (fake file lists, errors,
+/// offers "from" someone else) straight into a user's browser tab.
+async fn relay_is_legitimate(state: &NodeState, msg: &ServerMessage, sender_node: &NodeId) -> bool {
+    let claimed_from = match msg {
+        ServerMessage::WebRTCOffer { from_session_id, .. }
+        | ServerMessage::WebRTCAnswer { from_session_id, .. }
+        | ServerMessage::ICECandidate { from_session_id, .. }
+        | ServerMessage::IncomingFileOffer { from_session_id, .. }
+        | ServerMessage::FileOfferDeclined { from_session_id, .. } => from_session_id,
+        ServerMessage::DownloadRequest { requester_session_id, .. } => requester_session_id,
+        _ => return false,
+    };
+    let peers = state.local_peers.read().await;
+    peers.get(claimed_from).is_some_and(|p| !p.left && p.hosting_node_id.as_ref() == Some(sender_node))
 }
 
 // ---------------------------------------------------------------------------
@@ -955,3 +1000,69 @@ pub async fn route_signal(
 // Utility
 // ---------------------------------------------------------------------------
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn node_with_device(device: &str, hosted_by: &str, left: bool) -> NodeState {
+        let state = NodeState::for_tests(None);
+        state.local_peers.write().await.insert(
+            device.to_string(),
+            PeerInfo {
+                session_id: device.to_string(),
+                connected_at: chrono::Utc::now(),
+                user_agent: None,
+                hosting_node_id: Some(hosted_by.to_string()),
+                node_rtt_ms: None,
+                left,
+                left_at: None,
+                hosting_node_name: None,
+                nickname: None,
+                version: Default::default(),
+            },
+        );
+        state
+    }
+
+    fn offer(from: &str) -> ServerMessage {
+        ServerMessage::WebRTCOffer { from_session_id: from.into(), sdp: "{}".into() }
+    }
+
+    #[tokio::test]
+    async fn a_relay_from_a_device_the_sending_node_hosts_is_allowed() {
+        let state = node_with_device("peer_x", "node_other", false).await;
+        let sender = "node_other".to_string();
+        assert!(relay_is_legitimate(&state, &offer("peer_x"), &sender).await);
+        let request = ServerMessage::DownloadRequest { file_id: "f".into(), requester_session_id: "peer_x".into(), resume_from_bytes: None };
+        assert!(relay_is_legitimate(&state, &request, &sender).await);
+    }
+
+    #[tokio::test]
+    async fn a_node_cannot_relay_in_the_name_of_a_device_hosted_elsewhere() {
+        let state = node_with_device("peer_x", "node_honest", false).await;
+        assert!(!relay_is_legitimate(&state, &offer("peer_x"), &"node_evil".to_string()).await);
+        assert!(!relay_is_legitimate(&state, &offer("peer_unknown"), &"node_honest".to_string()).await);
+    }
+
+    #[tokio::test]
+    async fn a_device_that_has_left_cannot_be_relayed_for() {
+        let state = node_with_device("peer_x", "node_other", true).await;
+        assert!(!relay_is_legitimate(&state, &offer("peer_x"), &"node_other".to_string()).await);
+    }
+
+    #[tokio::test]
+    async fn only_signaling_messages_may_be_relayed_into_a_browser_tab() {
+        let state = node_with_device("peer_x", "node_other", false).await;
+        let sender = "node_other".to_string();
+        for forged in [
+            ServerMessage::FileListUpdate { files: vec![] },
+            ServerMessage::Error { message: "your session expired, log in at evil.example".into() },
+            ServerMessage::FileRemoved { file_id: "f".into() },
+            ServerMessage::PeerSync { peers: vec![] },
+            ServerMessage::MessageHistory { messages: vec![] },
+        ] {
+            assert!(!relay_is_legitimate(&state, &forged, &sender).await, "{forged:?}");
+        }
+    }
+}

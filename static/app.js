@@ -423,10 +423,23 @@ class LADEXApp {
         this.ws.onclose = () => {
             console.log('WS disconnected — reconnecting in 3 s');
             this.updateConnectionStatus(false);
-            setTimeout(() => this.connectWebSocket(), 3000);
+            setTimeout(() => this._reconnectOrSignIn(), 3000);
         };
 
         this.ws.onerror = (err) => console.error('WS error:', err);
+    }
+
+    // Reconnect, unless this device was signed out (or the node restarted and
+    // forgot its sessions): the node would just refuse, so go to the login page.
+    async _reconnectOrSignIn() {
+        try {
+            const status = await (await fetch('/auth-status', { cache: 'no-cache' })).json();
+            if (status.auth_required && !status.authenticated) {
+                window.location.href = '/login';
+                return;
+            }
+        } catch (_) { /* node unreachable — fall through and retry */ }
+        this.connectWebSocket();
     }
 
     sendWS(msg) {
@@ -1501,18 +1514,29 @@ class LADEXApp {
         dc.onmessage = (event) => {
             if (!headerHandled) {
                 headerHandled = true;
-                let meta;
+                let raw;
                 try {
-                    meta = JSON.parse(event.data);
+                    raw = JSON.parse(event.data);
                 } catch {
                     console.error('Invalid file header in consent flow');
+                    this.closeRTC(fromPeerId);
+                    return;
+                }
+                // The sender chose every field of this header, so nothing below
+                // uses it directly: `meta` is the cleaned copy (safe names, plain
+                // integers for sizes and counts), or null if the header is unusable.
+                const isFolder = !!raw && raw.kind === 'folder-manifest';
+                const meta = isFolder ? LadexPolicy.parseFolderManifest(raw) : LadexPolicy.parseFileHeader(raw);
+                if (!meta) {
+                    console.error('Rejected an invalid transfer header from', fromPeerId);
+                    this.toast('Rejected a transfer with an invalid header.', 'error');
                     this.closeRTC(fromPeerId);
                     return;
                 }
                 // F6: a folder manifest looks nothing like a single-file
                 // header — dispatch to its own consent dialog. Folders
                 // aren't offer-able via F3 yet, so no pre-accept bypass here.
-                if (meta.kind === 'folder-manifest') {
+                if (isFolder) {
                     this._showFolderConsentDialog(meta, fromPeerId, dc);
                     return;
                 }
@@ -1539,6 +1563,16 @@ class LADEXApp {
         } else {
             this.setupReceiverDC(dc, fromPeerId, meta);
         }
+    }
+
+    /** Drop a transfer whose sender broke the rules, and tell the user why. */
+    _rejectTransfer(fromPeerId, fileId, message) {
+        console.warn('Rejected transfer', fileId, 'from', fromPeerId, '—', message);
+        this.toast(message, 'error', 8000);
+        this.hideProgress(`dl:${fileId}`);
+        this.pendingDownloads.delete(fileId);
+        this._resumeState.delete(fileId);
+        this.closeRTC(fromPeerId);
     }
 
     /**
@@ -1698,7 +1732,18 @@ class LADEXApp {
             dir = await dir.getDirectoryHandle(parts[i], { create: true });
         }
         const leaf = parts[parts.length - 1] || 'unnamed';
-        return dir.getFileHandle(leaf, { create: true });
+        // A received folder never replaces anything already in the folder the
+        // user picked: on a name clash the new file becomes "name (1).ext".
+        for (let n = 0; n <= 100; n++) {
+            const candidate = n === 0 ? leaf : LadexPolicy.numberedName(leaf, n);
+            try {
+                await dir.getFileHandle(candidate);
+            } catch (err) {
+                if (err.name === 'NotFoundError') return dir.getFileHandle(candidate, { create: true });
+                if (err.name !== 'TypeMismatchError') throw err;
+            }
+        }
+        throw new Error(`too many files named ${leaf}`);
     }
 
     /** Streams each file in the folder straight to disk via FSAA — bounded
@@ -1728,12 +1773,21 @@ class LADEXApp {
         let currentFile = null; // { relativePath, size, received, writable }
         const startTime = Date.now();
         let chain = Promise.resolve();
+        // No more files or bytes than the manifest announced, and no file
+        // longer than its own header said.
+        const budget = new LadexPolicy.FolderBudget(meta.totalFiles, meta.totalBytes);
 
         const finishCurrentFile = async () => {
             if (currentFile?.writable) {
                 try { await currentFile.writable.close(); } catch (_) { /* best-effort */ }
             }
             currentFile = null;
+        };
+
+        const abortFolder = async (reason) => {
+            transferComplete = true;
+            await finishCurrentFile();
+            this._rejectTransfer(fromPeerId, meta.folderId, `Folder transfer stopped: the sender ${reason}.`);
         };
 
         const onMessage = (event) => {
@@ -1746,13 +1800,18 @@ class LADEXApp {
 
                     if (msg.kind === 'file-header') {
                         await finishCurrentFile();
+                        const entry = LadexPolicy.parseFolderEntryHeader(msg);
+                        if (!entry || !budget.startFile(entry.size)) {
+                            await abortFolder(entry ? budget.violation : 'sent an invalid file header');
+                            return;
+                        }
                         try {
-                            const fileHandle = await this._resolveFolderFileHandle(dirHandle, msg.relativePath);
+                            const fileHandle = await this._resolveFolderFileHandle(dirHandle, entry.relativePath);
                             const writable = await fileHandle.createWritable();
-                            currentFile = { relativePath: msg.relativePath, size: msg.size, received: 0, writable };
+                            currentFile = { relativePath: entry.relativePath, size: entry.size, received: 0, writable };
                         } catch (err) {
-                            console.error(`Could not open ${msg.relativePath} for writing:`, err);
-                            currentFile = { relativePath: msg.relativePath, size: msg.size, received: 0, writable: null };
+                            console.error(`Could not open ${entry.relativePath} for writing:`, err);
+                            currentFile = { relativePath: entry.relativePath, size: entry.size, received: 0, writable: null };
                         }
                     } else if (msg.kind === 'folder-done') {
                         await finishCurrentFile();
@@ -1768,15 +1827,21 @@ class LADEXApp {
 
                 // Binary chunk for whichever file is currently open
                 if (!currentFile) return; // out-of-protocol — ignore defensively
-                if (currentFile.writable) {
+                const keep = budget.accept(event.data.byteLength);
+                const data = keep < event.data.byteLength ? event.data.slice(0, keep) : event.data;
+                if (currentFile.writable && data.byteLength > 0) {
                     try {
-                        await currentFile.writable.write(event.data);
+                        await currentFile.writable.write(data);
                     } catch (err) {
                         console.error(`Write error for ${currentFile.relativePath}:`, err);
                     }
                 }
-                currentFile.received += event.data.byteLength;
-                totalReceived += event.data.byteLength;
+                currentFile.received += data.byteLength;
+                totalReceived += data.byteLength;
+                if (budget.violation) {
+                    await abortFolder(budget.violation);
+                    return;
+                }
                 if (currentFile.received >= currentFile.size) filesCompleted++;
 
                 const pct = Math.round((totalReceived / meta.totalBytes) * 100);
@@ -1843,6 +1908,7 @@ class LADEXApp {
         let transferComplete = false;
         let currentFile = null; // { relativePath, size, received, chunks }
         const startTime = Date.now();
+        const budget = new LadexPolicy.FolderBudget(meta.totalFiles, meta.totalBytes);
 
         const finishCurrentFile = () => {
             if (currentFile) {
@@ -1860,7 +1926,16 @@ class LADEXApp {
 
                 if (msg.kind === 'file-header') {
                     finishCurrentFile();
-                    currentFile = { relativePath: msg.relativePath, size: msg.size, received: 0, chunks: [] };
+                    // The path becomes an entry name inside the zip we hand the
+                    // user, so it must not be able to climb out when extracted.
+                    const entry = LadexPolicy.parseFolderEntryHeader(msg);
+                    if (!entry || !budget.startFile(entry.size)) {
+                        transferComplete = true;
+                        this._rejectTransfer(fromPeerId, meta.folderId,
+                            `Folder transfer stopped: the sender ${entry ? budget.violation : 'sent an invalid file header'}.`);
+                        return;
+                    }
+                    currentFile = { relativePath: entry.relativePath, size: entry.size, received: 0, chunks: [] };
                 } else if (msg.kind === 'folder-done') {
                     finishCurrentFile();
                     transferComplete = true;
@@ -1870,9 +1945,16 @@ class LADEXApp {
             }
 
             if (!currentFile) return;
-            currentFile.chunks.push(event.data);
-            currentFile.received += event.data.byteLength;
-            totalReceived += event.data.byteLength;
+            const keep = budget.accept(event.data.byteLength);
+            const data = keep < event.data.byteLength ? event.data.slice(0, keep) : event.data;
+            currentFile.chunks.push(data);
+            currentFile.received += data.byteLength;
+            totalReceived += data.byteLength;
+            if (budget.violation) {
+                transferComplete = true;
+                this._rejectTransfer(fromPeerId, meta.folderId, `Folder transfer stopped: the sender ${budget.violation}.`);
+                return;
+            }
             if (currentFile.received >= currentFile.size) filesCompleted++;
 
             const pct = Math.round((totalReceived / meta.totalBytes) * 100);
@@ -2031,6 +2113,12 @@ class LADEXApp {
     async _setupFSAAReceive(dc, meta, fromPeerId) {
         const cached = this._resumeState.get(meta.fileId);
         const isResume = !!(cached?.fileHandle && meta.resumeFromBytes > 0);
+        // The sender may only continue from bytes we really have.
+        if ((meta.resumeFromBytes > 0 && !isResume) ||
+                !LadexPolicy.resumeOffsetOk(meta.resumeFromBytes, cached?.bytesReceived, meta.fileSize)) {
+            this._rejectTransfer(fromPeerId, meta.fileId, 'The sender tried to resume a download from data we do not have.');
+            return;
+        }
 
         let fileHandle;
         if (isResume) {
@@ -2083,6 +2171,7 @@ class LADEXApp {
         }
 
         let receivedBytes = isResume ? meta.resumeFromBytes : 0;
+        const budget = new LadexPolicy.ByteBudget(meta.fileSize, receivedBytes);
         const startTime = Date.now();
         let transferComplete = false;
         // BUG-12 fix: keyed by fileId (not fileId+peer) — a retry can pick
@@ -2098,10 +2187,14 @@ class LADEXApp {
         // and the DC’s JS buffer can’t grow unboundedly.
         let writeChain = Promise.resolve();
 
-        const onChunk = (chunk) => {
+        const onChunk = (incoming) => {
             // Chain writes — each write waits for the previous one
             writeChain = writeChain.then(async () => {
                 if (transferComplete) return;
+                // A sender can't write past the size it announced.
+                const keep = budget.accept(incoming.byteLength);
+                if (keep === 0) return;
+                const chunk = keep < incoming.byteLength ? incoming.slice(0, keep) : incoming;
                 try {
                     await writable.write(chunk);  // sequential, backpressure-safe
                 } catch (err) {
@@ -2135,6 +2228,9 @@ class LADEXApp {
                     this.activeTransfers.delete(`retry:${meta.fileId}`);
                     this._resumeState.delete(meta.fileId);
                     console.log(`[FSAA] Download complete: ${meta.fileName}`);
+                    if (budget.exceeded) {
+                        this.toast(`${meta.fileName}: the sender sent more data than it announced; the extra was discarded.`, 'warning', 8000);
+                    }
 
                     if (hasher) {
                         const computed = hasher.digest('hex');
@@ -2217,6 +2313,12 @@ class LADEXApp {
     async setupReceiverDC(dc, fromPeerId, meta) {
         const cached = this._resumeState.get(meta.fileId);
         const isResume = !!(cached?.chunks && meta.resumeFromBytes > 0);
+        // The sender may only continue from bytes we really have.
+        if ((meta.resumeFromBytes > 0 && !isResume) ||
+                !LadexPolicy.resumeOffsetOk(meta.resumeFromBytes, cached?.bytesReceived, meta.fileSize)) {
+            this._rejectTransfer(fromPeerId, meta.fileId, 'The sender tried to resume a download from data we do not have.');
+            return;
+        }
 
         let chunks = isResume ? cached.chunks : [];
         let receivedBytes = isResume ? cached.bytesReceived : 0;
@@ -2241,7 +2343,13 @@ class LADEXApp {
         console.log(`Receiving ${meta.fileName} (${this.formatFileSize(meta.fileSize)}) from ${fromPeerId.slice(-6)}${isResume ? ` — resuming from ${this.formatFileSize(receivedBytes)}` : ''}`);
         this.showProgress(transferId, `Downloading ${meta.fileName}`, Math.round((receivedBytes / meta.fileSize) * 100), null, null, receivedBytes, meta.fileSize);
 
-        const onChunk = (chunk) => {
+        const budget = new LadexPolicy.ByteBudget(meta.fileSize, receivedBytes);
+        const onChunk = (incoming) => {
+            // A sender can't send more than it announced (this also stops
+            // anything arriving after the file is complete).
+            const keep = budget.accept(incoming.byteLength);
+            if (keep === 0) return;
+            const chunk = keep < incoming.byteLength ? incoming.slice(0, keep) : incoming;
             chunks.push(chunk);
             if (hasher) hasher.update(new Uint8Array(chunk));
             receivedBytes += chunk.byteLength;
@@ -2258,6 +2366,9 @@ class LADEXApp {
             if (receivedBytes >= meta.fileSize) {
                 transferComplete = true;  // Mark as complete before finalize
                 this._resumeState.delete(meta.fileId);
+                if (budget.exceeded) {
+                    this.toast(`${meta.fileName}: the sender sent more data than it announced; the extra was discarded.`, 'warning', 8000);
+                }
 
                 if (hasher) {
                     const computed = hasher.digest('hex');

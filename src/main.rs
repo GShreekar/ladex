@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 use warp::Filter;
 use clap::Parser;
@@ -15,9 +16,12 @@ mod discovery;
 mod state;
 mod auth;
 mod tls;
+mod hlc;
 mod mdns;
 mod ratelimit;
 mod server;
+mod sessions;
+mod validate;
 
 use types::*;
 use include_dir::{include_dir, Dir};
@@ -83,6 +87,13 @@ struct Args {
     /// testing.
     #[arg(long)]
     no_tls: bool,
+
+    /// Port for a plain-HTTP listener on this machine only (127.0.0.1).
+    /// Browsers treat http://localhost as a secure context, so the person
+    /// running LADEX can use it without the self-signed certificate warning.
+    /// Defaults to the main port + 1. Not used with --no-tls.
+    #[arg(long)]
+    local_port: Option<u16>,
 }
 
 // ---------------------------------------------------------------------------
@@ -145,15 +156,18 @@ pub struct NodeState {
     /// Throttles wrong guesses in the mesh handshake.
     pub mesh_limiter: Arc<ratelimit::AttemptLimiter>,
 
-    /// BUG-04 fix: random secret used ONLY for the browser HTTP auth
-    /// cookie. Generated once per process, never transmitted anywhere —
-    /// not in discovery announces, not in mesh Hello, not logged. Deliberately
-    /// distinct from node_id: node_id is broadcast in the clear over UDP
-    /// multicast every 2s (see discovery::build_announce) and is not a
-    /// secret, so using it as the cookie value let anyone passively
-    /// sniffing the LAN forge `auth=authenticated:{node_id}` and skip the
-    /// PIN entirely.
-    pub http_auth_secret: String,
+    /// Browser login sessions (one per device, individually revocable).
+    pub sessions: Arc<sessions::SessionStore>,
+
+    /// Orders catalog and peer updates across nodes without trusting wall clocks.
+    pub clock: Arc<hlc::Clock>,
+
+    /// Which WebSocket connection holds each browser `session_id`.
+    pub session_owners: Arc<RwLock<HashMap<SessionId, websocket::ConnOwner>>>,
+    connection_counter: Arc<AtomicU64>,
+
+    /// When the user was last shown a clock warning (they are rate limited).
+    pub clock_alert_at: Arc<Mutex<Option<std::time::Instant>>>,
 
     /// BUG-03 fix: rustls client config used by mesh::connect_to_peer to
     /// dial other nodes over wss://. `None` means TLS is disabled
@@ -181,14 +195,42 @@ pub struct NodeState {
     pub node_name: String,
 }
 
-// Convenience accessor — keeps the auth middleware readable.
 impl NodeState {
-    /// Returns the cookie-auth session token string.
-    /// BUG-04 fix: this is `http_auth_secret`, NOT `node_id` — node_id is
-    /// broadcast in the clear over the LAN (UDP discovery, mesh Hello) and
-    /// must never be usable to forge the HTTP auth cookie.
-    pub fn session_token(&self) -> &str {
-        &self.http_auth_secret
+    pub fn next_connection_id(&self) -> u64 {
+        self.connection_counter.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// A node with no network, for unit tests.
+    #[cfg(test)]
+    pub fn for_tests(passphrase: Option<&str>) -> Self {
+        let policy = || ratelimit::Policy {
+            free_attempts: 3,
+            base_lockout: Duration::from_secs(30),
+            max_lockout: Duration::from_secs(300),
+            global_cap: None,
+        };
+        let node_id: NodeId = "node_test".to_string();
+        NodeState {
+            local_peers: Arc::new(RwLock::new(HashMap::new())),
+            local_senders: Arc::new(RwLock::new(HashMap::new())),
+            files: Arc::new(RwLock::new(HashMap::new())),
+            messages: Arc::new(RwLock::new(Vec::new())),
+            node_id: node_id.clone(),
+            mesh_peers: Arc::new(RwLock::new(HashMap::new())),
+            passphrase: passphrase.map(String::from),
+            tls_fingerprint: Vec::new(),
+            auth_limiter: Arc::new(ratelimit::AttemptLimiter::new(policy())),
+            mesh_limiter: Arc::new(ratelimit::AttemptLimiter::new(policy())),
+            sessions: Arc::new(sessions::SessionStore::new()),
+            clock: Arc::new(hlc::Clock::new(node_id)),
+            session_owners: Arc::new(RwLock::new(HashMap::new())),
+            connection_counter: Arc::new(AtomicU64::new(1)),
+            clock_alert_at: Arc::new(Mutex::new(None)),
+            tls_client_config: None,
+            http_port: 0,
+            local_ip: None,
+            node_name: "test".to_string(),
+        }
     }
 }
 
@@ -196,28 +238,31 @@ impl NodeState {
 // Auth middleware
 // ---------------------------------------------------------------------------
 
-fn with_auth(state: NodeState) -> impl Filter<Extract = (), Error = warp::Rejection> + Clone {
-    warp::any()
-        .and(warp::cookie::optional("auth"))
+/// Resolves the browser's login session from its cookie. `None` on a node
+/// without a passphrase; otherwise an invalid or missing session is rejected,
+/// as a redirect to the login page, or as a 401 for API calls.
+fn with_session(state: NodeState, api: bool) -> impl Filter<Extract = (Option<sessions::SessionHandle>,), Error = warp::Rejection> + Clone {
+    warp::cookie::optional("auth")
         .and(warp::any().map(move || state.clone()))
-        .and_then(|auth_cookie: Option<String>, state: NodeState| async move {
-            match &state.passphrase {
-                None => Ok(()),
-                Some(_) => match auth_cookie {
-                    Some(cookie) => {
-                        let expected_cookie = format!("authenticated:{}", state.session_token());
-                        if auth::secrets_match(&expected_cookie, &cookie) {
-                            Ok(())
-                        } else {
-                            Err(warp::reject::custom(AuthenticationRequired))
-                        }
-                    },
-                    _ => Err(warp::reject::custom(AuthenticationRequired)),
-                }
+        .and_then(move |token: Option<String>, state: NodeState| async move {
+            if state.passphrase.is_none() {
+                return Ok(None);
+            }
+            match token.and_then(|t| state.sessions.authenticate(&t)) {
+                Some(session) => Ok(Some(session)),
+                None if api => Err(warp::reject::custom(Unauthorized)),
+                None => Err(warp::reject::custom(AuthenticationRequired)),
             }
         })
-        .untuple_one()
 }
+
+fn with_auth(state: NodeState) -> impl Filter<Extract = (), Error = warp::Rejection> + Clone {
+    with_session(state, false).map(|_| ()).untuple_one()
+}
+
+#[derive(Debug)]
+struct Unauthorized;
+impl warp::reject::Reject for Unauthorized {}
 
 #[derive(Debug)]
 struct AuthenticationRequired;
@@ -278,6 +323,8 @@ fn reject_browser_origin() -> impl Filter<Extract = (), Error = warp::Rejection>
 async fn handle_rejection(err: warp::Rejection) -> Result<Box<dyn warp::Reply>, std::convert::Infallible> {
     if err.find::<AuthenticationRequired>().is_some() {
         Ok(Box::new(warp::redirect::temporary(warp::http::Uri::from_static("/login"))) as Box<dyn warp::Reply>)
+    } else if err.find::<Unauthorized>().is_some() {
+        Ok(Box::new(warp::reply::with_status("Unauthorized", warp::http::StatusCode::UNAUTHORIZED)) as Box<dyn warp::Reply>)
     } else if err.find::<InvalidOrigin>().is_some() {
         Ok(Box::new(warp::reply::with_status("Forbidden", warp::http::StatusCode::FORBIDDEN)) as Box<dyn warp::Reply>)
     } else if err.is_not_found() {
@@ -347,17 +394,6 @@ async fn main() {
 
     tracing::info!("Node ID: {node_id}");
 
-    // BUG-04 fix: separate, never-transmitted secret for the HTTP auth
-    // cookie. 256 bits from the OS CSPRNG via `rand`'s default generator —
-    // plenty for a cookie value nobody can observe on the wire to begin
-    // with, since (unlike node_id) it's never sent anywhere but back to
-    // the browser that already proved it knows the PIN.
-    let http_auth_secret: String = {
-        let mut rng = rand::thread_rng();
-        let bytes: [u8; 32] = rng.gen();
-        hex::encode(bytes)
-    };
-
     // ── BUG-03 fix: TLS setup ────────────────────────────────────────────
     // Must happen before `state` is built: connect_to_peer (dialed from the
     // manual-peer, discovery, and reconnect-backoff call sites below) reads
@@ -376,21 +412,16 @@ async fn main() {
         None
     } else {
         tls::install_crypto_provider();
-        let mut sans: Vec<String> = vec!["localhost".to_string(), "127.0.0.1".to_string()];
-        sans.extend(local_ips.iter().map(IpAddr::to_string));
-        match tls::load_or_generate_cert(&sans) {
-            Ok((cert, key)) => match tls::build_server_config(cert.clone(), key) {
-                Ok(cfg) => {
-                    tls_fingerprint = auth::tls_fingerprint(cert.as_ref());
-                    Some(cfg)
-                }
-                Err(e) => {
-                    eprintln!("TLS: failed to build server config ({e}) — falling back to plain HTTP");
-                    None
-                }
-            },
+        // Every name this node is reachable by, including the mDNS name it advertises.
+        let mut names: Vec<String> = vec!["localhost".to_string(), "127.0.0.1".to_string(), "ladex.local".to_string()];
+        names.extend(local_ips.iter().map(IpAddr::to_string));
+        match tls::prepare_server_identity(&names) {
+            Ok((config, fingerprint)) => {
+                tls_fingerprint = fingerprint;
+                Some(config)
+            }
             Err(e) => {
-                eprintln!("TLS: failed to generate certificate ({e}) — falling back to plain HTTP");
+                eprintln!("TLS: could not set up a certificate ({e}) — falling back to plain HTTP");
                 None
             }
         }
@@ -430,7 +461,11 @@ async fn main() {
         tls_fingerprint,
         auth_limiter,
         mesh_limiter,
-        http_auth_secret,
+        sessions:             Arc::new(sessions::SessionStore::new()),
+        clock:                Arc::new(hlc::Clock::new(node_id.clone())),
+        session_owners:       Arc::new(RwLock::new(HashMap::new())),
+        connection_counter:   Arc::new(AtomicU64::new(1)),
+        clock_alert_at:       Arc::new(Mutex::new(None)),
         tls_client_config,
         http_port: args.port,
         local_ip: primary_local_ip,
@@ -498,18 +533,19 @@ async fn main() {
     }
 
     // ── Phase 4 / BUG-08 fix: periodic tombstone pruner ─────────────────
-    // Cleans up old tombstoned file entries (>60s old) from the in-memory
-    // catalog, and (BUG-08) old peer-departure tombstones, so neither grows
-    // unboundedly.
+    // Cleans up old tombstoned file entries from the in-memory catalog, and
+    // (BUG-08) old peer-departure tombstones, so neither grows unboundedly.
+    // Also drops expired login sessions.
     {
         let state_prune = state.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
                 interval.tick().await;
+                state_prune.sessions.purge_expired();
                 let mut files = state_prune.files.write().await;
                 let before = files.len();
-                state::prune_tombstones(&mut files);
+                state::prune_tombstones(&mut files, hlc::wall_clock_ms());
                 let pruned = before - files.len();
                 if pruned > 0 {
                     tracing::info!("State: pruned {pruned} stale tombstone(s) from file catalog");
@@ -518,7 +554,7 @@ async fn main() {
 
                 let mut peers = state_prune.local_peers.write().await;
                 let before = peers.len();
-                state::prune_peer_tombstones(&mut peers);
+                state::prune_peer_tombstones(&mut peers, hlc::wall_clock_ms());
                 let pruned = before - peers.len();
                 if pruned > 0 {
                     tracing::info!("State: pruned {pruned} stale peer-departure tombstone(s)");
@@ -579,13 +615,37 @@ async fn main() {
         .and(warp::body::content_length_limit(4096))
         .and(warp::body::json())
         .and(warp::ext::optional::<server::PeerAddr>())
+        .and(warp::header::optional::<String>("user-agent"))
         .and(warp::any().map(move || app_state_auth.clone()))
         .and_then(handlers::authenticate);
 
-    // Logout — not protected
+    // Logout — ends only the caller's own session
+    let app_state_logout = state.clone();
     let logout_route = warp::path("logout")
         .and(warp::post())
+        .and(require_same_origin())
+        .and(warp::cookie::optional("auth"))
+        .and(warp::ext::optional::<server::PeerAddr>())
+        .and(warp::any().map(move || app_state_logout.clone()))
         .and_then(handlers::logout);
+
+    // Per-device sessions: list them, and sign a device out.
+    let app_state_sessions = state.clone();
+    let sessions_list_route = warp::path!("api" / "sessions")
+        .and(warp::get())
+        .and(with_session(state.clone(), true))
+        .and(warp::ext::optional::<server::PeerAddr>())
+        .and(warp::any().map(move || app_state_sessions.clone()))
+        .and_then(handlers::list_sessions);
+
+    let app_state_revoke = state.clone();
+    let sessions_revoke_route = warp::path!("api" / "sessions" / String)
+        .and(warp::delete())
+        .and(require_same_origin())
+        .and(with_session(state.clone(), true))
+        .and(warp::ext::optional::<server::PeerAddr>())
+        .and(warp::any().map(move || app_state_revoke.clone()))
+        .and_then(handlers::revoke_session);
 
     // Auth-status check — not protected
     let auth_status_route = warp::path("auth-status")
@@ -647,7 +707,7 @@ async fn main() {
     // Browser-tab WebSocket /ws — protected
     let app_state_ws = state.clone();
     let websocket_route = warp::path("ws")
-        .and(with_auth(state.clone()))
+        .and(with_session(state.clone(), false))
         .and(require_same_origin())
         .and(warp::ws())
         .and(warp::any().map(move || app_state_ws.clone()))
@@ -681,6 +741,8 @@ async fn main() {
     let routes = login_route
         .or(auth_route)
         .or(logout_route)
+        .or(sessions_list_route)
+        .or(sessions_revoke_route)
         .or(auth_status_route)
         .or(static_route)
         .or(favicon_route)
@@ -704,20 +766,63 @@ async fn main() {
     // isn't universally supported.
     let mdns_handle = mdns::advertise(&local_ips, args.port, tls_enabled);
 
+    // The host's own browser can skip the certificate warning by using plain
+    // HTTP on loopback: browsers treat http://localhost as a secure context.
+    let local_http_port: Option<u16> = if tls_enabled {
+        Some(args.local_port.unwrap_or(if args.port == u16::MAX { args.port - 1 } else { args.port + 1 }))
+    } else {
+        None
+    };
+    let local_listener = match local_http_port {
+        Some(port) => match tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port))).await {
+            Ok(listener) => Some(listener),
+            Err(e) => {
+                eprintln!("Note: could not open the local HTTP listener on 127.0.0.1:{port} ({e}); use the https address below, or pick another port with --local-port.");
+                None
+            }
+        },
+        None => None,
+    };
+
+    let public_listener = match tokio::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], args.port))).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            eprintln!("Error: could not listen on port {}: {e}", args.port);
+            std::process::exit(1);
+        }
+    };
+
     let scheme = if tls_enabled { "https" } else { "http" };
-    println!("Access locally: {scheme}://localhost:{}", args.port);
-    println!("Access from network: {scheme}://{local_ip}:{}", args.port);
+    match (&local_listener, local_http_port) {
+        (Some(_), Some(port)) => println!("Access on this machine: http://localhost:{port}  (no certificate warning)"),
+        _ => println!("Access locally: {scheme}://localhost:{}", args.port),
+    }
+    println!("Access from other devices: {scheme}://{local_ip}:{}", args.port);
     if tls_enabled {
-        println!("Note: your browser will warn about the self-signed certificate on first visit — this is expected for a LAN-local tool with no public CA. Click through (\"Advanced\" → \"Proceed\").");
+        println!("Certificate fingerprint (SHA-256): {}", tls::format_fingerprint(&state.tls_fingerprint));
+        println!(
+            "Other devices' browsers will warn that this certificate is self-signed. Before accepting it, \
+             check that the fingerprint in the browser's certificate details matches the one above."
+        );
     }
     if primary_local_ip.is_some() {
         print_qr_code(&format!("{scheme}://{local_ip}:{}", args.port));
     }
 
-    let addr: SocketAddr = ([0, 0, 0, 0], args.port).into();
+    let service = warp::service(routes);
+    if let (Some(listener), Some(port)) = (local_listener, local_http_port) {
+        let hosts = vec![format!("localhost:{port}"), format!("127.0.0.1:{port}")];
+        let service = service.clone();
+        tokio::spawn(async move {
+            if let Err(e) = server::serve(listener, None, Some(hosts), service).await {
+                tracing::error!("Local HTTP listener exited: {e}");
+            }
+        });
+    }
+
     let acceptor = tls_server_config.map(tokio_rustls::TlsAcceptor::from);
     tokio::select! {
-        result = server::serve(addr, acceptor, warp::service(routes)) => {
+        result = server::serve(public_listener, acceptor, None, service) => {
             if let Err(e) = result {
                 tracing::error!("Server exited: {e}");
             }
