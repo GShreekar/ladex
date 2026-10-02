@@ -792,6 +792,85 @@ mod tests {
         assert_eq!(order, [("m1", 10), ("m2", 20), ("m3", 30)]);
     }
 
+    fn chat_message(id: &str, created_at: u64) -> TextMessage {
+        TextMessage {
+            id: id.into(),
+            content: "hi".into(),
+            sender_id: "peer_a".into(),
+            sender_name: None,
+            timestamp: chrono::Utc::now(),
+            created_at,
+        }
+    }
+
+    #[test]
+    fn merging_the_same_catalog_twice_changes_nothing() {
+        let incoming = vec![file("a", stamp(10, 0, "n")), tombstone("b", stamp(11, 0, "n"))];
+        let mut once = HashMap::new();
+        merge_files(&mut once, incoming.clone(), 100);
+        let mut twice = once.clone();
+        merge_files(&mut twice, incoming, 100);
+        for (id, entry) in &once {
+            assert_eq!(twice[id].version, entry.version);
+            assert_eq!(twice[id].deleted, entry.deleted);
+        }
+        assert_eq!(once.len(), twice.len());
+    }
+
+    #[test]
+    fn merging_an_empty_catalog_changes_nothing() {
+        let mut local = catalog(vec![file("a", stamp(10, 0, "n"))]);
+        merge_files(&mut local, Vec::new(), 100);
+        assert_eq!(local.len(), 1);
+    }
+
+    #[test]
+    fn a_full_peer_list_ignores_new_peers_but_still_updates_known_ones() {
+        let mut local: HashMap<SessionId, PeerInfo> = HashMap::new();
+        for i in 0..MAX_PEERS {
+            let id = format!("p{i}");
+            local.insert(id.clone(), peer(&id, stamp(10, 0, "a"), false));
+        }
+        merge_peers(&mut local, vec![peer("newcomer", stamp(10, 0, "a"), false)]);
+        assert!(!local.contains_key("newcomer"));
+        merge_peers(&mut local, vec![peer("p0", stamp(20, 0, "a"), true)]);
+        assert!(local["p0"].left);
+        assert_eq!(local.len(), MAX_PEERS);
+    }
+
+    #[test]
+    fn merging_chat_into_nothing_keeps_it_sorted() {
+        let mut local = Vec::new();
+        merge_messages(&mut local, vec![chat_message("b", 20), chat_message("a", 10)]);
+        let order: Vec<_> = local.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(order, ["a", "b"]);
+    }
+
+    #[test]
+    fn messages_created_at_the_same_moment_are_ordered_by_id_on_every_node() {
+        let mut first = vec![chat_message("b", 10)];
+        let mut second = vec![chat_message("a", 10)];
+        merge_messages(&mut first, vec![chat_message("a", 10)]);
+        merge_messages(&mut second, vec![chat_message("b", 10)]);
+        let ids = |messages: &[TextMessage]| messages.iter().map(|m| m.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&first), ids(&second));
+    }
+
+    #[test]
+    fn pruning_chat_drops_the_oldest_messages_first() {
+        let mut messages: Vec<_> = (0..MAX_CHAT_MESSAGES as u64 + 3).map(|i| chat_message(&format!("m{i}"), i)).collect();
+        prune_messages(&mut messages);
+        assert_eq!(messages.len(), MAX_CHAT_MESSAGES);
+        assert_eq!(messages[0].id, "m3");
+    }
+
+    #[test]
+    fn pruning_a_short_chat_keeps_everything() {
+        let mut messages = vec![chat_message("a", 1), chat_message("b", 2)];
+        prune_messages(&mut messages);
+        assert_eq!(messages.len(), 2);
+    }
+
     #[tokio::test]
     async fn a_catalog_sync_from_another_node_is_validated_and_advances_our_clock() {
         let state = NodeState::for_tests(None);

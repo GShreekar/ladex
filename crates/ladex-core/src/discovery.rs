@@ -406,6 +406,101 @@ mod tests {
         assert!(!backoff_active(&backoff, "other-node"));
     }
 
+    const OWN_ID: &str = "node_own";
+
+    fn valid_packet() -> AnnouncePacket {
+        AnnouncePacket {
+            packet_type: "ladex_announce".into(),
+            node_id: "node_other".into(),
+            node_name: "laptop".into(),
+            http_port: 8080,
+            protocol_version: crate::mesh::PROTOCOL_VERSION,
+            secured: true,
+        }
+    }
+
+    fn parse(bytes: &[u8]) -> Option<AnnouncePacket> {
+        serde_json::from_slice(bytes).ok()
+    }
+
+    #[test]
+    fn a_well_formed_packet_from_another_node_is_valid() {
+        assert!(valid_packet().is_valid(OWN_ID));
+    }
+
+    #[test]
+    fn our_own_announce_is_ignored() {
+        let packet = AnnouncePacket { node_id: OWN_ID.into(), ..valid_packet() };
+        assert!(!packet.is_valid(OWN_ID));
+    }
+
+    #[test]
+    fn a_packet_of_another_type_is_invalid() {
+        let packet = AnnouncePacket { packet_type: "something_else".into(), ..valid_packet() };
+        assert!(!packet.is_valid(OWN_ID));
+    }
+
+    #[test]
+    fn a_packet_from_another_protocol_version_is_invalid() {
+        let packet = AnnouncePacket { protocol_version: crate::mesh::PROTOCOL_VERSION + 1, ..valid_packet() };
+        assert!(!packet.is_valid(OWN_ID));
+    }
+
+    #[test]
+    fn a_packet_without_a_node_id_is_invalid() {
+        let packet = AnnouncePacket { node_id: String::new(), ..valid_packet() };
+        assert!(!packet.is_valid(OWN_ID));
+    }
+
+    #[test]
+    fn a_packet_announcing_port_zero_is_invalid() {
+        let packet = AnnouncePacket { http_port: 0, ..valid_packet() };
+        assert!(!packet.is_valid(OWN_ID));
+    }
+
+    #[test]
+    fn a_valid_packet_round_trips_through_json() {
+        let bytes = serde_json::to_vec(&valid_packet()).unwrap();
+        assert!(parse(&bytes).unwrap().is_valid(OWN_ID));
+    }
+
+    #[test]
+    fn garbage_bytes_do_not_parse() {
+        assert!(parse(b"").is_none());
+        assert!(parse(b"\xff\xfe\x00").is_none());
+        assert!(parse(b"not json").is_none());
+        assert!(parse(b"[]").is_none());
+        assert!(parse(b"null").is_none());
+    }
+
+    #[test]
+    fn a_packet_missing_a_field_does_not_parse() {
+        let without_port = br#"{"type":"ladex_announce","node_id":"n","node_name":"x","protocol_version":4,"secured":false}"#;
+        assert!(parse(without_port).is_none());
+    }
+
+    #[test]
+    fn fields_of_the_wrong_type_do_not_parse() {
+        let port_as_string = br#"{"type":"ladex_announce","node_id":"n","node_name":"x","http_port":"80","protocol_version":4,"secured":false}"#;
+        let secured_as_number = br#"{"type":"ladex_announce","node_id":"n","node_name":"x","http_port":80,"protocol_version":4,"secured":1}"#;
+        assert!(parse(port_as_string).is_none());
+        assert!(parse(secured_as_number).is_none());
+    }
+
+    #[test]
+    fn a_port_outside_the_u16_range_does_not_parse() {
+        let port_too_big = br#"{"type":"ladex_announce","node_id":"n","node_name":"x","http_port":70000,"protocol_version":4,"secured":false}"#;
+        let negative_port = br#"{"type":"ladex_announce","node_id":"n","node_name":"x","http_port":-1,"protocol_version":4,"secured":false}"#;
+        assert!(parse(port_too_big).is_none());
+        assert!(parse(negative_port).is_none());
+    }
+
+    #[test]
+    fn unknown_extra_fields_are_ignored() {
+        let with_old_hash = br#"{"type":"ladex_announce","node_id":"n","node_name":"x","http_port":80,"protocol_version":4,"secured":false,"passphrase_hash":"abc"}"#;
+        assert!(parse(with_old_hash).is_some());
+    }
+
     #[test]
     fn announce_carries_only_public_fields() {
         let packet = AnnouncePacket {

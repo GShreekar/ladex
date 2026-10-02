@@ -253,6 +253,76 @@ mod tests {
     }
 
     #[test]
+    fn a_secret_that_only_extends_the_real_one_does_not_match() {
+        assert!(!secrets_match("abcd-efgh", "abcd-efgh-extra"));
+        assert!(!secrets_match("abcd-efgh-extra", "abcd-efgh"));
+    }
+
+    #[test]
+    fn secret_comparison_works_on_non_ascii_text() {
+        assert!(secrets_match("pässwörd-ключ", "pässwörd-ключ"));
+        assert!(!secrets_match("pässwörd-ключ", "passwörd-ключ"));
+    }
+
+    #[test]
+    fn the_same_certificate_always_gets_the_same_fingerprint() {
+        assert_eq!(tls_fingerprint(b"cert-a"), tls_fingerprint(b"cert-a"));
+    }
+
+    #[test]
+    fn different_certificates_get_different_fingerprints() {
+        assert_ne!(tls_fingerprint(b"cert-a"), tls_fingerprint(b"cert-b"));
+        assert_eq!(tls_fingerprint(b"cert-a").len(), 32);
+    }
+
+    #[test]
+    fn a_proof_of_the_wrong_length_is_rejected() {
+        let key = Pake::start(Role::Client, "pw").finish(Pake::start(Role::Server, "pw").message()).unwrap();
+        let transcript = Transcript::new("c", "s", b"x", b"y", b"");
+        assert!(!key.verify(Role::Client, &transcript, &[]));
+        assert!(!key.verify(Role::Client, &transcript, &[0u8; 31]));
+        assert!(!key.verify(Role::Client, &transcript, &[0u8; 64]));
+    }
+
+    #[test]
+    fn a_proof_for_one_transcript_fails_on_another() {
+        let (client, server) = (Pake::start(Role::Client, "pw"), Pake::start(Role::Server, "pw"));
+        let key = client.finish(server.message()).unwrap();
+        let proof = key.prove(Role::Client, &Transcript::new("c", "s", b"x", b"y", b""));
+        assert!(!key.verify(Role::Client, &Transcript::new("c", "other", b"x", b"y", b""), &proof));
+        assert!(!key.verify(Role::Client, &Transcript::new("c", "s", b"x", b"y", b"cert"), &proof));
+    }
+
+    #[test]
+    fn a_node_id_cannot_be_swapped_without_breaking_the_proof() {
+        let (client_msg, server_msg) = (b"x".as_slice(), b"y".as_slice());
+        let honest = Transcript::new("node_a", "node_b", client_msg, server_msg, b"");
+        let impersonated = Transcript::new("node_evil", "node_b", client_msg, server_msg, b"");
+        assert_ne!(honest.0, impersonated.0);
+    }
+
+    #[test]
+    fn the_two_roles_have_different_labels() {
+        assert_ne!(Role::Client.label(), Role::Server.label());
+    }
+
+    #[test]
+    fn passphrase_length_is_counted_in_characters_not_bytes() {
+        assert!(weakness("ééééééé").is_some());
+        assert!(weakness("éééééééé").is_none());
+    }
+
+    #[test]
+    fn a_passphrase_of_exactly_eight_letters_is_acceptable() {
+        assert!(weakness("abcdefgh").is_none());
+    }
+
+    #[test]
+    fn digits_with_a_separator_are_not_flagged_as_digits_only() {
+        assert!(weakness("1234-5678").is_none());
+    }
+
+    #[test]
     fn secret_comparison() {
         assert!(secrets_match("abcd-efgh", "abcd-efgh"));
         assert!(!secrets_match("abcd-efgh", "abcd-efgi"));
