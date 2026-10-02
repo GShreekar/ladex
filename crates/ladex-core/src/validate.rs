@@ -209,7 +209,7 @@ mod tests {
 
     #[test]
     fn file_names_match_the_shared_fixture() {
-        let cases: Cases = serde_json::from_str(include_str!("../tests/filename_cases.json")).unwrap();
+        let cases: Cases = serde_json::from_str(include_str!("../../../tests/filename_cases.json")).unwrap();
         for case in cases.file_names {
             assert_eq!(sanitize_file_name(&case.input), case.expected.unwrap(), "input: {:?}", case.input);
         }
@@ -341,7 +341,7 @@ mod tests {
         struct PathCases {
             relative_paths: Vec<Case>,
         }
-        let cases: PathCases = serde_json::from_str(include_str!("../tests/filename_cases.json")).unwrap();
+        let cases: PathCases = serde_json::from_str(include_str!("../../../tests/filename_cases.json")).unwrap();
         for case in cases.relative_paths {
             assert_eq!(sanitize_relative_path(&case.input), case.expected, "input: {:?}", case.input);
         }

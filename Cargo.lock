@@ -866,10 +866,26 @@ dependencies = [
 name = "ladex"
 version = "2.1.0"
 dependencies = [
+ "clap",
+ "include_dir",
+ "ladex-core",
+ "mime_guess",
+ "qrcode",
+ "rand 0.8.5",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "tracing-subscriber",
+ "warp",
+]
+
+[[package]]
+name = "ladex-core"
+version = "2.1.0"
+dependencies = [
  "anyhow",
  "bytes",
  "chrono",
- "clap",
  "crc32fast",
  "fs4",
  "futures-util",
@@ -879,11 +895,9 @@ dependencies = [
  "hyper",
  "hyper-util",
  "if-addrs",
- "include_dir",
  "mdns-sd",
  "mime_guess",
  "percent-encoding",
- "qrcode",
  "rand 0.8.5",
  "rcgen",
  "ring",
@@ -898,7 +912,6 @@ dependencies = [
  "tokio-tungstenite 0.20.1",
  "tower-service",
  "tracing",
- "tracing-subscriber",
  "warp",
 ]
 

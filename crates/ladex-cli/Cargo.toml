@@ -1,0 +1,21 @@
+[package]
+name = "ladex"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ladex-core.workspace = true
+warp.workspace = true
+tokio.workspace = true
+rand.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+include_dir.workspace = true
+qrcode.workspace = true
+mime_guess.workspace = true
+tokio-rustls.workspace = true
+
+[dev-dependencies]
+ladex-core = { workspace = true, features = ["test-support"] }
+warp = { workspace = true, features = ["test"] }
