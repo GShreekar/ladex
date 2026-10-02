@@ -202,6 +202,15 @@ pub fn prepare_server_identity(wanted: &[String]) -> anyhow::Result<(Arc<rustls:
     Ok((config, fingerprint))
 }
 
+/// A fresh certificate that is never written to disk, for in-process test nodes.
+#[cfg(any(test, feature = "test-support"))]
+pub fn ephemeral_server_identity(names: &[String]) -> anyhow::Result<(Arc<rustls::ServerConfig>, Vec<u8>)> {
+    let (cert, key) = generate(names)?;
+    let fingerprint = crate::auth::tls_fingerprint(cert.as_ref());
+    let config = build_server_config(cert, PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key)))?;
+    Ok((config, fingerprint))
+}
+
 /// "AB:CD:EF:…" — the form browsers show in their certificate details.
 pub fn format_fingerprint(fingerprint: &[u8]) -> String {
     fingerprint.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(":")

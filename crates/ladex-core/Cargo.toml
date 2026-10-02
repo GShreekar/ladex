@@ -39,5 +39,7 @@ percent-encoding.workspace = true
 crc32fast.workspace = true
 
 [dev-dependencies]
+# Turns on the testing module for this crate's own integration tests in tests/.
+ladex-core = { path = ".", features = ["test-support"] }
 tempfile.workspace = true
 warp = { workspace = true, features = ["test"] }

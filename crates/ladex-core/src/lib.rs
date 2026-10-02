@@ -26,6 +26,8 @@ pub mod store;
 pub mod transfer;
 pub mod zip;
 pub mod validate;
+#[cfg(any(test, feature = "test-support"))]
+pub mod testing;
 
 use types::*;
 

@@ -895,6 +895,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "if-addrs",
+ "ladex-core",
  "mdns-sd",
  "mime_guess",
  "percent-encoding",
