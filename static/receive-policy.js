@@ -1,9 +1,8 @@
-// What a receiving browser accepts from the peer that is sending it a file.
-//
-// The sender is another device on the network, so everything in its headers
-// (names, sizes, counts) and the amount of data it sends is untrusted. The
-// node can't be relied on to have cleaned any of it either. The file-name
-// rules mirror src/validate.rs and are tested against the same cases
+// How this page treats names that come from other devices when it writes a
+// downloaded folder to disk: file and folder names are made safe on every
+// platform, and a path can never climb out of the folder. The node cleans
+// names too, but can't be relied on to have done it. The rules mirror
+// src/validate.rs and are tested against the same cases
 // (tests/filename_cases.json).
 
 (function (root) {
@@ -24,10 +23,6 @@
     // Control characters plus invisible and bidirectional-override characters
     // that let "photo\u202Egpj.exe" display as "photoexe.jpg".
     const STRIPPED = /[\u0000-\u001F\u007F-\u009F\u00AD\u061C\u200B-\u200F\u2028\u2029\u202A-\u202E\u2060-\u206F\uFEFF\uFFF9-\uFFFB]/;
-
-    const ID = /^[A-Za-z0-9_-]{1,64}$/;
-    const SHA256 = /^[0-9a-f]{64}$/;
-    const MIME_TOKEN = /^[A-Za-z0-9!#$&^_.+-]+$/;
 
     function utf8Length(ch) {
         const code = ch.codePointAt(0);
@@ -108,131 +103,11 @@
         return sanitizeFileName(kept + tail);
     }
 
-    function sanitizeMime(mime) {
-        const fallback = 'application/octet-stream';
-        if (typeof mime !== 'string' || mime.length > 255) return fallback;
-        const parts = mime.split('/');
-        return parts.length === 2 && MIME_TOKEN.test(parts[0]) && MIME_TOKEN.test(parts[1]) ? mime : fallback;
-    }
-
-    const isId = (value) => typeof value === 'string' && ID.test(value);
-    const isSize = (value) => Number.isSafeInteger(value) && value >= 0;
-
-    // The header the sender puts in front of a single file. Returns the same
-    // fields, cleaned, or null when it is not something to accept. Everything
-    // the page later shows or uses comes from this, never from the raw header.
-    function parseFileHeader(meta) {
-        if (!meta || typeof meta !== 'object') return null;
-        if (!isId(meta.fileId) || !isSize(meta.fileSize)) return null;
-        const resumeFromBytes = meta.resumeFromBytes === undefined ? 0 : meta.resumeFromBytes;
-        if (!isSize(resumeFromBytes) || resumeFromBytes > meta.fileSize) return null;
-        return {
-            fileId: meta.fileId,
-            fileName: sanitizeFileName(meta.fileName),
-            fileSize: meta.fileSize,
-            mimeType: sanitizeMime(meta.mimeType),
-            sha256: typeof meta.sha256 === 'string' && SHA256.test(meta.sha256) ? meta.sha256 : null,
-            resumeFromBytes,
-            totalChunks: isSize(meta.totalChunks) ? meta.totalChunks : 0,
-        };
-    }
-
-    function parseFolderManifest(meta) {
-        if (!meta || typeof meta !== 'object' || meta.kind !== 'folder-manifest') return null;
-        if (!isId(meta.folderId) || !isSize(meta.totalBytes)) return null;
-        if (!Number.isInteger(meta.totalFiles) || meta.totalFiles < 0 || meta.totalFiles > MAX_FOLDER_FILES) return null;
-        return {
-            kind: 'folder-manifest',
-            folderId: meta.folderId,
-            folderName: sanitizeFileName(meta.folderName),
-            totalBytes: meta.totalBytes,
-            totalFiles: meta.totalFiles,
-        };
-    }
-
-    // The header that precedes each file inside a folder transfer.
-    function parseFolderEntryHeader(msg) {
-        if (!msg || typeof msg !== 'object' || !isSize(msg.size)) return null;
-        const relativePath = sanitizeRelativePath(msg.relativePath);
-        return relativePath === null ? null : { relativePath, size: msg.size };
-    }
-
-    // A resumed transfer may only continue from bytes we really have.
-    function resumeOffsetOk(offset, bytesWeHave, fileSize) {
-        if (offset === 0) return true;
-        return Number.isSafeInteger(bytesWeHave) && offset <= bytesWeHave && offset <= fileSize;
-    }
-
-    // Counts what a sender actually sends against what it announced.
-    // `accept` says how much of a chunk may be kept (a sender can't write
-    // past its announced size) and remembers if it tried to.
-    class ByteBudget {
-        constructor(limit, alreadyReceived = 0) {
-            this.limit = limit;
-            this.received = alreadyReceived;
-            this.exceeded = false;
-        }
-
-        accept(length) {
-            const take = Math.max(0, Math.min(length, this.limit - this.received));
-            if (take < length) this.exceeded = true;
-            this.received += take;
-            return take;
-        }
-
-        get complete() {
-            return this.received >= this.limit;
-        }
-    }
-
-    // The same for a folder: no more files, and no more bytes in total, than
-    // the manifest announced, and no file longer than its own header said.
-    class FolderBudget {
-        constructor(totalFiles, totalBytes) {
-            this.maxFiles = totalFiles;
-            this.maxBytes = totalBytes;
-            this.files = 0;
-            this.declaredBytes = 0;
-            this.receivedBytes = 0;
-            this.file = null;
-            this.violation = null;
-        }
-
-        startFile(size) {
-            if (this.files >= this.maxFiles) return this._fail('more files than announced');
-            if (this.declaredBytes + size > this.maxBytes) return this._fail('more data than announced');
-            this.files += 1;
-            this.declaredBytes += size;
-            this.file = new ByteBudget(size);
-            return true;
-        }
-
-        accept(length) {
-            if (!this.file) return 0;
-            const take = Math.max(0, Math.min(this.file.accept(length), this.maxBytes - this.receivedBytes));
-            if (this.file.exceeded) this.violation = 'sent more data than announced';
-            this.receivedBytes += take;
-            return take;
-        }
-
-        _fail(reason) {
-            this.violation = reason;
-            return false;
-        }
-    }
-
     const api = {
         MAX_FOLDER_FILES,
         sanitizeFileName,
         sanitizeRelativePath,
         numberedName,
-        sanitizeMime,
-        parseFileHeader,
-        parseFolderManifest,
-        parseFolderEntryHeader,
-        resumeOffsetOk,
-        ByteBudget,
-        FolderBudget,
     };
     if (typeof module !== 'undefined' && module.exports) module.exports = api;
     root.LadexPolicy = api;

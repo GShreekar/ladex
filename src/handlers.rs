@@ -31,7 +31,7 @@ fn json_error(message: &str, status: StatusCode) -> Box<dyn Reply> {
     ))
 }
 
-pub async fn check_auth_status(auth_cookie: Option<String>, state: NodeState) -> Result<impl Reply, Rejection> {
+pub async fn check_auth_status(auth_cookie: Option<String>, peer: Option<PeerAddr>, state: NodeState) -> Result<impl Reply, Rejection> {
     let is_authenticated = match &state.passphrase {
         None => true, // No auth required
         Some(_) => auth_cookie.as_deref().is_some_and(|token| state.sessions.authenticate(token).is_some()),
@@ -41,11 +41,17 @@ pub async fn check_auth_status(auth_cookie: Option<String>, state: NodeState) ->
     struct AuthStatusResponse {
         authenticated: bool,
         auth_required: bool,
+        /// This node's id, to tell which shared files came through it.
+        node_id: String,
+        /// The request comes from the machine running this node.
+        is_host: bool,
     }
 
     let response = AuthStatusResponse {
         authenticated: is_authenticated,
         auth_required: state.passphrase.is_some(),
+        node_id: state.node_id.clone(),
+        is_host: can_manage(peer),
     };
 
     Ok(warp::reply::json(&response))
@@ -241,7 +247,7 @@ mod tests {
         let state = NodeState::for_tests(Some("pw"));
         let token = token_of(&login(&state, "pw", LAN, true).await);
         logout(Some(token.clone()), peer(LAN, true), state.clone()).await.unwrap();
-        let status = check_auth_status(Some(token), state).await.unwrap().into_response();
+        let status = check_auth_status(Some(token), peer(LAN, true), state).await.unwrap().into_response();
         assert!(body_text(status).await.contains("\"authenticated\":false"));
     }
 

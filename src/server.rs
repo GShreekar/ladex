@@ -7,15 +7,32 @@
 // limiters, session management and the cookie's `Secure` flag need.
 
 use std::convert::Infallible;
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
+use bytes::Bytes;
+use http_body_util::{combinators::UnsyncBoxBody, BodyExt};
 use hyper::body::Incoming;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tower_service::Service;
 use warp::Reply;
+
+pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+pub type ServerBody = UnsyncBoxBody<Bytes, BoxError>;
+
+/// Handles the requests warp can't: uploads and downloads stream their
+/// bodies, which warp's filters have no way to do.
+pub trait Api: Clone + Send + Sync + 'static {
+    fn claims(&self, path: &str) -> bool;
+    fn handle(&self, req: hyper::Request<Incoming>, peer: PeerAddr) -> impl Future<Output = hyper::Response<ServerBody>> + Send;
+}
+
+fn from_warp(response: warp::reply::Response) -> hyper::Response<ServerBody> {
+    response.map(|body| body.map_err(|e| Box::new(e) as BoxError).boxed_unsync())
+}
 
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
@@ -45,15 +62,17 @@ fn host_allowed(allowed: &AllowedHosts, host: Option<&hyper::header::HeaderValue
     host.and_then(|h| h.to_str().ok()).is_some_and(|h| allowed.iter().any(|a| a.eq_ignore_ascii_case(h)))
 }
 
-pub async fn serve<S>(
+pub async fn serve<S, A>(
     listener: TcpListener,
     tls: Option<TlsAcceptor>,
     allowed_hosts: Option<AllowedHosts>,
     routes: S,
+    api: A,
 ) -> anyhow::Result<()>
 where
     S: Service<hyper::Request<Incoming>, Response = warp::reply::Response, Error = Infallible> + Clone + Send + 'static,
     S::Future: Send,
+    A: Api,
 {
     tracing::info!("Serving on {} ({})", listener.local_addr()?, if tls.is_some() { "TLS" } else { "plain HTTP" });
 
@@ -68,21 +87,28 @@ where
         let _ = tcp.set_nodelay(true);
         let tls = tls.clone();
         let routes = routes.clone();
+        let api = api.clone();
         let allowed_hosts = allowed_hosts.clone();
         let is_tls = tls.is_some();
 
         tokio::spawn(async move {
             let service = hyper::service::service_fn(move |mut req: hyper::Request<Incoming>| {
-                req.extensions_mut().insert(PeerAddr { addr: peer, tls: is_tls });
+                let peer_addr = PeerAddr { addr: peer, tls: is_tls };
+                req.extensions_mut().insert(peer_addr);
                 let mut routes = routes.clone();
+                let api = api.clone();
                 let allowed_hosts = allowed_hosts.clone();
                 async move {
                     if let Some(allowed) = &allowed_hosts {
                         if !host_allowed(allowed, req.headers().get(hyper::header::HOST)) {
-                            return Ok(warp::reply::with_status("Unexpected Host header", hyper::StatusCode::MISDIRECTED_REQUEST).into_response());
+                            let refusal = warp::reply::with_status("Unexpected Host header", hyper::StatusCode::MISDIRECTED_REQUEST);
+                            return Ok::<_, Infallible>(from_warp(refusal.into_response()));
                         }
                     }
-                    routes.call(req).await
+                    if api.claims(req.uri().path()) {
+                        return Ok(api.handle(req, peer_addr).await);
+                    }
+                    Ok(from_warp(routes.call(req).await?))
                 }
             });
             let mut http = hyper::server::conn::http1::Builder::new();

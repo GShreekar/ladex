@@ -16,11 +16,16 @@ mod discovery;
 mod state;
 mod auth;
 mod tls;
+mod bitmap;
+mod files_api;
 mod hlc;
 mod mdns;
 mod ratelimit;
 mod server;
 mod sessions;
+mod store;
+mod transfer;
+mod zip;
 mod validate;
 
 use types::*;
@@ -94,6 +99,18 @@ struct Args {
     /// Defaults to the main port + 1. Not used with --no-tls.
     #[arg(long)]
     local_port: Option<u16>,
+
+    /// Where shared files are stored on this machine. Default: ~/.ladex/files
+    #[arg(long)]
+    data_dir: Option<std::path::PathBuf>,
+
+    /// How long a download may wait for the next piece of a file before giving up.
+    #[arg(long, default_value = "60")]
+    stall_timeout_secs: u64,
+
+    /// Most disk space, in GiB, that shared files may use on this node.
+    #[arg(long, default_value = "20")]
+    storage_limit_gb: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -162,6 +179,10 @@ pub struct NodeState {
     /// Orders catalog and peer updates across nodes without trusting wall clocks.
     pub clock: Arc<hlc::Clock>,
 
+    /// The files this node holds (see store.rs), and the transfers in progress (see transfer.rs).
+    pub store: Arc<store::Store>,
+    pub transfers: Arc<transfer::Transfers>,
+
     /// Which WebSocket connection holds each browser `session_id`.
     pub session_owners: Arc<RwLock<HashMap<SessionId, websocket::ConnOwner>>>,
     connection_counter: Arc<AtomicU64>,
@@ -203,13 +224,18 @@ impl NodeState {
     /// A node with no network, for unit tests.
     #[cfg(test)]
     pub fn for_tests(passphrase: Option<&str>) -> Self {
+        Self::for_tests_node("node_test", passphrase)
+    }
+
+    #[cfg(test)]
+    pub fn for_tests_node(node_id: &str, passphrase: Option<&str>) -> Self {
         let policy = || ratelimit::Policy {
             free_attempts: 3,
             base_lockout: Duration::from_secs(30),
             max_lockout: Duration::from_secs(300),
             global_cap: None,
         };
-        let node_id: NodeId = "node_test".to_string();
+        let node_id: NodeId = node_id.to_string();
         NodeState {
             local_peers: Arc::new(RwLock::new(HashMap::new())),
             local_senders: Arc::new(RwLock::new(HashMap::new())),
@@ -223,6 +249,14 @@ impl NodeState {
             mesh_limiter: Arc::new(ratelimit::AttemptLimiter::new(policy())),
             sessions: Arc::new(sessions::SessionStore::new()),
             clock: Arc::new(hlc::Clock::new(node_id)),
+            store: Arc::new(store::Store::open(&tempfile::tempdir().unwrap().keep(), 1 << 40).unwrap()),
+            transfers: Arc::new(transfer::Transfers::with_tuning(transfer::Tuning {
+                request_timeout: Duration::from_millis(400),
+                tick: Duration::from_millis(20),
+                idle_exit: Duration::from_secs(30),
+                map_interval: Duration::from_millis(100),
+                stall_timeout: Duration::from_secs(5),
+            })),
             session_owners: Arc::new(RwLock::new(HashMap::new())),
             connection_counter: Arc::new(AtomicU64::new(1)),
             clock_alert_at: Arc::new(Mutex::new(None)),
@@ -450,6 +484,16 @@ async fn main() {
         global_cap: None,
     }));
 
+    let data_dir = args.data_dir.clone().unwrap_or_else(|| tls::config_dir().join("files"));
+    let store = match store::Store::open(&data_dir, args.storage_limit_gb.saturating_mul(1 << 30)) {
+        Ok(store) => Arc::new(store),
+        Err(e) => {
+            eprintln!("Error: could not open the file store at {}: {e}", data_dir.display());
+            std::process::exit(1);
+        }
+    };
+    println!("Shared files are kept in {} (up to {} GiB)", data_dir.display(), args.storage_limit_gb);
+
     let state = NodeState {
         local_peers:          Arc::new(RwLock::new(HashMap::new())),
         local_senders:        Arc::new(RwLock::new(HashMap::new())),
@@ -461,6 +505,11 @@ async fn main() {
         tls_fingerprint,
         auth_limiter,
         mesh_limiter,
+        store:                store.clone(),
+        transfers:            Arc::new(transfer::Transfers::with_tuning(transfer::Tuning {
+            stall_timeout: Duration::from_secs(args.stall_timeout_secs),
+            ..Default::default()
+        })),
         sessions:             Arc::new(sessions::SessionStore::new()),
         clock:                Arc::new(hlc::Clock::new(node_id.clone())),
         session_owners:       Arc::new(RwLock::new(HashMap::new())),
@@ -471,6 +520,8 @@ async fn main() {
         local_ip: primary_local_ip,
         node_name: types::hostname(),
     };
+
+    state::load_catalog_from_store(&state).await;
 
     // ── Phase 3: connect to manually-specified peers ─────────────────────
     // These are processed before the HTTP server starts so the mesh is
@@ -543,9 +594,11 @@ async fn main() {
             loop {
                 interval.tick().await;
                 state_prune.sessions.purge_expired();
+                state::collect_garbage(&state_prune).await;
                 let mut files = state_prune.files.write().await;
                 let before = files.len();
                 state::prune_tombstones(&mut files, hlc::wall_clock_ms());
+                state::prune_unheld(&mut files, hlc::wall_clock_ms());
                 let pruned = before - files.len();
                 if pruned > 0 {
                     tracing::info!("State: pruned {pruned} stale tombstone(s) from file catalog");
@@ -651,6 +704,7 @@ async fn main() {
     let auth_status_route = warp::path("auth-status")
         .and(warp::get())
         .and(warp::cookie::optional("auth"))
+        .and(warp::ext::optional::<server::PeerAddr>())
         .and(warp::any().map({
             let s = state.clone();
             move || s.clone()
@@ -708,6 +762,7 @@ async fn main() {
     let app_state_ws = state.clone();
     let websocket_route = warp::path("ws")
         .and(with_session(state.clone(), false))
+        .and(warp::ext::optional::<server::PeerAddr>())
         .and(require_same_origin())
         .and(warp::ws())
         .and(warp::any().map(move || app_state_ws.clone()))
@@ -810,11 +865,13 @@ async fn main() {
     }
 
     let service = warp::service(routes);
+    let api = files_api::FilesApi::new(state.clone());
     if let (Some(listener), Some(port)) = (local_listener, local_http_port) {
         let hosts = vec![format!("localhost:{port}"), format!("127.0.0.1:{port}")];
         let service = service.clone();
+        let api = api.clone();
         tokio::spawn(async move {
-            if let Err(e) = server::serve(listener, None, Some(hosts), service).await {
+            if let Err(e) = server::serve(listener, None, Some(hosts), service, api).await {
                 tracing::error!("Local HTTP listener exited: {e}");
             }
         });
@@ -822,7 +879,7 @@ async fn main() {
 
     let acceptor = tls_server_config.map(tokio_rustls::TlsAcceptor::from);
     tokio::select! {
-        result = server::serve(public_listener, acceptor, None, service) => {
+        result = server::serve(public_listener, acceptor, None, service, api) => {
             if let Err(e) = result {
                 tracing::error!("Server exited: {e}");
             }

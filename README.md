@@ -1,16 +1,17 @@
 # LADEX - Local Area Data Exchange
 
-A fast and secure peer-to-peer file transfer tool built with Rust that enables seamless file sharing over local networks without requiring internet connectivity. LADEX provides a beautiful web interface with passphrase protection for secure transfers.
+A fast, secure, serverless file-sharing tool built with Rust for local networks, with no internet connection needed. Every device that runs LADEX is an equal peer: it keeps the files shared through it on its own disk and hands them to the other peers directly, several at a time. A web interface (any browser, including phones) is how you share and download.
 
 ## Features
 
 - **Passphrase Protection**: One passphrase (generated or your own) gates both the browser login and joining the mesh
 - **Zero Configuration**: No complex setup required - just run and share
 - **Local Network Only**: All transfers happen over your local network, ensuring privacy and speed
-- **Real-time Transfer**: WebSocket-based communication for instant file transfers
-- **Chunked Transfer**: Efficient handling of large files with progress tracking
+- **Files outlive tabs**: shared files are stored on the node, so closing the tab (or locking the phone) that shared one doesn't make it disappear
+- **Swarm downloads**: a node fetches a file in 1 MiB pieces from every node that has it, at once, and each piece is checked against its hash. A node starts passing pieces on as soon as it has them, so a popular file gets faster, not slower, the more devices want it. Nodes that go away mid-download, send bad data or go silent are simply skipped
+- **Resumable and streaming**: uploads continue where they stopped after a dropped connection; downloads are plain HTTP, so every browser (including iPhone Safari) saves them straight to disk with no memory limit, and a node that doesn't have a file yet streams it through while fetching it
 - **Text Messaging**: Send quick text messages between connected peers
-- **Folder Support**: Transfer entire directories with automatic compression
+- **Folder Support**: share a whole folder; download it into a real folder (Chrome, Edge) or as a streamed zip (everything else)
 - **Cross-Platform**: Works on Linux, macOS, and Windows
 - **Web Interface**: Modern, responsive web UI accessible from any browser
 - **Session Security**: Server restart invalidates old authentication cookies
@@ -97,16 +98,21 @@ When a passphrase is set:
 2. **Enter the passphrase** (if one is set)
 3. **Connect peers** by sharing the URL and passphrase with other devices
 4. **Send files** by dragging and dropping or using the file picker
-5. **Send folders** by selecting entire directories (automatically zipped)
+5. **Send folders** by selecting entire directories
 6. **Send messages** using the text input field
 7. **Monitor transfers** with the real-time progress indicators
 8. **Logout** when finished (passphrase mode only)
 
+## Where files are kept
+
+Shared files are stored on the node they were shared through, in `~/.ladex/files` (change with `--data-dir`), up to 20 GiB (`--storage-limit-gb`). A node also keeps a copy of any file it fetches for a download, so that it can serve it to others; unsharing a file deletes every copy. Files left half-received are deleted after a day. Don't share with LADEX what you wouldn't want copied onto the machines of the people on your network: anyone signed in can download any shared file, which stores it on their node.
+
 ## Testing
 
 ```bash
-cargo test             # unit tests (merging, sessions, handshake, validation, ...)
-node --test tests/js/  # browser-side receive policy; shares test cases with the Rust side
+cargo test                         # unit tests: storage, scheduling, merging, sessions, handshake, zip, ...
+node --test tests/js/*.test.js    # browser-side name handling; shares test cases with the Rust side
+cargo build && for t in data folder client; do node tests/e2e/$t.test.js; done   # real nodes, real HTTP
 ```
 
 ## Command Line Options
@@ -116,6 +122,8 @@ ladex [PASSPHRASE]     # Launch with your own passphrase
 ladex -s, --secure     # Launch with a generated passphrase
 ladex                  # Launch without a passphrase (open access, prints a warning)
 ladex --local-port N   # Port for the localhost-only HTTP listener (default: port + 1)
+ladex --data-dir DIR   # Where shared files are stored (default: ~/.ladex/files)
+ladex --storage-limit-gb N   # Most disk this node may use for shared files (default: 20)
 ```
 
 ## Build from Source

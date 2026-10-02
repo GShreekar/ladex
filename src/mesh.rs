@@ -31,13 +31,18 @@ use warp::{Rejection, Reply};
 // with a SPAKE2 exchange instead.
 // v3: catalog and peer entries are ordered by hybrid-logical-clock `version`
 // instead of wall-clock time, and the handshake carries each side's clock.
-pub const PROTOCOL_VERSION: u32 = 3;
+// v4: files are held by nodes and move between them as chunks (ChunkMap,
+// GetManifest, Manifest, GetChunks, ChunkError and binary chunk frames); catalog
+// entries list `holders` per node instead of hosting browser sessions.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 // Phase 10 timing constants
 const HEARTBEAT_INTERVAL:  Duration = Duration::from_secs(5);
 const HEARTBEAT_TIMEOUT:   Duration = Duration::from_secs(15);
 const RECONNECT_GIVE_UP:   Duration = Duration::from_secs(600); // 10 min
 const HANDSHAKE_TIMEOUT:   Duration = Duration::from_secs(10);
+// Chunk frames waiting to be written to one peer.
+const DATA_QUEUE_FRAMES: usize = 8;
 // Mesh messages are full catalog / chat snapshots, so allow far more than a
 // browser tab may send, but not the library default of 64 MiB.
 const MAX_MESH_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
@@ -74,6 +79,12 @@ pub struct MeshPeerHandle {
     pub addr:       SocketAddr,
     pub http_port:  u16,
     pub sender:     mpsc::UnboundedSender<MeshMessage>,
+    /// Binary chunk frames. Bounded, so a slow link holds the sender back
+    /// instead of letting chunks pile up in memory; control messages use
+    /// `sender` and go first.
+    pub data:       mpsc::Sender<Vec<u8>>,
+    /// Limits how many chunk requests from this peer are served at once.
+    pub serve_slots: Arc<tokio::sync::Semaphore>,
     pub last_seen:  Instant,
     /// Latest measured RTT to this peer (ms).  None until first Pong.
     /// Phase 6: exposed to browser tabs via PeerSync.node_rtt_ms.
@@ -146,6 +157,16 @@ pub enum MeshMessage {
     PeerSync     { peers:    Vec<PeerInfo>     },
     ChatSync     { messages: Vec<TextMessage>  },
     ChatMessage  { message:  TextMessage       },
+
+    // ── File transfer (see transfer.rs) ───────────────────────────────────
+    /// A node still fetching a file says which chunks it has, so others can fetch from it too.
+    ChunkMap { file_id: String, chunks: u32, bitmap: String },
+    GetManifest { file_id: String },
+    /// The file's chunk hashes, as hex (32 bytes per chunk).
+    Manifest { file_id: String, size: u64, hashes: String },
+    /// Ask for chunks; they come back as binary frames, not as messages.
+    GetChunks { file_id: String, indices: Vec<u32> },
+    ChunkError { file_id: String, index: u32, reason: String },
 
     // Phase 5 — SignalRelay
     /// Routes a WebRTC payload between browser tabs via the mesh node layer.
@@ -229,34 +250,23 @@ async fn peer_departed_cleanup(state: &NodeState, departed_node_id: &NodeId) {
         }
     }
 
-    // Tombstone files whose only remaining host session belongs to the departed node.
-    // We can't perfectly know which sessions belonged to which node here (sessions
-    // are purged on WS disconnect), but we mark files whose host set is now empty.
-    let tombstoned: Vec<FileMetadata> = {
+    // The departed node can no longer serve anything. Its files stay listed,
+    // marked as unavailable, until it returns (or nobody holds them for a day).
+    let changed: Vec<FileMetadata> = {
         let mut files = state.files.write().await;
-        let mut ts = Vec::new();
-        for file in files.values_mut() {
-            if file.deleted { continue; }
-            // If every host session is now gone from local_peers, tombstone.
-            // (In a real multi-node scenario sessions for the departed node
-            //  were already cleaned up by cleanup_peer in websocket.rs.)
-            if file.hosts.is_empty() {
-                file.version = state.clock.now();
-                file.deleted = true;
-                file.deleted_at = file.version.wall;
-                ts.push(file.clone());
-            }
-        }
-        ts
+        files
+            .values_mut()
+            .filter(|f| !f.deleted && f.is_held_by(departed_node_id))
+            .map(|file| {
+                file.set_holder(departed_node_id, false, state.clock.now());
+                file.clone()
+            })
+            .collect()
     };
-    state::push_files_to_mesh(&state.mesh_peers, tombstoned).await;
+    state::push_files_to_mesh(&state.mesh_peers, changed).await;
+    crate::transfer::sources_changed(state);
 
-    // Refresh local tab file list
-    let files: Vec<FileMetadata> = {
-        let files = state.files.read().await;
-        files.values().filter(|f| !f.deleted).cloned().collect()
-    };
-    crate::websocket::broadcast(state, ServerMessage::FileListUpdate { files }).await;
+    state::broadcast_catalog(state).await;
 }
 
 /// Phase 10 §10.3 — Reconnect with exponential backoff.
@@ -640,6 +650,7 @@ pub async fn connect_to_peer(addr: IpAddr, http_port: u16, state: NodeState) -> 
         .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
 
     let (peer_tx, mut peer_rx) = mpsc::unbounded_channel::<MeshMessage>();
+    let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(DATA_QUEUE_FRAMES);
     {
         let mut peers = state.mesh_peers.write().await;
         peers.insert(peer_node_id.clone(), MeshPeerHandle {
@@ -648,11 +659,14 @@ pub async fn connect_to_peer(addr: IpAddr, http_port: u16, state: NodeState) -> 
             addr:      remote_addr,
             http_port,
             sender:    peer_tx.clone(),
+            data:      data_tx,
+            serve_slots: Arc::new(tokio::sync::Semaphore::new(crate::transfer::SERVE_SLOTS)),
             last_seen: Instant::now(),
             rtt_ms:    None,
         });
     }
     tracing::info!("Mesh: registered peer {peer_node_id} ({peer_node_name})");
+    crate::transfer::sources_changed(&state);
 
     post_handshake_sync(&peer_tx, &state).await;
 
@@ -660,9 +674,21 @@ pub async fn connect_to_peer(addr: IpAddr, http_port: u16, state: NodeState) -> 
     spawn_heartbeat(state.clone(), peer_node_id.clone(), addr, http_port);
 
     let write_task = tokio::spawn(async move {
-        while let Some(msg) = peer_rx.recv().await {
-            let json = match serde_json::to_string(&msg) { Ok(j) => j, Err(_) => continue };
-            if tt_tx.send(tokio_tungstenite::tungstenite::Message::Text(json)).await.is_err() { break; }
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+        loop {
+            // Control messages (heartbeats, catalog) always go before chunk data.
+            tokio::select! {
+                biased;
+                msg = peer_rx.recv() => {
+                    let Some(msg) = msg else { break };
+                    let json = match serde_json::to_string(&msg) { Ok(j) => j, Err(_) => continue };
+                    if tt_tx.send(WsMessage::Text(json)).await.is_err() { break; }
+                }
+                frame = data_rx.recv() => {
+                    let Some(frame) = frame else { break };
+                    if tt_tx.send(WsMessage::Binary(frame)).await.is_err() { break; }
+                }
+            }
         }
     });
 
@@ -678,6 +704,7 @@ pub async fn connect_to_peer(addr: IpAddr, http_port: u16, state: NodeState) -> 
                         Err(e) => tracing::warn!("Mesh outbound: bad JSON from {peer_id_rd}: {e}"),
                     }
                 }
+                Ok(msg) if msg.is_binary() => crate::transfer::on_binary_frame(&state_rd, &peer_id_rd, &msg.into_data()),
                 Ok(msg) if msg.is_close() => break,
                 Err(e) => { tracing::warn!("Mesh outbound: WS error from {peer_id_rd}: {e}"); break; }
                 _ => {}
@@ -712,6 +739,7 @@ async fn run_connection(
     state: NodeState,
 ) {
     let (peer_tx, mut peer_rx) = mpsc::unbounded_channel::<MeshMessage>();
+    let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(DATA_QUEUE_FRAMES);
     {
         let mut peers = state.mesh_peers.write().await;
         peers.insert(peer_node_id.clone(), MeshPeerHandle {
@@ -720,11 +748,14 @@ async fn run_connection(
             addr,
             http_port,
             sender:    peer_tx.clone(),
+            data:      data_tx,
+            serve_slots: Arc::new(tokio::sync::Semaphore::new(crate::transfer::SERVE_SLOTS)),
             last_seen: Instant::now(),
             rtt_ms:    None,
         });
     }
     tracing::info!("Mesh: registered inbound peer {peer_node_id} ({peer_node_name})");
+    crate::transfer::sources_changed(&state);
 
     post_handshake_sync(&peer_tx, &state).await;
 
@@ -735,9 +766,20 @@ async fn run_connection(
     spawn_heartbeat(state.clone(), peer_node_id.clone(), addr.ip(), http_port);
 
     let write_task = tokio::spawn(async move {
-        while let Some(msg) = peer_rx.recv().await {
-            let json = match serde_json::to_string(&msg) { Ok(j) => j, Err(_) => continue };
-            if ws_tx.send(Message::text(json)).await.is_err() { break; }
+        loop {
+            // Control messages (heartbeats, catalog) always go before chunk data.
+            tokio::select! {
+                biased;
+                msg = peer_rx.recv() => {
+                    let Some(msg) = msg else { break };
+                    let json = match serde_json::to_string(&msg) { Ok(j) => j, Err(_) => continue };
+                    if ws_tx.send(Message::text(json)).await.is_err() { break; }
+                }
+                frame = data_rx.recv() => {
+                    let Some(frame) = frame else { break };
+                    if ws_tx.send(Message::binary(frame)).await.is_err() { break; }
+                }
+            }
         }
     });
 
@@ -750,6 +792,7 @@ async fn run_connection(
                     Err(e) => tracing::warn!("Mesh inbound: bad JSON from {peer_node_id}: {e}"),
                 }
             }
+            Ok(msg) if msg.is_binary() => crate::transfer::on_binary_frame(&state, &peer_node_id, msg.as_bytes()),
             Ok(msg) if msg.is_close() => break,
             Err(e) => { tracing::warn!("Mesh inbound: WS error from {peer_node_id}: {e}"); break; }
             _ => {}
@@ -792,7 +835,7 @@ async fn post_handshake_sync(peer_tx: &mpsc::UnboundedSender<MeshMessage>, state
 // Dispatch (Phases 3–7)
 // ---------------------------------------------------------------------------
 
-async fn dispatch(msg: &MeshMessage, from_node_id: &NodeId, state: &NodeState) {
+pub(crate) async fn dispatch(msg: &MeshMessage, from_node_id: &NodeId, state: &NodeState) {
     match msg {
         // ── Phase 3: keepalive ───────────────────────────────────────────
         MeshMessage::Ping { ts } => {
@@ -843,7 +886,17 @@ async fn dispatch(msg: &MeshMessage, from_node_id: &NodeId, state: &NodeState) {
         MeshMessage::CatalogSync { files } => {
             tracing::debug!("Mesh CatalogSync from {from_node_id}: {} file(s)", files.len());
             state::apply_catalog_sync(state, files.clone(), from_node_id).await;
+            // The catalog may have lost us as a holder while we were away, or learned of deletions.
+            state::reassert_holdership(state).await;
+            crate::transfer::sources_changed(state);
         }
+
+        // ── File transfer ────────────────────────────────────────────────
+        MeshMessage::GetManifest { file_id } => crate::transfer::serve_manifest(state, from_node_id, file_id).await,
+        MeshMessage::Manifest { file_id, hashes, .. } => crate::transfer::on_manifest(state, from_node_id, file_id, hashes),
+        MeshMessage::GetChunks { file_id, indices } => crate::transfer::serve_chunks(state, from_node_id, file_id, indices.clone()).await,
+        MeshMessage::ChunkError { file_id, index, .. } => crate::transfer::on_chunk_error(state, from_node_id, file_id, *index),
+        MeshMessage::ChunkMap { file_id, chunks, bitmap } => crate::transfer::on_chunk_map(state, from_node_id, file_id, *chunks, bitmap),
         MeshMessage::PeerSync { peers } => {
             tracing::debug!("Mesh PeerSync from {from_node_id}: {} peer(s)", peers.len());
             state::apply_peer_sync(state, peers.clone(), from_node_id).await;
@@ -907,18 +960,14 @@ async fn dispatch(msg: &MeshMessage, from_node_id: &NodeId, state: &NodeState) {
     }
 }
 
-/// A relay may only carry WebRTC signaling and download/offer requests, and
-/// the device it says it is from must really be hosted by the sending node.
-/// Without this a peer could push any message (fake file lists, errors,
-/// offers "from" someone else) straight into a user's browser tab.
+/// A relay may only carry a file offer (or its refusal), and the device it
+/// says it is from must really be hosted by the sending node. Without this a
+/// peer could push any message (fake file lists, errors, offers "from"
+/// someone else) straight into a user's browser tab.
 async fn relay_is_legitimate(state: &NodeState, msg: &ServerMessage, sender_node: &NodeId) -> bool {
     let claimed_from = match msg {
-        ServerMessage::WebRTCOffer { from_session_id, .. }
-        | ServerMessage::WebRTCAnswer { from_session_id, .. }
-        | ServerMessage::ICECandidate { from_session_id, .. }
-        | ServerMessage::IncomingFileOffer { from_session_id, .. }
+        ServerMessage::IncomingFileOffer { from_session_id, .. }
         | ServerMessage::FileOfferDeclined { from_session_id, .. } => from_session_id,
-        ServerMessage::DownloadRequest { requester_session_id, .. } => requester_session_id,
         _ => return false,
     };
     let peers = state.local_peers.read().await;
@@ -1026,7 +1075,7 @@ mod tests {
     }
 
     fn offer(from: &str) -> ServerMessage {
-        ServerMessage::WebRTCOffer { from_session_id: from.into(), sdp: "{}".into() }
+        ServerMessage::IncomingFileOffer { file_id: "f".into(), from_session_id: from.into() }
     }
 
     #[tokio::test]
@@ -1034,8 +1083,8 @@ mod tests {
         let state = node_with_device("peer_x", "node_other", false).await;
         let sender = "node_other".to_string();
         assert!(relay_is_legitimate(&state, &offer("peer_x"), &sender).await);
-        let request = ServerMessage::DownloadRequest { file_id: "f".into(), requester_session_id: "peer_x".into(), resume_from_bytes: None };
-        assert!(relay_is_legitimate(&state, &request, &sender).await);
+        let declined = ServerMessage::FileOfferDeclined { file_id: "f".into(), from_session_id: "peer_x".into() };
+        assert!(relay_is_legitimate(&state, &declined, &sender).await);
     }
 
     #[tokio::test]
@@ -1052,7 +1101,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_signaling_messages_may_be_relayed_into_a_browser_tab() {
+    async fn only_file_offers_may_be_relayed_into_a_browser_tab() {
         let state = node_with_device("peer_x", "node_other", false).await;
         let sender = "node_other".to_string();
         for forged in [

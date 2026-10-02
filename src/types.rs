@@ -1,6 +1,6 @@
 use crate::hlc::Stamp;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 
@@ -92,68 +92,83 @@ pub struct AuthResponse {
     pub message: Option<String>,
 }
 
+/// Whether one node has the complete file. Each node only ever changes its
+/// own record, with a stamp from its own clock, so concurrent changes by
+/// different nodes merge instead of overwriting each other.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Holder {
+    pub since: Stamp,
+    pub present: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileMetadata {
     pub id: String,
     pub name: String,
     pub size: u64,
     pub mime_type: String,
+    /// Device (browser session) that shared it; empty for files found on disk
+    /// after a restart. Only that device, or the machine running the node it
+    /// was shared through, may unshare it.
     pub uploader_id: SessionId,
-    pub hosts: HashSet<SessionId>,
+    /// Node it was first shared through.
+    #[serde(default)]
+    pub uploader_node: NodeId,
+    /// Nodes that have the complete file (and can serve it).
+    #[serde(default)]
+    pub holders: HashMap<NodeId, Holder>,
     pub uploaded_at: chrono::DateTime<chrono::Utc>,
     /// Unix-millisecond wall-clock time of creation, for display only.
     /// Merging uses `version`.
     #[serde(default)]
     pub created_at: u64,
 
-    /// Stamp of the latest change to this entry (create, delete, new host,
-    /// checksum). The entry with the greater stamp wins a merge; see hlc.rs.
+    /// Stamp of the latest change to this entry (create, delete). The entry
+    /// with the greater stamp wins a merge; see hlc.rs. Holders merge
+    /// separately, node by node.
     #[serde(default)]
     pub version: Stamp,
 
-    // ── Phase 4: tombstone support ─────────────────────────────────────────
+    // ── tombstone support ──────────────────────────────────────────────────
     /// True when this file has been deleted.  Tombstones propagate across the
-    /// mesh so all nodes stop advertising the file.  The entry is pruned from
-    /// memory after `deleted_at` is 60+ seconds old (see `state::prune_tombstones`).
+    /// mesh so all nodes stop advertising the file and delete their copy.  The
+    /// entry is pruned from memory after a while (see `state::prune_tombstones`).
     #[serde(default)]
     pub deleted: bool,
     /// Unix-millisecond wall-clock time of deletion, for display only.
     #[serde(default)]
     pub deleted_at: u64,
 
-    // ── Phase 11: integrity checksum ───────────────────────────────────────
-    /// SHA-256 hex digest of the original file bytes, computed on the sender
-    /// side in a Web Worker.  `None` if the sender didn't compute it (e.g.
-    /// very old client or a file shared before the field was introduced).
-    /// Receivers compare against this value after transfer and surface ✓/✗ UI.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sha256: Option<String>,
+    /// Identifies the exact contents (size and every chunk hash, see store.rs).
+    /// A node that fetches the file checks what it receives against it.
+    #[serde(default)]
+    pub manifest_root: Option<String>,
 
-    /// F6: true when this catalog entry is a folder rather than a single
-    /// file. The server treats it as completely opaque — same as every
-    /// other field here, it's a signaling relay only; the sending client
-    /// decides whether to respond to a download request with a normal
-    /// single-file stream or a folder-manifest stream based on this flag,
-    /// same as it already decides FSAA vs Blob-fallback.
+    /// A folder is a small JSON file listing its children (stored like any
+    /// other file), which are themselves catalog entries with `parent` set.
     #[serde(default)]
     pub is_folder: bool,
+    #[serde(default)]
+    pub parent: Option<String>,
+    /// For a folder: what is inside, for display. `size` is the listing's own size.
+    #[serde(default)]
+    pub folder_bytes: u64,
+    #[serde(default)]
+    pub folder_files: u32,
 }
 
-/// What a browser tab may say about a file it shares. The node fills in
-/// everything else (uploader, hosts, timestamps), so a tab can't claim to be
-/// someone else or backdate an entry. Unknown fields sent by older pages are
-/// ignored.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FileUploadRequest {
-    pub id: String,
-    pub name: String,
-    pub size: u64,
-    #[serde(default)]
-    pub mime_type: String,
-    #[serde(default)]
-    pub sha256: Option<String>,
-    #[serde(default)]
-    pub is_folder: bool,
+impl FileMetadata {
+    pub fn is_held_by(&self, node: &str) -> bool {
+        self.holders.get(node).is_some_and(|h| h.present)
+    }
+
+    pub fn holder_nodes(&self) -> impl Iterator<Item = &NodeId> {
+        self.holders.iter().filter(|(_, h)| h.present).map(|(node, _)| node)
+    }
+
+    pub fn set_holder(&mut self, node: &str, present: bool, since: Stamp) {
+        self.holders.insert(node.to_string(), Holder { since, present });
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -190,76 +205,6 @@ pub enum ClientMessage {
         nickname: String,
     },
 
-    /// Peer registers a file it is willing to share (metadata only, zero bytes)
-    #[serde(rename = "file_upload")]
-    FileUpload {
-        session_id: SessionId,
-        file: FileUploadRequest,
-    },
-
-    /// Peer wants to download a file — server picks a host and tells it to
-    /// initiate a WebRTC connection back to the requester
-    #[serde(rename = "request_download")]
-    RequestDownload {
-        session_id: SessionId,
-        file_id: String,
-    },
-
-    /// Peer finished downloading a file and is now also a host
-    #[serde(rename = "file_downloaded")]
-    FileDownloaded {
-        session_id: SessionId,
-        file_id: String,
-    },
-
-    // ── WebRTC signaling ─────────────────────────────────────────────────
-    /// SDP offer from initiator → target (relayed via server)
-    #[serde(rename = "webrtc_offer")]
-    WebRTCOffer {
-        session_id: SessionId,
-        target_session_id: SessionId,
-        sdp: String,
-    },
-
-    /// SDP answer from target → initiator (relayed via server)
-    #[serde(rename = "webrtc_answer")]
-    WebRTCAnswer {
-        session_id: SessionId,
-        target_session_id: SessionId,
-        sdp: String,
-    },
-
-    /// ICE candidate exchange (both directions, relayed via server)
-    #[serde(rename = "ice_candidate")]
-    ICECandidate {
-        session_id: SessionId,
-        target_session_id: SessionId,
-        candidate: String,
-    },
-
-    /// Phase 6: Requester explicitly names the host it chose (client-side selection).
-    /// The node honors this choice without override.  Returns an error if the
-    /// named peer is unreachable rather than silently rerouting.
-    #[serde(rename = "request_download_from")]
-    RequestDownloadFrom {
-        session_id: SessionId,
-        file_id: String,
-        /// The specific peer session ID the client chose as host.
-        host_peer_id: SessionId,
-        /// F8: resume a previously-interrupted download from this byte
-        /// offset instead of starting over. `None`/0 = fresh download.
-        #[serde(default)]
-        resume_from_bytes: Option<u64>,
-    },
-
-    /// Phase 5: Receiver signals it does not want the incoming file.
-    /// Causes the sender to surface a rejection toast instead of stalling.
-    #[serde(rename = "transfer_declined")]
-    TransferDeclined {
-        session_id: SessionId,
-        file_id: String,
-    },
-
     #[serde(rename = "ping")]
     Ping {
         session_id: SessionId,
@@ -271,16 +216,6 @@ pub enum ClientMessage {
         content: String,
     },
 
-    /// Phase 11.3: Browser sends this after the SHA-256 Web Worker finishes
-    /// hashing the shared file.  The server patches the existing FileMetadata
-    /// entry with the hash and re-syncs to the mesh.
-    #[serde(rename = "file_checksum_update")]
-    FileChecksumUpdate {
-        session_id: SessionId,
-        file_id: String,
-        sha256: String,
-    },
-
     /// F4: unshare a file. Only the original uploader may do this.
     #[serde(rename = "delete_file")]
     DeleteFile {
@@ -288,9 +223,8 @@ pub enum ClientMessage {
         file_id: String,
     },
 
-    /// F3: push a file directly to one peer instead of publishing it to the
-    /// catalog for anyone to find. Routed to `target_session_id`, who gets
-    /// an IncomingFileOffer consent prompt.
+    /// F3: point one peer at a file it may want. Routed to
+    /// `target_session_id`, who gets an IncomingFileOffer consent prompt.
     #[serde(rename = "offer_file_to")]
     OfferFileTo {
         session_id: SessionId,
@@ -346,38 +280,6 @@ pub enum ServerMessage {
         peers: Vec<PeerInfo>,
     },
 
-    /// Server tells a host: "peer X wants file Y — initiate WebRTC to them"
-    #[serde(rename = "download_request")]
-    DownloadRequest {
-        file_id: String,
-        requester_session_id: SessionId,
-        /// F8: resume from this byte offset — see ClientMessage::RequestDownloadFrom.
-        #[serde(default)]
-        resume_from_bytes: Option<u64>,
-    },
-
-    // ── WebRTC signaling (targeted to a single peer) ─────────────────────
-    /// Forwarded SDP offer
-    #[serde(rename = "webrtc_offer")]
-    WebRTCOffer {
-        from_session_id: SessionId,
-        sdp: String,
-    },
-
-    /// Forwarded SDP answer
-    #[serde(rename = "webrtc_answer")]
-    WebRTCAnswer {
-        from_session_id: SessionId,
-        sdp: String,
-    },
-
-    /// Forwarded ICE candidate
-    #[serde(rename = "ice_candidate")]
-    ICECandidate {
-        from_session_id: SessionId,
-        candidate: String,
-    },
-
     // ── Misc ─────────────────────────────────────────────────────────────
     #[serde(rename = "error")]
     Error {
@@ -395,22 +297,6 @@ pub enum ServerMessage {
     #[serde(rename = "message_history")]
     MessageHistory {
         messages: Vec<TextMessage>,
-    },
-
-    /// Phase 5: Receiver declined the incoming file transfer.
-    /// Delivered to the sender so it can toast the user instead of stalling.
-    #[serde(rename = "transfer_declined")]
-    TransferDeclined {
-        file_id: String,
-        from_session_id: SessionId,
-    },
-
-    /// Phase 6: The explicitly named host peer was not found / not reachable.
-    /// Client should retry with a different host selection.
-    #[serde(rename = "host_unreachable")]
-    HostUnreachable {
-        file_id: String,
-        host_peer_id: SessionId,
     },
 
     /// Phase 10 §10.4: AP isolation diagnostic — no mesh peers found after 10s.

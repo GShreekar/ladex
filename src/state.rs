@@ -35,6 +35,7 @@ use crate::NodeState;
 use crate::websocket;
 
 const TOMBSTONE_TTL_MS: u64 = 60 * 60 * 1000;
+const UNHELD_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 pub const MAX_CATALOG_ENTRIES: usize = 5000;
 const MAX_PEERS: usize = 2000;
 
@@ -42,21 +43,40 @@ const MAX_PEERS: usize = 2000;
 // Merge: file catalog
 // ---------------------------------------------------------------------------
 
-/// Merge `incoming` files into `local`; the greater `version` wins.  New ids
-/// are skipped once `capacity` is reached, but updates to known ids still apply.
-/// Returns how many new entries were skipped for lack of room.
+fn merge_holders(into: &mut HashMap<NodeId, Holder>, from: HashMap<NodeId, Holder>) {
+    for (node, holder) in from {
+        match into.get(&node) {
+            Some(existing) if existing.since >= holder.since => {}
+            _ => {
+                into.insert(node, holder);
+            }
+        }
+    }
+}
+
+/// Merge `incoming` files into `local`. The entry with the greater `version`
+/// wins; holders are merged node by node (each node's own record is the
+/// newest stamp) whichever entry wins, so a node adding itself as a holder is
+/// never lost to a concurrent change elsewhere. New ids are skipped once
+/// `capacity` is reached, but updates to known ids still apply. Returns how
+/// many new entries were skipped for lack of room.
 pub fn merge_files(local: &mut HashMap<String, FileMetadata>, incoming: Vec<FileMetadata>, capacity: usize) -> usize {
     let mut skipped = 0;
     for entry in incoming {
-        match local.get(&entry.id) {
-            Some(existing) if existing.version >= entry.version => {}
-            Some(_) => {
+        let Some(existing) = local.get_mut(&entry.id) else {
+            if local.len() >= capacity {
+                skipped += 1;
+            } else {
                 local.insert(entry.id.clone(), entry);
             }
-            None if local.len() >= capacity => skipped += 1,
-            None => {
-                local.insert(entry.id.clone(), entry);
-            }
+            continue;
+        };
+        if entry.version > existing.version {
+            let old_holders = std::mem::take(&mut existing.holders);
+            *existing = entry;
+            merge_holders(&mut existing.holders, old_holders);
+        } else {
+            merge_holders(&mut existing.holders, entry.holders);
         }
     }
     skipped
@@ -66,6 +86,13 @@ pub fn merge_files(local: &mut HashMap<String, FileMetadata>, incoming: Vec<File
 /// (a peer with a fast clock, within the drift limit) is simply not old yet.
 pub fn prune_tombstones(local: &mut HashMap<String, FileMetadata>, now_ms: u64) {
     local.retain(|_, f| !f.deleted || now_ms.saturating_sub(f.version.wall) < TOMBSTONE_TTL_MS);
+}
+
+/// Drop entries no node has held for a day: nobody can serve them, and the
+/// listing shouldn't keep them forever. A node that still has the file puts
+/// itself back as a holder when it reconnects (see `reassert_holdership`).
+pub fn prune_unheld(local: &mut HashMap<String, FileMetadata>, now_ms: u64) {
+    local.retain(|_, f| f.deleted || f.holder_nodes().next().is_some() || now_ms.saturating_sub(f.version.wall) < UNHELD_TTL_MS);
 }
 
 /// Same as `prune_tombstones`, for departed peers. Without it a correctly
@@ -187,21 +214,173 @@ pub async fn report_clock_problem(state: &NodeState, from: &str, problem: &impl 
 
 /// Apply an incoming catalog sync and fan out the updated list to local tabs.
 pub async fn apply_catalog_sync(state: &NodeState, incoming: Vec<FileMetadata>, from: &str) {
-    let (accepted, clock_problem) = accept_from_mesh(state, incoming, validate::incoming_file, |f| &f.version);
-    let updated: Vec<FileMetadata> = {
+    let (mut accepted, clock_problem) = accept_from_mesh(state, incoming, validate::incoming_file, |f| &f.version);
+    // Holder records carry stamps too; absorb them so what this node stamps next outranks them.
+    for file in &mut accepted {
+        file.holders.retain(|_, holder| state.clock.observe(&holder.since).is_ok());
+    }
+    let ids: Vec<String> = accepted.iter().map(|f| f.id.clone()).collect();
+    let (updated, unshared): (Vec<FileMetadata>, Vec<String>) = {
         let mut files = state.files.write().await;
         evict_old_tombstones(&mut files, MAX_CATALOG_ENTRIES);
         let skipped = merge_files(&mut files, accepted, MAX_CATALOG_ENTRIES);
         if skipped > 0 {
             tracing::warn!("Catalog full: ignored {skipped} new entries from {from}");
         }
+        let unshared = ids.into_iter().filter(|id| files.get(id).is_some_and(|f| f.deleted)).collect();
         // Return only non-deleted files for the browser (tombstones are internal)
-        files.values().filter(|f| !f.deleted).cloned().collect()
+        (live_files(&files), unshared)
     };
+    // Someone unshared these: our copy (if any) goes too.
+    for id in unshared {
+        forget_file(state, &id).await;
+    }
     if let Some(problem) = clock_problem {
         report_clock_problem(state, from, &problem).await;
     }
     websocket::broadcast(state, ServerMessage::FileListUpdate { files: updated }).await;
+}
+
+pub fn live_files(files: &HashMap<String, FileMetadata>) -> Vec<FileMetadata> {
+    files.values().filter(|f| !f.deleted).cloned().collect()
+}
+
+pub async fn broadcast_catalog(state: &NodeState) {
+    let files = live_files(&*state.files.read().await);
+    websocket::broadcast(state, ServerMessage::FileListUpdate { files }).await;
+}
+
+/// Delete our copy of a file that was unshared, and stop any transfer of it.
+pub async fn forget_file(state: &NodeState, id: &str) {
+    crate::transfer::cancel(state, id);
+    if state.store.get(id).is_some() {
+        tracing::info!("Store: removing {id} (unshared)");
+        state.store.remove(id);
+    }
+}
+
+/// Add or replace a catalog entry for a file this node holds: saves it with the
+/// file on disk (so it survives a restart), shows it to local tabs, and tells the mesh.
+pub async fn publish_entry(state: &NodeState, entry: FileMetadata) {
+    if let Some(blob) = state.store.get(&entry.id) {
+        blob.set_entry(entry.clone());
+        blob.persist().await;
+    }
+    {
+        let mut files = state.files.write().await;
+        evict_old_tombstones(&mut files, MAX_CATALOG_ENTRIES);
+        merge_files(&mut files, vec![entry.clone()], MAX_CATALOG_ENTRIES);
+    }
+    broadcast_catalog(state).await;
+    push_file_to_mesh(&state.mesh_peers, entry).await;
+}
+
+/// This node has just finished fetching a file: it can serve it from now on.
+pub async fn add_self_as_holder(state: &NodeState, id: &str) {
+    let entry = {
+        let mut files = state.files.write().await;
+        match files.get_mut(id) {
+            Some(file) if !file.deleted => {
+                file.set_holder(&state.node_id, true, state.clock.now());
+                Some(file.clone())
+            }
+            _ => None,
+        }
+    };
+    if let Some(entry) = entry {
+        publish_entry(state, entry).await;
+    }
+}
+
+// A partly received file nobody has touched for this long is deleted.
+const ABANDONED_PARTIAL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+// Files uploaded for a folder that was never published are deleted after this.
+const UNPUBLISHED_FOLDER_FILES_MS: u64 = 60 * 60 * 1000;
+
+/// Housekeeping for the disk: abandoned partial files, and files uploaded for a
+/// folder that never got published (the upload was cancelled or died).
+pub async fn collect_garbage(state: &NodeState) {
+    collect_garbage_with(state, ABANDONED_PARTIAL, UNPUBLISHED_FOLDER_FILES_MS).await;
+}
+
+async fn collect_garbage_with(state: &NodeState, partial_ttl: std::time::Duration, orphan_ttl_ms: u64) {
+    for blob in state.store.all() {
+        let abandoned = !blob.is_complete()
+            && !blob.is_being_written()
+            && !state.transfers.is_downloading(blob.id())
+            && blob.idle_for() >= partial_ttl;
+        if abandoned {
+            tracing::info!("Store: removing {} (partly received, untouched for a long time)", blob.id());
+            state.store.remove(blob.id());
+        }
+    }
+
+    let now = crate::hlc::wall_clock_ms();
+    let tombstones: Vec<FileMetadata> = {
+        let mut files = state.files.write().await;
+        let orphans: Vec<String> = files
+            .values()
+            .filter(|f| !f.deleted && f.uploader_node == state.node_id && now.saturating_sub(f.created_at) >= orphan_ttl_ms)
+            .filter(|f| f.parent.as_ref().is_some_and(|parent| !files.get(parent).is_some_and(|p| !p.deleted)))
+            .map(|f| f.id.clone())
+            .collect();
+        let mut tombstones = Vec::new();
+        for id in orphans {
+            if let Some(file) = files.get_mut(&id) {
+                file.version = state.clock.now();
+                file.deleted = true;
+                file.deleted_at = file.version.wall;
+                tombstones.push(file.clone());
+            }
+        }
+        tombstones
+    };
+    if !tombstones.is_empty() {
+        for tombstone in &tombstones {
+            forget_file(state, &tombstone.id).await;
+        }
+        broadcast_catalog(state).await;
+        push_files_to_mesh(&state.mesh_peers, tombstones).await;
+    }
+}
+
+/// Entries for the files on this node's disk, from before it last stopped.
+pub async fn load_catalog_from_store(state: &NodeState) {
+    let mut files = state.files.write().await;
+    for blob in state.store.all() {
+        if let (true, Some(entry)) = (blob.is_complete(), blob.entry()) {
+            if let Some(entry) = validate::incoming_file(entry) {
+                merge_files(&mut files, vec![entry], MAX_CATALOG_ENTRIES);
+            }
+        }
+    }
+}
+
+/// After syncing with the mesh: for every complete file on disk, make sure the
+/// catalog lists this node as a holder (other nodes took it off when we left),
+/// and delete our copy if the catalog says it was unshared meanwhile.
+pub async fn reassert_holdership(state: &NodeState) {
+    let mut changed = Vec::new();
+    let mut unshared = Vec::new();
+    {
+        let mut files = state.files.write().await;
+        for blob in state.store.all().into_iter().filter(|b| b.is_complete()) {
+            match files.get_mut(blob.id()) {
+                Some(file) if file.deleted => unshared.push(blob.id().to_string()),
+                Some(file) if !file.is_held_by(&state.node_id) => {
+                    file.set_holder(&state.node_id, true, state.clock.now());
+                    changed.push(file.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+    for id in unshared {
+        forget_file(state, &id).await;
+    }
+    for entry in changed {
+        publish_entry(state, entry).await;
+    }
 }
 
 /// Apply an incoming peer sync and fan out the updated peer list to local tabs.
@@ -371,14 +550,18 @@ mod tests {
             size: 1,
             mime_type: "text/plain".into(),
             uploader_id: "peer_a".into(),
-            hosts: ["peer_a".to_string()].into(),
+            uploader_node: "node_a".into(),
+            holders: [("node_a".to_string(), Holder { since: version.clone(), present: true })].into(),
             uploaded_at: chrono::Utc::now(),
             created_at: version.wall,
+            version,
             deleted: false,
             deleted_at: 0,
-            version,
-            sha256: None,
+            manifest_root: Some("ab".repeat(32)),
             is_folder: false,
+            parent: None,
+            folder_bytes: 0,
+            folder_files: 0,
         }
     }
 
@@ -410,15 +593,73 @@ mod tests {
         assert_eq!(local["f"].name, "newer.txt");
     }
 
+    fn held_by(mut f: FileMetadata, node: &str, present: bool, since: Stamp) -> FileMetadata {
+        f.set_holder(node, present, since);
+        f
+    }
+
     #[test]
-    fn a_new_host_added_without_changing_the_creation_time_now_propagates() {
-        // Before versions, equal timestamps were ignored, so a download on
-        // one node never made it into another node's list of hosts.
-        let mut local = catalog(vec![file("f", stamp(10, 0, "a"))]);
-        let mut with_host = file("f", stamp(10, 1, "a"));
-        with_host.hosts.insert("peer_b".into());
-        merge_files(&mut local, vec![with_host], 100);
-        assert!(local["f"].hosts.contains("peer_b"));
+    fn holders_added_by_different_nodes_at_the_same_time_both_survive() {
+        // Each node only edits its own record, so neither update is lost
+        // even though the entry itself is identical on both sides.
+        let base = file("f", stamp(10, 0, "node_a"));
+        let mut one = catalog(vec![held_by(base.clone(), "node_b", true, stamp(20, 0, "node_b"))]);
+        let mut two = catalog(vec![held_by(base.clone(), "node_c", true, stamp(21, 0, "node_c"))]);
+        let from_one = one["f"].clone();
+        let from_two = two["f"].clone();
+        merge_files(&mut one, vec![from_two], 100);
+        merge_files(&mut two, vec![from_one], 100);
+        for merged in [&one["f"], &two["f"]] {
+            let mut nodes: Vec<_> = merged.holder_nodes().cloned().collect();
+            nodes.sort();
+            assert_eq!(nodes, ["node_a", "node_b", "node_c"]);
+        }
+    }
+
+    #[test]
+    fn a_holder_is_kept_when_a_newer_version_of_the_entry_arrives() {
+        let mut local = catalog(vec![held_by(file("f", stamp(10, 0, "node_a")), "node_b", true, stamp(15, 0, "node_b"))]);
+        let mut renamed = file("f", stamp(30, 0, "node_a"));
+        renamed.name = "renamed.txt".into();
+        merge_files(&mut local, vec![renamed], 100);
+        assert_eq!(local["f"].name, "renamed.txt");
+        assert!(local["f"].is_held_by("node_b"));
+    }
+
+    #[test]
+    fn a_node_leaving_wins_over_its_older_holding_and_not_over_a_newer_one() {
+        let mut local = catalog(vec![held_by(file("f", stamp(10, 0, "node_a")), "node_b", true, stamp(15, 0, "node_b"))]);
+        let left = held_by(file("f", stamp(10, 0, "node_a")), "node_b", false, stamp(20, 0, "node_c"));
+        merge_files(&mut local, vec![left], 100);
+        assert!(!local["f"].is_held_by("node_b"));
+
+        // A stale "present" from before it left must not bring it back...
+        let stale = held_by(file("f", stamp(10, 0, "node_a")), "node_b", true, stamp(15, 0, "node_b"));
+        merge_files(&mut local, vec![stale], 100);
+        assert!(!local["f"].is_held_by("node_b"));
+
+        // ...but the node itself re-adding itself afterwards does.
+        let back = held_by(file("f", stamp(10, 0, "node_a")), "node_b", true, stamp(40, 0, "node_b"));
+        merge_files(&mut local, vec![back], 100);
+        assert!(local["f"].is_held_by("node_b"));
+    }
+
+    #[test]
+    fn entries_nobody_holds_are_dropped_after_a_day() {
+        let day = 24 * 60 * 60 * 1000;
+        let now = 100 * day;
+        let mut gone = file("gone", stamp(now - day - 1, 0, "node_a"));
+        gone.set_holder("node_a", false, stamp(now - day - 1, 0, "node_a"));
+        let mut recent = file("recent", stamp(now - 1000, 0, "node_a"));
+        recent.set_holder("node_a", false, stamp(now - 1000, 0, "node_a"));
+        let held = file("held", stamp(now - 5 * day, 0, "node_a"));
+        let mut local = catalog(vec![gone, recent, held, tombstone("t", stamp(now - 5 * day, 0, "node_a"))]);
+
+        prune_unheld(&mut local, now);
+
+        let mut kept: Vec<_> = local.keys().cloned().collect();
+        kept.sort();
+        assert_eq!(kept, ["held", "recent", "t"]);
     }
 
     #[test]
@@ -608,5 +849,51 @@ mod tests {
         assert_eq!(messages[0].content, "hi");
         assert!(messages[0].created_at <= crate::hlc::wall_clock_ms());
         assert!(messages[0].timestamp <= chrono::Utc::now());
+    }
+
+    #[tokio::test]
+    async fn abandoned_partial_files_are_removed_but_complete_and_active_ones_are_not() {
+        let state = NodeState::for_tests(None);
+        let partial = state.store.create("file_partial", 100).unwrap();
+        let writing = state.store.create("file_writing", 100).unwrap();
+        let _guard = writing.try_write_lock().unwrap();
+        let complete = state.store.create("file_complete", 10).unwrap();
+        complete.write_chunk_hashing(0, vec![1; 10]).await.unwrap();
+        complete.seal().unwrap();
+
+        collect_garbage_with(&state, std::time::Duration::from_secs(3600), UNPUBLISHED_FOLDER_FILES_MS).await;
+        assert!(state.store.get("file_partial").is_some(), "recently touched files stay");
+
+        collect_garbage_with(&state, std::time::Duration::ZERO, UNPUBLISHED_FOLDER_FILES_MS).await;
+        assert!(state.store.get("file_partial").is_none());
+        assert!(partial.is_removed());
+        assert!(state.store.get("file_writing").is_some(), "a file being uploaded right now is never collected");
+        assert!(state.store.get("file_complete").is_some());
+    }
+
+    #[tokio::test]
+    async fn files_uploaded_for_a_folder_that_was_never_published_are_removed() {
+        let state = NodeState::for_tests_node("node_a", None);
+        let mut orphan = file("file_orphan", stamp(1, 0, "node_a"));
+        orphan.parent = Some("folder_never".into());
+        let mut inside_real = file("file_inside", stamp(2, 0, "node_a"));
+        inside_real.parent = Some("folder_real".into());
+        let mut folder = file("folder_real", stamp(3, 0, "node_a"));
+        folder.is_folder = true;
+        let mut elsewhere = file("file_elsewhere", stamp(4, 0, "node_other"));
+        elsewhere.parent = Some("folder_unknown".into());
+        elsewhere.uploader_node = "node_other".into();
+        let loose = file("file_loose", stamp(5, 0, "node_a"));
+        for entry in [orphan, inside_real, folder, elsewhere, loose] {
+            state.files.write().await.insert(entry.id.clone(), entry);
+        }
+
+        collect_garbage_with(&state, std::time::Duration::from_secs(3600), 0).await;
+
+        let files = state.files.read().await;
+        assert!(files["file_orphan"].deleted, "no such folder: the file goes");
+        assert!(!files["file_inside"].deleted && !files["folder_real"].deleted);
+        assert!(!files["file_elsewhere"].deleted, "another node's files are its own business");
+        assert!(!files["file_loose"].deleted);
     }
 }

@@ -32,7 +32,12 @@ hyper = { version = "1", features = ["server", "http1"] }  # serve connections o
 hyper-util = { version = "0.1", features = ["tokio"] }
 tower-service = "0.3"
 subtle = "2"                        # constant-time comparison
+fs4 = { version = "0.13", features = ["sync"] }
+bytes = "1"
+http-body-util = "0.1"
+percent-encoding = "2"
+crc32fast = "1"
 
 [dev-dependencies]
-http-body-util = "0.1"
+tempfile = "3"
 

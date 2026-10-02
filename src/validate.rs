@@ -17,7 +17,10 @@ const MAX_EXTENSION_BYTES: usize = 16;
 const MAX_ID_LEN: usize = 64;
 const MAX_MESSAGE_ID_LEN: usize = 128;
 const MAX_MIME_LEN: usize = 255;
-const MAX_HOSTS: usize = 256;
+const MAX_HOLDERS: usize = 256;
+const MAX_PATH_BYTES: usize = 1024;
+const MAX_PATH_DEPTH: usize = 32;
+pub const MAX_FOLDER_FILES: u32 = 100_000;
 pub const MAX_USER_AGENT_CHARS: usize = 256;
 pub const MAX_NICKNAME_CHARS: usize = 60;
 pub const MAX_NODE_NAME_CHARS: usize = 128;
@@ -79,6 +82,21 @@ fn truncate_to_bytes(name: &str) -> String {
     format!("{}{extension}", if kept.is_empty() { "unnamed" } else { kept })
 }
 
+// A path inside a shared folder: "a/b/c.txt". Empty, "." and ".." parts are
+// dropped, so it can never point outside the folder. None if nothing usable is left.
+pub fn sanitize_relative_path(path: &str) -> Option<String> {
+    let segments: Vec<String> = path
+        .split(['/', '\\'])
+        .filter(|part| !matches!(*part, "" | "." | ".."))
+        .map(sanitize_file_name)
+        .collect();
+    if segments.is_empty() || segments.len() > MAX_PATH_DEPTH {
+        return None;
+    }
+    let joined = segments.join("/");
+    (joined.len() <= MAX_PATH_BYTES).then_some(joined)
+}
+
 pub fn is_valid_id(s: &str) -> bool {
     is_valid_id_up_to(s, MAX_ID_LEN)
 }
@@ -119,38 +137,30 @@ pub fn clean_message(s: &str) -> Option<String> {
     (!cleaned.is_empty()).then_some(cleaned)
 }
 
-// What a browser tab may say about a file it shares; everything else in the
-// catalog entry is decided by the node.
-pub fn file_request(mut req: FileUploadRequest) -> Result<FileUploadRequest, &'static str> {
-    if !is_valid_id(&req.id) {
-        return Err("invalid file id");
-    }
-    if req.size > MAX_SAFE_INTEGER {
-        return Err("file size is out of range");
-    }
-    req.name = sanitize_file_name(&req.name);
-    req.mime_type = sanitize_mime(&req.mime_type);
-    req.sha256 = match req.sha256 {
-        Some(hash) if is_valid_sha256(&hash) => Some(hash),
-        Some(_) => return Err("invalid checksum"),
-        None => None,
-    };
-    Ok(req)
-}
-
 // Entries from another node. Names and the like are cleaned rather than
-// rejected so one odd name doesn't hide the file.
+// rejected so one odd name doesn't hide the file; an entry that can't be
+// fetched (no manifest root) or has a bad id is dropped.
 pub fn incoming_file(mut file: FileMetadata) -> Option<FileMetadata> {
-    if !is_valid_id(&file.id) || !is_valid_id(&file.uploader_id) || file.size > MAX_SAFE_INTEGER || !file.version.is_set() {
+    if !is_valid_id(&file.id) || file.size > MAX_SAFE_INTEGER || !file.version.is_set() {
         return None;
     }
-    if file.hosts.len() > MAX_HOSTS {
+    let optional_id_ok = |id: &str| id.is_empty() || is_valid_id(id);
+    if !optional_id_ok(&file.uploader_id) || !optional_id_ok(&file.uploader_node) {
         return None;
     }
-    file.hosts.retain(|host| is_valid_id(host));
+    if file.holders.len() > MAX_HOLDERS {
+        return None;
+    }
+    file.holders.retain(|node, holder| is_valid_id(node) && holder.since.is_set());
+    if !file.deleted && !file.manifest_root.as_deref().is_some_and(is_valid_sha256) {
+        return None;
+    }
+    file.parent = file.parent.filter(|parent| is_valid_id(parent));
+    if file.folder_bytes > MAX_SAFE_INTEGER || file.folder_files > MAX_FOLDER_FILES {
+        return None;
+    }
     file.name = sanitize_file_name(&file.name);
     file.mime_type = sanitize_mime(&file.mime_type);
-    file.sha256 = file.sha256.filter(|hash| is_valid_sha256(hash));
     file.uploaded_at = file.uploaded_at.min(chrono::Utc::now());
     Some(file)
 }
@@ -258,29 +268,6 @@ mod tests {
         assert_eq!(clean_message(&"x".repeat(5000)).unwrap().chars().count(), MAX_MESSAGE_CHARS);
     }
 
-    fn request(id: &str, size: u64, sha256: Option<&str>) -> FileUploadRequest {
-        FileUploadRequest {
-            id: id.into(),
-            name: "../evil/CON.txt".into(),
-            size,
-            mime_type: "bad".into(),
-            sha256: sha256.map(String::from),
-            is_folder: false,
-        }
-    }
-
-    #[test]
-    fn file_requests_are_sanitized_or_rejected() {
-        let ok = file_request(request("file_1", 10, None)).unwrap();
-        assert_eq!(ok.name, ".._evil_CON.txt");
-        assert_eq!(ok.mime_type, "application/octet-stream");
-
-        assert!(file_request(request("bad id", 10, None)).is_err());
-        assert!(file_request(request("file_1", MAX_SAFE_INTEGER + 1, None)).is_err());
-        assert!(file_request(request("file_1", 10, Some("nothex"))).is_err());
-        assert!(file_request(request("file_1", 10, Some(&"a".repeat(64)))).is_ok());
-    }
-
     fn stamp() -> Stamp {
         Stamp { wall: 1, counter: 0, node: "node_a".into() }
     }
@@ -292,14 +279,23 @@ mod tests {
             size: 5,
             mime_type: "text/plain".into(),
             uploader_id: "peer_1".into(),
-            hosts: ["peer_1".to_string(), "bad host".to_string()].into(),
+            uploader_node: "node_a".into(),
+            holders: [
+                ("node_a".to_string(), Holder { since: stamp(), present: true }),
+                ("bad node".to_string(), Holder { since: stamp(), present: true }),
+                ("node_unset".to_string(), Holder { since: Stamp::default(), present: true }),
+            ]
+            .into(),
             uploaded_at: chrono::Utc::now() + chrono::Duration::days(30),
             created_at: 0,
+            version: stamp(),
             deleted: false,
             deleted_at: 0,
-            version: stamp(),
-            sha256: Some("nothex".into()),
+            manifest_root: Some("ab".repeat(32)),
             is_folder: false,
+            parent: Some("folder 1".into()),
+            folder_bytes: 0,
+            folder_files: 0,
         }
     }
 
@@ -307,27 +303,50 @@ mod tests {
     fn incoming_files_from_other_nodes_are_cleaned() {
         let file = incoming_file(incoming()).unwrap();
         assert_eq!(file.name, "a_b.txt");
-        assert_eq!(file.hosts, ["peer_1".to_string()].into());
-        assert_eq!(file.sha256, None);
+        assert_eq!(file.holders.keys().collect::<Vec<_>>(), ["node_a"]);
+        assert_eq!(file.parent, None);
         assert!(file.uploaded_at <= chrono::Utc::now());
     }
 
     #[test]
-    fn incoming_files_without_a_stamp_or_with_bad_ids_are_dropped() {
-        let mut f = incoming();
-        f.version = Stamp::default();
-        assert!(incoming_file(f).is_none());
+    fn incoming_files_that_cannot_be_used_are_dropped() {
+        let broken: [fn(&mut FileMetadata); 8] = [
+            |f| f.version = Stamp::default(),
+            |f| f.id = "../x".into(),
+            |f| f.size = u64::MAX,
+            |f| f.uploader_id = "bad id".into(),
+            |f| f.uploader_node = "<x>".into(),
+            |f| f.holders = (0..300).map(|i| (format!("node_{i}"), Holder { since: stamp(), present: true })).collect(),
+            |f| f.manifest_root = None,
+            |f| f.folder_files = MAX_FOLDER_FILES + 1,
+        ];
+        for (i, change) in broken.iter().enumerate() {
+            let mut f = incoming();
+            change(&mut f);
+            assert!(incoming_file(f).is_none(), "case {i}");
+        }
+        // A tombstone doesn't need a manifest root, and an unowned (found on disk) file has no uploader.
+        let mut tombstone = incoming();
+        tombstone.deleted = true;
+        tombstone.manifest_root = None;
+        assert!(incoming_file(tombstone).is_some());
+        let mut orphan = incoming();
+        orphan.uploader_id = String::new();
+        assert!(incoming_file(orphan).is_some());
+    }
 
-        let mut f = incoming();
-        f.id = "../x".into();
-        assert!(incoming_file(f).is_none());
-
-        let mut f = incoming();
-        f.size = u64::MAX;
-        assert!(incoming_file(f).is_none());
-
-        let mut f = incoming();
-        f.hosts = (0..300).map(|i| format!("peer_{i}")).collect();
-        assert!(incoming_file(f).is_none());
+    #[test]
+    fn relative_paths_match_the_shared_fixture() {
+        #[derive(serde::Deserialize)]
+        struct PathCases {
+            relative_paths: Vec<Case>,
+        }
+        let cases: PathCases = serde_json::from_str(include_str!("../tests/filename_cases.json")).unwrap();
+        for case in cases.relative_paths {
+            assert_eq!(sanitize_relative_path(&case.input), case.expected, "input: {:?}", case.input);
+        }
+        assert_eq!(sanitize_relative_path(&["d"; 33].join("/")), None);
+        assert!(sanitize_relative_path(&["d"; 32].join("/")).is_some());
+        assert_eq!(sanitize_relative_path(&["x".repeat(255).as_str(); 5].join("/")), None);
     }
 }
