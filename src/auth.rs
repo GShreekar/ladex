@@ -208,6 +208,37 @@ mod tests {
     }
 
     #[test]
+    fn a_recorded_proof_is_useless_in_a_new_handshake() {
+        let handshake_transcript = |client: &Pake, server: &Pake| {
+            Transcript::new("c", "s", client.message(), server.message(), b"")
+        };
+        let (client, server) = (Pake::start(Role::Client, "pw"), Pake::start(Role::Server, "pw"));
+        let recorded_proof = {
+            let transcript = handshake_transcript(&client, &server);
+            let key = server.finish(client.message()).unwrap();
+            key.prove(Role::Server, &transcript)
+        };
+
+        let (new_client, new_server) = (Pake::start(Role::Client, "pw"), Pake::start(Role::Server, "pw"));
+        let transcript = handshake_transcript(&new_client, &new_server);
+        let new_key = new_client.finish(new_server.message()).unwrap();
+        assert!(!new_key.verify(Role::Server, &transcript, &recorded_proof));
+    }
+
+    #[test]
+    fn an_eavesdropper_who_only_saw_the_wire_cannot_prove_knowledge() {
+        let client = Pake::start(Role::Client, "pw");
+        let server = Pake::start(Role::Server, "pw");
+        let transcript = Transcript::new("c", "s", client.message(), server.message(), b"");
+        let real_proof = server.finish(client.message()).unwrap().prove(Role::Server, &transcript);
+
+        // The eavesdropper saw both PAKE messages but guesses the wrong passphrase.
+        let guesser = Pake::start(Role::Server, "wrong guess");
+        let guessed_proof = guesser.finish(client.message()).unwrap().prove(Role::Server, &transcript);
+        assert_ne!(real_proof, guessed_proof);
+    }
+
+    #[test]
     fn malformed_pake_messages_are_rejected() {
         assert!(Pake::start(Role::Server, "pw").finish(&[]).is_none());
         assert!(Pake::start(Role::Server, "pw").finish(&[0u8; 200]).is_none());

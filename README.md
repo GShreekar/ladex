@@ -14,7 +14,7 @@ A fast, secure, serverless file-sharing tool built with Rust for local networks,
 - **Folder Support**: share a whole folder; download it into a real folder (Chrome, Edge) or as a streamed zip (everything else)
 - **Cross-Platform**: Works on Linux, macOS, and Windows
 - **Web Interface**: Modern, responsive web UI accessible from any browser
-- **Session Security**: Server restart invalidates old authentication cookies
+- **Session Security**: every device gets its own random, revocable login session; logging out ends only that device's session
 - **Brute-Force Resistant**: Wrong guesses are throttled per device, and the passphrase is never sent over the network
 
 ## Supported Platforms
@@ -80,6 +80,21 @@ When a passphrase is set:
 3. **Throttling**: after 5 wrong guesses an address is locked out for 30 seconds, doubling with each further failure up to 1 hour. There is also a cap across all addresses, so guessing from several devices doesn't help
 4. **Per-device sessions**: every device that logs in gets its own session (24 hours, or until the node restarts). Logging out ends only that device's session
 5. **Signed-in devices**: the shield button lists the devices that are signed in. Any device can sign itself out; the machine running LADEX (opened at `http://localhost`) can sign out any of them, which also closes their open connection
+
+### Security Status
+
+LADEX is built for networks you partly trust, such as home, a classroom or an office, and not for the open internet. What has been done:
+
+- A passphrase, numeric or not, always means a browser login. Only a node started with no passphrase is open.
+- A device on the LAN that records all traffic can't join the mesh or use the web UI. The passphrase is never sent, and the mesh handshake is a SPAKE2 exchange that gives an attacker one guess per connection and nothing to crack offline.
+- Wrong login guesses are throttled per address with exponential lockout: 1,000 wrong guesses from one address take over a month.
+
+What to keep in mind:
+
+- Without a passphrase (open mode) or with `--no-tls`, anyone on the network can read or change what you share.
+- The passphrase protects joining. Everyone who has it can see and download everything shared on the mesh.
+- The TLS certificate is self-signed, so the first visit from each browser shows a warning.
+- LADEX has not had an independent security audit.
 
 ### Security Model
 

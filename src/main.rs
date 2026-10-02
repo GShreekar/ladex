@@ -474,12 +474,7 @@ async fn main() {
     // Browser logins are the main target for guessing, so they also get a cap
     // across all addresses; mesh joins don't, because a second mesh with a
     // different passphrase on the same network would trip it for everyone.
-    let auth_limiter = Arc::new(ratelimit::AttemptLimiter::new(ratelimit::Policy {
-        free_attempts: 5,
-        base_lockout: Duration::from_secs(30),
-        max_lockout: Duration::from_secs(3600),
-        global_cap: Some((30, Duration::from_secs(600))),
-    }));
+    let auth_limiter = Arc::new(ratelimit::AttemptLimiter::new(ratelimit::browser_login_policy()));
     let mesh_limiter = Arc::new(ratelimit::AttemptLimiter::new(ratelimit::Policy {
         free_attempts: 5,
         base_lockout: Duration::from_secs(10),
@@ -929,5 +924,51 @@ fn print_qr_code(url: &str) {
             println!("\nScan to open on your phone:\n{qr}");
         }
         Err(e) => tracing::warn!("QR code: failed to encode {url}: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LAN_IP: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 20));
+
+    async fn status_for(state: &NodeState, cookie: Option<&str>) -> u16 {
+        let protected = with_session(state.clone(), true)
+            .map(|_| "ok")
+            .recover(|_| async { Ok::<_, std::convert::Infallible>("denied") });
+        let mut request = warp::test::request().path("/api");
+        if let Some(token) = cookie {
+            request = request.header("cookie", format!("auth={token}"));
+        }
+        match request.reply(&protected).await.body() {
+            body if body.as_ref() == b"ok" => 200,
+            _ => 401,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_numeric_passphrase_still_requires_login() {
+        let state = NodeState::for_tests(Some("123456"));
+        assert_eq!(status_for(&state, None).await, 401);
+    }
+
+    #[tokio::test]
+    async fn a_made_up_cookie_is_not_a_login() {
+        let state = NodeState::for_tests(Some("123456"));
+        assert_eq!(status_for(&state, Some("not-a-real-token")).await, 401);
+    }
+
+    #[tokio::test]
+    async fn a_real_session_cookie_gets_through() {
+        let state = NodeState::for_tests(Some("123456"));
+        let (token, _) = state.sessions.create(LAN_IP, None);
+        assert_eq!(status_for(&state, Some(&token)).await, 200);
+    }
+
+    #[tokio::test]
+    async fn a_node_without_a_passphrase_needs_no_login() {
+        let state = NodeState::for_tests(None);
+        assert_eq!(status_for(&state, None).await, 200);
     }
 }

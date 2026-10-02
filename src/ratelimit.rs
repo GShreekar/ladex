@@ -23,6 +23,18 @@ pub struct Policy {
     pub global_cap: Option<(usize, Duration)>,
 }
 
+// Browser logins are the main target for guessing, so they also get a cap
+// across all addresses; mesh joins don't, because a second mesh with a
+// different passphrase on the same network would trip it for everyone.
+pub fn browser_login_policy() -> Policy {
+    Policy {
+        free_attempts: 5,
+        base_lockout: Duration::from_secs(30),
+        max_lockout: Duration::from_secs(3600),
+        global_cap: Some((30, Duration::from_secs(600))),
+    }
+}
+
 struct Entry {
     unrefunded: u32,
     locked_until: Option<Instant>,
@@ -181,6 +193,32 @@ mod tests {
         assert!(lockouts[4].unwrap() > 10 && lockouts[4].unwrap() <= 20);
         assert!(lockouts[5].unwrap() > 20 && lockouts[5].unwrap() <= 40);
         assert!(lockouts[7].unwrap() > 40 && lockouts[7].unwrap() <= 80);
+    }
+
+    #[test]
+    fn a_thousand_wrong_guesses_from_one_address_take_over_a_day() {
+        let limiter = AttemptLimiter::new(Policy { global_cap: None, ..browser_login_policy() });
+        let mut total_lockout_secs = 0;
+        for _ in 0..1000 {
+            // Wait out the lockout instantly, but add up how long it would have lasted.
+            if let Some(entry) = limiter.inner.lock().unwrap().by_ip.get_mut(&IP) {
+                entry.locked_until = None;
+            }
+            limiter.begin(IP).unwrap();
+            if let Some(until) = limiter.inner.lock().unwrap().by_ip[&IP].locked_until {
+                total_lockout_secs += until.duration_since(Instant::now()).as_secs();
+            }
+        }
+        assert!(total_lockout_secs > 24 * 3600);
+    }
+
+    #[test]
+    fn guessing_from_many_addresses_hits_the_global_cap() {
+        let limiter = AttemptLimiter::new(browser_login_policy());
+        let allowed = (0..1000u32)
+            .filter(|i| limiter.begin(IpAddr::V4(std::net::Ipv4Addr::from(*i))).is_ok())
+            .count();
+        assert_eq!(allowed, 30);
     }
 
     #[test]

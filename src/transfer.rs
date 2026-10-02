@@ -634,6 +634,11 @@ mod tests {
     use crate::store::manifest_root;
     use crate::types::Holder;
 
+    #[test]
+    fn a_download_gives_up_after_sixty_seconds_without_progress() {
+        assert_eq!(Tuning::default().stall_timeout, Duration::from_secs(60));
+    }
+
     // ── Scheduling ───────────────────────────────────────────────────────
 
     fn source(node: &str, has: Option<&[u32]>, len: u32, in_flight: usize, speed: f64) -> Source {
