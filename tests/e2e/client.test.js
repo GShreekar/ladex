@@ -76,9 +76,12 @@ function loadPage(base, token) {
     };
     context.globalThis = context; context.window.window = window;
     vm.createContext(context);
-    vm.runInContext(fs.readFileSync(path.join(STATIC, 'receive-policy.js'), 'utf8'), context);
+    // The same files, in the same order, as the <script> tags in index.html.
+    const scripts = ['js/util.js', 'receive-policy.js', 'app.js', 'js/connection.js', 'js/transfers.js', 'js/ui.js'];
+    for (const file of scripts) vm.runInContext(fs.readFileSync(path.join(STATIC, file), 'utf8'), context);
     context.LadexPolicy = window.LadexPolicy;
-    const App = vm.runInContext(fs.readFileSync(path.join(STATIC, 'app.js'), 'utf8') + '\n;LADEXApp;', context);
+    context.LadexUtil = window.LadexUtil;
+    const App = vm.runInContext('LADEXApp;', context);
     const app = new App();
     app.showProgress = (id, name, pct, speed, eta, done, total) => log.progress.push({ id, name, pct, done, total });
     app.hideProgress = () => {};

@@ -12,6 +12,7 @@ mod types;
 mod websocket;
 mod handlers;
 mod mesh;
+mod persist;
 mod discovery;
 mod state;
 mod auth;
@@ -420,10 +421,12 @@ async fn main() {
 
     // ── node identity ────────────────────────────────────────────────────
     // node_id identifies THIS machine on the mesh.  Different from a browser
-    // tab's session_id.  Generated once per process lifetime.
-    let node_id: NodeId = {
-        let mut rng = rand::thread_rng();
-        format!("node_{:016x}", rng.gen::<u64>())
+    // tab's session_id.  Created on the first run and kept in the data directory.
+    let data_dir = args.data_dir.clone().unwrap_or_else(|| tls::config_dir().join("files"));
+    let saved = persist::load(&data_dir);
+    let node_id: NodeId = match &saved {
+        Some(saved) => saved.node_id.clone(),
+        None => format!("node_{:016x}", rand::thread_rng().gen::<u64>()),
     };
 
     tracing::info!("Node ID: {node_id}");
@@ -484,7 +487,6 @@ async fn main() {
         global_cap: None,
     }));
 
-    let data_dir = args.data_dir.clone().unwrap_or_else(|| tls::config_dir().join("files"));
     let store = match store::Store::open(&data_dir, args.storage_limit_gb.saturating_mul(1 << 30)) {
         Ok(store) => Arc::new(store),
         Err(e) => {
@@ -522,6 +524,10 @@ async fn main() {
     };
 
     state::load_catalog_from_store(&state).await;
+    if let Some(saved) = &saved {
+        persist::restore(&state, saved).await;
+    }
+    let saver = persist::spawn_saver(state.clone(), &data_dir, saved.as_ref());
 
     // ── Phase 3: connect to manually-specified peers ─────────────────────
     // These are processed before the HTTP server starts so the mesh is
@@ -545,6 +551,10 @@ async fn main() {
                 }
             }
         }
+    }
+
+    if let Some(saved) = &saved {
+        persist::redial(&state, saved.peers.clone());
     }
 
     // ── Phase 2: UDP multicast discovery ────────────────────────────────
@@ -887,6 +897,7 @@ async fn main() {
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("Shutdown: SIGINT received — sending Goodbye to mesh peers");
             mesh::broadcast_goodbye(&state_shutdown).await;
+            saver.flush().await;
             if let Some(handle) = mdns_handle {
                 mdns::shutdown(handle).await;
             }

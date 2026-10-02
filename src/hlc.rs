@@ -72,6 +72,20 @@ impl Clock {
         Self { node, latest: Mutex::new((0, 0)) }
     }
 
+    // Never issue a stamp at or before one this node issued before it stopped.
+    pub fn resume_from(&self, wall: u64, counter: u32) {
+        let wall = wall.min(wall_clock_ms().saturating_add(MAX_DRIFT_MS));
+        let mut latest = self.latest.lock().unwrap();
+        if (wall, counter) > *latest {
+            *latest = (wall, counter);
+        }
+    }
+
+    // The latest (wall, counter) issued or observed, to save across a restart.
+    pub fn latest(&self) -> (u64, u32) {
+        *self.latest.lock().unwrap()
+    }
+
     // Stamp for an event happening on this node now.
     pub fn now(&self) -> Stamp {
         self.now_at(wall_clock_ms())
@@ -120,6 +134,19 @@ impl Clock {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_resumed_clock_never_goes_back_and_ignores_absurd_values() {
+        let clock = Clock::new("a".into());
+        let before = clock.now_at(T);
+        let resumed = Clock::new("a".into());
+        resumed.resume_from(before.wall, before.counter);
+        assert!(resumed.now_at(T - 5000) > before);
+
+        let wild = Clock::new("a".into());
+        wild.resume_from(u64::MAX, 0);
+        assert!(wild.latest().0 <= wall_clock_ms() + MAX_DRIFT_MS);
+    }
+
     use super::*;
 
     const T: u64 = 1_700_000_000_000;

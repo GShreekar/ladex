@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use rand::Rng;
 use ring::digest;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 pub const SESSION_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
@@ -31,6 +31,18 @@ pub struct SessionSummary {
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub last_seen: chrono::DateTime<chrono::Utc>,
     pub expires_in_secs: u64,
+}
+
+// A session as saved to disk. The expiry is a wall-clock time, since `Instant` means nothing after a restart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedSession {
+    token_hash: String,
+    id: String,
+    label: String,
+    ip: IpAddr,
+    created_at: chrono::DateTime<chrono::Utc>,
+    last_seen: chrono::DateTime<chrono::Utc>,
+    expires_at: chrono::DateTime<chrono::Utc>,
 }
 
 struct Record {
@@ -151,6 +163,42 @@ impl SessionStore {
         self.by_token_hash.lock().unwrap().values().any(|r| r.id == id && r.expires_at > now)
     }
 
+    pub fn export(&self) -> Vec<SavedSession> {
+        let now = Instant::now();
+        let wall_now = chrono::Utc::now();
+        let sessions = self.by_token_hash.lock().unwrap();
+        sessions
+            .iter()
+            .filter(|(_, r)| r.expires_at > now)
+            .map(|(hash, r)| SavedSession {
+                token_hash: hex::encode(hash),
+                id: r.id.clone(),
+                label: r.label.clone(),
+                ip: r.ip,
+                created_at: r.created_at,
+                last_seen: r.last_seen,
+                expires_at: wall_now + chrono::Duration::from_std(r.expires_at - now).unwrap_or_default(),
+            })
+            .collect()
+    }
+
+    // Sessions that expired while the node was off are dropped.
+    pub fn import(&self, saved: Vec<SavedSession>) {
+        let now = Instant::now();
+        let wall_now = chrono::Utc::now();
+        let mut sessions = self.by_token_hash.lock().unwrap();
+        for s in saved.into_iter().take(MAX_SESSIONS) {
+            let (Ok(hash), Ok(left)) = (hex::decode(&s.token_hash), (s.expires_at - wall_now).to_std()) else {
+                continue;
+            };
+            let left = left.min(self.lifetime);
+            sessions.insert(
+                hash,
+                Record { id: s.id, label: s.label, ip: s.ip, created_at: s.created_at, last_seen: s.last_seen, expires_at: now + left },
+            );
+        }
+    }
+
     pub fn subscribe_ended(&self) -> broadcast::Receiver<String> {
         self.ended.subscribe()
     }
@@ -194,6 +242,24 @@ mod tests {
     use super::*;
 
     const IP: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 20));
+
+    #[test]
+    fn sessions_survive_a_save_and_load_but_expired_ones_do_not() {
+        let old = SessionStore::new();
+        let (token, handle) = old.create(IP, Some("Mozilla/5.0 (Linux; Android 14) Chrome/120"));
+        let saved = old.export();
+
+        let fresh = SessionStore::new();
+        fresh.import(saved.clone());
+        assert_eq!(fresh.authenticate(&token).map(|h| h.id), Some(handle.id));
+        assert_eq!(fresh.list()[0].label, "Chrome on Android");
+
+        let mut expired = saved;
+        expired[0].expires_at = chrono::Utc::now() - chrono::Duration::seconds(5);
+        let other = SessionStore::new();
+        other.import(expired);
+        assert!(other.authenticate(&token).is_none());
+    }
 
     #[test]
     fn a_created_session_authenticates_and_others_do_not() {

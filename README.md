@@ -105,7 +105,7 @@ When a passphrase is set:
 
 ## Where files are kept
 
-Shared files are stored on the node they were shared through, in `~/.ladex/files` (change with `--data-dir`), up to 20 GiB (`--storage-limit-gb`). A node also keeps a copy of any file it fetches for a download, so that it can serve it to others; unsharing a file deletes every copy. Files left half-received are deleted after a day. Don't share with LADEX what you wouldn't want copied onto the machines of the people on your network: anyone signed in can download any shared file, which stores it on their node.
+Shared files are stored on the node they were shared through, in `~/.ladex/files` (change with `--data-dir`), up to 20 GiB (`--storage-limit-gb`). A node also keeps a copy of any file it fetches for a download, so that it can serve it to others; unsharing a file deletes every copy. Files left half-received are deleted after a day. The node also remembers its identity, chat history, logged-in devices and the nodes it was connected to in `node.state` in the same folder, so a restart doesn't sign everyone out or make the node look new to the mesh; changing the passphrase signs everyone out. Don't share with LADEX what you wouldn't want copied onto the machines of the people on your network: anyone signed in can download any shared file, which stores it on their node.
 
 ## Testing
 

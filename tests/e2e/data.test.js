@@ -145,6 +145,8 @@ const check = (name, ok, detail = '') => { console.log(`${ok ? 'PASS' : 'FAIL'} 
     r = await upload(n1b.base, t1b, 'peer_one', 'file_b', fileB, { name: 'only-here.bin' });
     check('node 1 (restarted) accepts a new upload', r.status === 201, JSON.stringify(r.body));
     check('node 1 still lists the earlier file after its restart (from disk)', c1b.files().some((f) => f.id === 'file_a') || !!(await c1b.wait((m) => m.type === 'file_list_update' && m.files.some((f) => f.id === 'file_a'))));
+    // the other nodes redial a restarted node on a back-off timer, so wait until they have heard of the file
+    check('node 2 hears of the new file once it reconnects', !!(await c2.wait((m) => m.type === 'file_list_update' && m.files.some((f) => f.id === 'file_b'), 20000)));
     await sleep(800);
     await stopNode(1);
     await sleep(1500);
@@ -172,6 +174,8 @@ const check = (name, ok, detail = '') => { console.log(`${ok ? 'PASS' : 'FAIL'} 
     check('resuming from that offset completes the upload', r.status === 201, JSON.stringify(r));
     d = await download(n1c.base, t1c, 'file_c');
     check('and the resumed file is byte-for-byte intact', d.status === 200 && sha(d.buf) === sha(fileC));
+
+    await c2.wait((m) => m.type === 'file_list_update' && m.files.some((f) => f.id === 'file_c'), 20000);
 
     // ---- who may do what
     r = await upload(n1c.base, 'deadbeef', 'peer_one', 'file_x', fileC.subarray(0, 100), {});
@@ -210,6 +214,6 @@ const check = (name, ok, detail = '') => { console.log(`${ok ? 'PASS' : 'FAIL'} 
 
     for (const n of [1, 2, 3]) await stopNode(n).catch(() => {});
     console.log(failures === 0 ? '\nALL PASSED' : `\n${failures} FAILED`);
-    fs.rmSync(ROOT, { recursive: true, force: true });
+    if (!process.env.LADEX_KEEP) fs.rmSync(ROOT, { recursive: true, force: true }); else console.log('kept', ROOT);
     process.exit(failures ? 1 : 0);
 })().catch(async (e) => { console.error('test crashed:', e); for (const n of Object.keys(procs)) procs[n].kill('SIGKILL'); process.exit(2); });
