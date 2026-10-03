@@ -133,6 +133,16 @@ async function waitUntil(n, pred, ms) {
     return false;
 }
 
+// The end of each node's log, so a CI failure shows its cause in the job output.
+function printLogTails() {
+    for (const n of nodes) {
+        const log = path.join(n.dir, 'node.log');
+        if (!fs.existsSync(log)) continue;
+        const lines = fs.readFileSync(log, 'utf8').trimEnd().split('\n');
+        console.error(`\n---- ${n.name} (last 40 lines)\n${lines.slice(-40).join('\n')}`);
+    }
+}
+
 let failures = 0;
 const check = (name, ok, detail = '') => { console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${ok ? '' : '  ' + detail}`); if (!ok) failures++; };
 
@@ -184,6 +194,7 @@ const check = (name, ok, detail = '') => { console.log(`${ok ? 'PASS' : 'FAIL'} 
     uploader.ws.close();
     chatter.ws.close();
     tearDownNetwork();
+    if (failures) printLogTails();
     console.log(failures ? `\n${failures} FAILED (logs in ${ROOT})` : '\nALL PASSED');
     process.exit(failures ? 1 : 0);
-})().catch((e) => { console.error(e); tearDownNetwork(); console.error(`logs in ${ROOT}`); process.exit(1); });
+})().catch((e) => { console.error(e); tearDownNetwork(); printLogTails(); console.error(`logs in ${ROOT}`); process.exit(1); });

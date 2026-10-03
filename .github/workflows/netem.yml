@@ -37,6 +37,11 @@ jobs:
           mkdir -p "$LADEX_NETEM_DIR"
           sudo --preserve-env=LADEX_NETEM_DIR "$(which node)" tests/netem/netem.test.js
 
+      # The nodes ran as root, and their file stores are private to that user.
+      - name: Make the node logs readable
+        if: failure()
+        run: sudo chown -R "$USER" "${{ runner.temp }}/netem"
+
       - name: Keep the node logs
         if: failure()
         uses: actions/upload-artifact@v4
