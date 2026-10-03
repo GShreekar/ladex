@@ -16,6 +16,9 @@ use crate::store::CHUNK_SIZE;
 use crate::types::{FileMetadata, Holder, NodeId, TextMessage};
 use crate::{files_api, mesh, ratelimit, server, state, tls, NodeState};
 
+mod faulty_link;
+pub use faulty_link::{Faults, FaultyLink, LinkedMesh};
+
 // How long `eventually` waits for the mesh to settle.
 const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);

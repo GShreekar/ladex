@@ -178,6 +178,7 @@ impl NodeState {
             store: Arc::new(store::Store::open(&tempfile::tempdir().unwrap().keep(), 1 << 40).unwrap()),
             transfers: Arc::new(transfer::Transfers::with_tuning(transfer::Tuning {
                 request_timeout: Duration::from_millis(400),
+                manifest_retry: Duration::from_millis(400),
                 tick: Duration::from_millis(20),
                 idle_exit: Duration::from_secs(30),
                 map_interval: Duration::from_millis(100),

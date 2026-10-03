@@ -211,6 +211,33 @@ pub async fn remove_mesh_peer(state: &NodeState, peer_node_id: &NodeId) {
     }
 }
 
+/// Registers a newly authenticated connection, unless the peer is already
+/// connected (both nodes dialed each other at once). Checking and inserting
+/// under one lock means only one of two racing connections can win.
+async fn register_peer(state: &NodeState, handle: MeshPeerHandle) -> bool {
+    let mut peers = state.mesh_peers.write().await;
+    if peers.contains_key(&handle.node_id) {
+        return false;
+    }
+    peers.insert(handle.node_id.clone(), handle);
+    true
+}
+
+/// Whether `sender` belongs to the connection currently registered for the peer.
+async fn is_current_connection(state: &NodeState, peer_node_id: &NodeId, sender: &mpsc::UnboundedSender<MeshMessage>) -> bool {
+    state.mesh_peers.read().await.get(peer_node_id).is_some_and(|h| h.sender.same_channel(sender))
+}
+
+/// Cleanup when a connection ends. A duplicate connection closing late must
+/// not remove the peer while its other connection is still live.
+async fn connection_ended(state: &NodeState, peer_node_id: &NodeId, sender: &mpsc::UnboundedSender<MeshMessage>) -> bool {
+    let current = is_current_connection(state, peer_node_id, sender).await;
+    if current {
+        remove_mesh_peer(state, peer_node_id).await;
+    }
+    current
+}
+
 /// Phase 10 §10.2 — mark hosted peers offline and tombstone their files.
 /// Does NOT delete catalog entries; marks them unavailable so the UI shows
 /// "[offline]" rather than silently hiding the file.
@@ -282,6 +309,9 @@ pub fn spawn_reconnect(addr: IpAddr, http_port: u16, state: NodeState, peer_node
         tracing::debug!("Reconnect: no dialable address for {peer_node_id} — not attempting");
         return;
     }
+    // When both nodes redial each other, the one with the higher id waits a
+    // little longer, so the other's dial usually lands first instead of colliding.
+    let stagger = if state.node_id > peer_node_id { Duration::from_secs(1) } else { Duration::ZERO };
     tokio::spawn(async move {
         let started = Instant::now();
         let delays_secs = [2u64, 4, 8, 30];
@@ -300,7 +330,7 @@ pub fn spawn_reconnect(addr: IpAddr, http_port: u16, state: NodeState, peer_node
             } else {
                 30
             };
-            tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+            tokio::time::sleep(Duration::from_secs(delay_secs) + stagger).await;
             attempt += 1;
             if state.mesh_peers.read().await.contains_key(&peer_node_id) {
                 return;
@@ -336,6 +366,7 @@ pub async fn broadcast_goodbye(state: &NodeState) {
 pub fn spawn_heartbeat(
     state: NodeState,
     peer_node_id: NodeId,
+    sender: mpsc::UnboundedSender<MeshMessage>,
     peer_addr: IpAddr,
     http_port: u16,
 ) {
@@ -347,21 +378,11 @@ pub fn spawn_heartbeat(
         interval.tick().await; // skip first immediate tick
         loop {
             interval.tick().await;
-            // Check if this peer is still in mesh_peers
-            let still_connected = {
-                let peers = state.mesh_peers.read().await;
-                peers.contains_key(&peer_node_id)
-            };
-            if !still_connected { return; }
+            // Stop once this connection is no longer the peer's registered one.
+            if !is_current_connection(&state, &peer_node_id, &sender).await { return; }
 
-            // Send Ping
             let ts = chrono::Utc::now().timestamp_millis() as u64;
-            {
-                let peers = state.mesh_peers.read().await;
-                if let Some(h) = peers.get(&peer_node_id) {
-                    let _ = h.sender.send(MeshMessage::Ping { ts });
-                }
-            }
+            let _ = sender.send(MeshMessage::Ping { ts });
 
             // Wait for up to HEARTBEAT_TIMEOUT for a Pong (last_seen update)
             tokio::time::sleep(HEARTBEAT_TIMEOUT).await;
@@ -369,12 +390,12 @@ pub fn spawn_heartbeat(
             let timed_out = {
                 let peers = state.mesh_peers.read().await;
                 peers.get(&peer_node_id)
-                    .map(|h| h.last_seen.elapsed() > HEARTBEAT_TIMEOUT)
-                    .unwrap_or(false)
+                    .filter(|h| h.sender.same_channel(&sender))
+                    .is_some_and(|h| h.last_seen.elapsed() > HEARTBEAT_TIMEOUT)
             };
             if timed_out {
                 tracing::warn!("Heartbeat: peer {peer_node_id} timed out — removing");
-                remove_mesh_peer(&state, &peer_node_id).await;
+                connection_ended(&state, &peer_node_id, &sender).await;
                 // Attempt to reconnect
                 spawn_reconnect(peer_addr, http_port, state.clone(), peer_node_id.clone());
                 return;
@@ -497,10 +518,6 @@ async fn handle_inbound(ws: WebSocket, remote_ip: IpAddr, state: NodeState) {
     state.mesh_limiter.succeed(remote_ip, ticket);
     note_clock_skew(&state, &peer_node_name, peer_now_ms).await;
 
-    // The peer may have connected to us in the meantime, from its own dial.
-    if state.mesh_peers.read().await.contains_key(&peer_node_id) {
-        return;
-    }
     tracing::info!("Mesh: inbound handshake OK — peer {peer_node_id} ({peer_node_name})");
 
     // BUG-10 fix: build a real, dialable address for this peer from its
@@ -641,29 +658,25 @@ pub async fn connect_to_peer(addr: IpAddr, http_port: u16, state: NodeState) -> 
     let peer_node_name = validate::clean_label(&peer_node_name, validate::MAX_NODE_NAME_CHARS);
     note_clock_skew(&state, &peer_node_name, server_now_ms).await;
 
-    if state.mesh_peers.read().await.contains_key(&peer_node_id) {
-        tracing::warn!("Mesh: duplicate after handshake with {peer_node_id} — dropping");
-        return Ok(());
-    }
-
     let remote_addr: SocketAddr = format!("{addr}:{http_port}").parse()
         .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
 
     let (peer_tx, mut peer_rx) = mpsc::unbounded_channel::<MeshMessage>();
     let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(DATA_QUEUE_FRAMES);
-    {
-        let mut peers = state.mesh_peers.write().await;
-        peers.insert(peer_node_id.clone(), MeshPeerHandle {
-            node_id:   peer_node_id.clone(),
-            node_name: peer_node_name.clone(),
-            addr:      remote_addr,
-            http_port,
-            sender:    peer_tx.clone(),
-            data:      data_tx,
-            serve_slots: Arc::new(tokio::sync::Semaphore::new(crate::transfer::SERVE_SLOTS)),
-            last_seen: Instant::now(),
-            rtt_ms:    None,
-        });
+    let registered = register_peer(&state, MeshPeerHandle {
+        node_id:   peer_node_id.clone(),
+        node_name: peer_node_name.clone(),
+        addr:      remote_addr,
+        http_port,
+        sender:    peer_tx.clone(),
+        data:      data_tx,
+        serve_slots: Arc::new(tokio::sync::Semaphore::new(crate::transfer::SERVE_SLOTS)),
+        last_seen: Instant::now(),
+        rtt_ms:    None,
+    }).await;
+    if !registered {
+        tracing::warn!("Mesh: duplicate after handshake with {peer_node_id} — dropping");
+        return Ok(());
     }
     tracing::info!("Mesh: registered peer {peer_node_id} ({peer_node_name})");
     crate::transfer::sources_changed(&state);
@@ -671,7 +684,7 @@ pub async fn connect_to_peer(addr: IpAddr, http_port: u16, state: NodeState) -> 
     post_handshake_sync(&peer_tx, &state).await;
 
     // Phase 10: start heartbeat for this connection
-    spawn_heartbeat(state.clone(), peer_node_id.clone(), addr, http_port);
+    spawn_heartbeat(state.clone(), peer_node_id.clone(), peer_tx.clone(), addr, http_port);
 
     let write_task = tokio::spawn(async move {
         use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -694,6 +707,7 @@ pub async fn connect_to_peer(addr: IpAddr, http_port: u16, state: NodeState) -> 
 
     let state_rd   = state.clone();
     let peer_id_rd = peer_node_id.clone();
+    let sender_rd  = peer_tx.clone();
     let read_task  = tokio::spawn(async move {
         while let Some(result) = tt_rx.next().await {
             match result {
@@ -711,9 +725,7 @@ pub async fn connect_to_peer(addr: IpAddr, http_port: u16, state: NodeState) -> 
             }
         }
         // Phase 10: only run cleanup if not already done by heartbeat
-        let still_present = state_rd.mesh_peers.read().await.contains_key(&peer_id_rd);
-        if still_present {
-            remove_mesh_peer(&state_rd, &peer_id_rd).await;
+        if connection_ended(&state_rd, &peer_id_rd, &sender_rd).await {
             // Reconnect backoff — we know the addr/port from the handle stored before we lost it,
             // but the handle is now gone. The heartbeat task handles reconnect for timeout cases;
             // this branch handles clean-close cases where heartbeat didn't fire.
@@ -740,19 +752,20 @@ async fn run_connection(
 ) {
     let (peer_tx, mut peer_rx) = mpsc::unbounded_channel::<MeshMessage>();
     let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(DATA_QUEUE_FRAMES);
-    {
-        let mut peers = state.mesh_peers.write().await;
-        peers.insert(peer_node_id.clone(), MeshPeerHandle {
-            node_id:   peer_node_id.clone(),
-            node_name: peer_node_name.clone(),
-            addr,
-            http_port,
-            sender:    peer_tx.clone(),
-            data:      data_tx,
-            serve_slots: Arc::new(tokio::sync::Semaphore::new(crate::transfer::SERVE_SLOTS)),
-            last_seen: Instant::now(),
-            rtt_ms:    None,
-        });
+    let registered = register_peer(&state, MeshPeerHandle {
+        node_id:   peer_node_id.clone(),
+        node_name: peer_node_name.clone(),
+        addr,
+        http_port,
+        sender:    peer_tx.clone(),
+        data:      data_tx,
+        serve_slots: Arc::new(tokio::sync::Semaphore::new(crate::transfer::SERVE_SLOTS)),
+        last_seen: Instant::now(),
+        rtt_ms:    None,
+    }).await;
+    // The peer connected to us in the meantime, from its own dial.
+    if !registered {
+        return;
     }
     tracing::info!("Mesh: registered inbound peer {peer_node_id} ({peer_node_name})");
     crate::transfer::sources_changed(&state);
@@ -763,7 +776,7 @@ async fn run_connection(
     // are now the peer's real, dialable address (see handle_inbound), so a
     // reconnect *attempt* — whichever path below ends up making one — has
     // somewhere real to dial for inbound connections too, not just outbound.
-    spawn_heartbeat(state.clone(), peer_node_id.clone(), addr.ip(), http_port);
+    spawn_heartbeat(state.clone(), peer_node_id.clone(), peer_tx.clone(), addr.ip(), http_port);
 
     let write_task = tokio::spawn(async move {
         loop {
@@ -808,9 +821,7 @@ async fn run_connection(
     // far more common disconnect shape left inbound connections with no
     // reconnect attempt at all, silently, regardless of the address fix
     // above. Mirrors the equivalent cleanup in connect_to_peer's read_task.
-    let still_present = state.mesh_peers.read().await.contains_key(&peer_node_id);
-    if still_present {
-        remove_mesh_peer(&state, &peer_node_id).await;
+    if connection_ended(&state, &peer_node_id, &peer_tx).await {
         spawn_reconnect(addr.ip(), http_port, state.clone(), peer_node_id.clone());
     }
 }
@@ -820,8 +831,8 @@ async fn run_connection(
 // ---------------------------------------------------------------------------
 
 async fn post_handshake_sync(peer_tx: &mpsc::UnboundedSender<MeshMessage>, state: &NodeState) {
-    let files: Vec<FileMetadata> = state.files.read().await
-        .values().filter(|f| !f.deleted).cloned().collect();
+    // Tombstones too: a peer that was away must learn what was unshared meanwhile.
+    let files: Vec<FileMetadata> = state.files.read().await.values().cloned().collect();
     let _ = peer_tx.send(MeshMessage::CatalogSync { files });
 
     let peers: Vec<PeerInfo> = state.local_peers.read().await.values().cloned().collect();

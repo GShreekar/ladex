@@ -1,0 +1,45 @@
+name: Network faults
+
+on:
+  push:
+    branches: [main, v3]
+  pull_request:
+
+jobs:
+  netem:
+    name: Real sockets under loss, jitter and partition
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build
+        run: cargo build -p ladex
+
+      - name: Load the netem queueing discipline
+        run: |
+          sudo modprobe sch_netem || {
+            sudo apt-get update
+            sudo apt-get install -y "linux-modules-extra-$(uname -r)"
+            sudo modprobe sch_netem
+          }
+
+      - name: Three nodes in network namespaces, joined by veth pairs
+        env:
+          LADEX_NETEM_DIR: ${{ runner.temp }}/netem
+        run: |
+          mkdir -p "$LADEX_NETEM_DIR"
+          sudo --preserve-env=LADEX_NETEM_DIR "$(which node)" tests/netem/netem.test.js
+
+      - name: Keep the node logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: netem-node-logs
+          path: ${{ runner.temp }}/netem/**/node.log

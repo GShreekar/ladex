@@ -149,6 +149,8 @@ pub fn plan(want: &[u32], in_flight: &HashMap<u32, Vec<usize>>, sources: &[Sourc
 
 pub struct Tuning {
     pub request_timeout: Duration,
+    // How long to wait for a file's manifest before asking again.
+    pub manifest_retry: Duration,
     pub tick: Duration,
     // A download nobody is waiting for stops after this long without progress.
     pub idle_exit: Duration,
@@ -161,6 +163,7 @@ impl Default for Tuning {
     fn default() -> Self {
         Self {
             request_timeout: Duration::from_secs(20),
+            manifest_retry: Duration::from_secs(10),
             tick: Duration::from_millis(250),
             idle_exit: Duration::from_secs(600),
             map_interval: Duration::from_secs(2),
@@ -444,7 +447,6 @@ impl Peer {
 }
 
 const BAN_AFTER_BAD_CHUNKS: u32 = 2;
-const MANIFEST_RETRY: Duration = Duration::from_secs(10);
 
 async fn run(state: NodeState, download: Arc<Download>, mut events: mpsc::Receiver<Event>) {
     let blob = download.blob.clone();
@@ -541,7 +543,7 @@ async fn run(state: NodeState, download: Arc<Download>, mut events: mpsc::Receiv
         peers.retain(|node, p| connected.contains_key(node) || p.banned);
 
         if !blob.has_manifest() {
-            if manifest_asked.is_none_or(|t| t.elapsed() > MANIFEST_RETRY) {
+            if manifest_asked.is_none_or(|t| t.elapsed() > tuning.manifest_retry) {
                 let holder = holders.iter().find(|n| connected.contains_key(*n) && !peers.get(*n).is_some_and(|p| p.banned));
                 if let Some(node) = holder {
                     let _ = connected[node].send(MeshMessage::GetManifest { file_id: id.clone() });

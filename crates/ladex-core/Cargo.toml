@@ -42,4 +42,5 @@ crc32fast.workspace = true
 # Turns on the testing module for this crate's own integration tests in tests/.
 ladex-core = { path = ".", features = ["test-support"] }
 tempfile.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 warp = { workspace = true, features = ["test"] }
