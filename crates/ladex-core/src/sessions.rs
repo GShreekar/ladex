@@ -70,6 +70,12 @@ fn random_hex(len_bytes: usize) -> String {
     hex::encode(bytes)
 }
 
+impl Default for SessionStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SessionStore {
     pub fn new() -> Self {
         Self::with_lifetime(SESSION_LIFETIME)

@@ -59,6 +59,12 @@ pub struct ZipWriter {
     finished: Vec<Finished>,
 }
 
+impl Default for ZipWriter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ZipWriter {
     pub fn new() -> Self {
         Self::with_threshold(CLASSIC_LIMIT)
