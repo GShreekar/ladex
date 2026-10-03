@@ -39,8 +39,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned so a new Rust release can't fail CI with lints nobody can see locally.
+      # Bump it together with the local toolchain.
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.97.0"
           components: clippy
 
       - uses: Swatinem/rust-cache@v2

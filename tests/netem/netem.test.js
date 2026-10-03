@@ -55,7 +55,7 @@ function tearDownNetwork() {
 }
 
 // Applies to everything the node sends, so a cut node can neither send nor answer.
-const netem = (n, spec) => sh(`ip -n ${n.ns} qdisc replace dev eth0 root netem ${spec}`);
+const netem = (n, spec) => sh(`tc -n ${n.ns} qdisc replace dev eth0 root netem ${spec}`);
 
 function start(n, peers) {
     fs.mkdirSync(path.join(n.dir, 'home'), { recursive: true });

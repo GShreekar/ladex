@@ -358,7 +358,7 @@ pub fn on_chunk_error(state: &NodeState, from: &NodeId, file_id: &str, index: u3
 pub fn on_manifest(state: &NodeState, from: &NodeId, file_id: &str, hashes_hex: &str) {
     let Some(download) = state.transfers.get(file_id) else { return };
     let Ok(raw) = hex::decode(hashes_hex) else { return };
-    let hashes = raw.chunks_exact(32).map(|c| <ChunkHash>::try_from(c).unwrap()).collect();
+    let hashes = raw.as_chunks::<32>().0.to_vec();
     let _ = download.events.try_send(Event::Manifest { from: from.clone(), hashes });
 }
 

@@ -296,15 +296,15 @@ impl FilesApi {
 
     // The device (browser session) an upload is for must have joined over a
     // WebSocket owned by the same login session as this request.
-    async fn owned_device(&self, headers: &HeaderMap, auth: &Option<SessionHandle>) -> Result<String, Response<ServerBody>> {
+    async fn owned_device(&self, headers: &HeaderMap, auth: &Option<SessionHandle>) -> Result<String, Box<Response<ServerBody>>> {
         let device = header_str(headers, "x-ladex-session").unwrap_or_default().to_string();
         if !validate::is_valid_id(&device) {
-            return Err(fail(StatusCode::BAD_REQUEST, "missing or invalid X-Ladex-Session"));
+            return Err(Box::new(fail(StatusCode::BAD_REQUEST, "missing or invalid X-Ladex-Session")));
         }
         let owners = self.state.session_owners.read().await;
         match owners.get(&device) {
             Some(owner) if owner.auth_id == auth.as_ref().map(|a| a.id.clone()) => Ok(device),
-            _ => Err(fail(StatusCode::FORBIDDEN, "that device is not connected here")),
+            _ => Err(Box::new(fail(StatusCode::FORBIDDEN, "that device is not connected here"))),
         }
     }
 
@@ -353,7 +353,7 @@ impl FilesApi {
         };
         let device = match self.owned_device(headers, &auth).await {
             Ok(device) => device,
-            Err(response) => return response,
+            Err(response) => return *response,
         };
         let Ok(_slot) = self.uploads.try_acquire() else {
             return fail(StatusCode::SERVICE_UNAVAILABLE, "too many uploads in progress; try again shortly");
@@ -651,7 +651,7 @@ impl FilesApi {
         }
         let device = match self.owned_device(req.headers(), &auth).await {
             Ok(device) => device,
-            Err(response) => return response,
+            Err(response) => return *response,
         };
         let body = match Limited::new(req.into_body(), MAX_FOLDER_LISTING_BYTES).collect().await {
             Ok(collected) => collected.to_bytes(),

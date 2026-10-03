@@ -535,7 +535,7 @@ impl Store {
 
         let mut raw = vec![0u8; chunks as usize * 32];
         read_exact_at(&hashes_file, &mut raw, 0)?;
-        let hashes = raw.chunks_exact(32).map(|c| <ChunkHash>::try_from(c).unwrap()).collect();
+        let hashes = raw.as_chunks::<32>().0.to_vec();
 
         Ok(Arc::new(Blob {
             id: meta.id,
