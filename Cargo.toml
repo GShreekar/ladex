@@ -44,4 +44,5 @@ tempfile = "3"
 ed25519-dalek = "2"                 # the node's long-lived identity key
 keyring = "4"                       # keeps that key in the OS keychain
 data-encoding = "2"                 # base32 node ids
+redb = "4"                          # embedded database for the trust store
 ladex-core = { path = "crates/ladex-core" }

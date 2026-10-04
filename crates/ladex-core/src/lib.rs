@@ -25,6 +25,7 @@ pub mod server;
 pub mod sessions;
 pub mod store;
 pub mod transfer;
+pub mod trust;
 pub mod zip;
 pub mod validate;
 #[cfg(any(test, feature = "test-support"))]
