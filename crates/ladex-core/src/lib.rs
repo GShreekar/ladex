@@ -17,6 +17,7 @@ pub mod auth;
 pub mod tls;
 pub mod bitmap;
 pub mod files_api;
+pub mod handshake;
 pub mod hlc;
 pub mod identity;
 pub mod mdns;
@@ -80,6 +81,12 @@ pub struct NodeState {
     /// Unique identifier for this node (machine).  Stable across browser
     /// reconnects — it lives in the Rust process, not the browser tab.
     pub node_id: NodeId,
+
+    /// The key pair behind `node_id`; the mesh handshake proves possession of it.
+    pub identity: Arc<identity::Identity>,
+
+    /// The nodes this one has accepted into its mesh, and those it has revoked.
+    pub trust: Arc<trust::TrustStore>,
 
     /// Connected mesh peer handles keyed by node_id.
     /// Empty until Phase 3 (Mesh WebSocket Layer) is implemented.
@@ -164,12 +171,15 @@ impl NodeState {
             global_cap: None,
         };
         let node_id: NodeId = node_id.to_string();
+        let data_dir = tempfile::tempdir().unwrap().keep();
         NodeState {
             local_peers: Arc::new(RwLock::new(HashMap::new())),
             local_senders: Arc::new(RwLock::new(HashMap::new())),
             files: Arc::new(RwLock::new(HashMap::new())),
             messages: Arc::new(RwLock::new(Vec::new())),
             node_id: node_id.clone(),
+            identity: Arc::new(identity::Identity::generate()),
+            trust: Arc::new(trust::TrustStore::open(&data_dir).unwrap()),
             mesh_peers: Arc::new(RwLock::new(HashMap::new())),
             passphrase: passphrase.map(String::from),
             tls_fingerprint: Vec::new(),
@@ -177,7 +187,7 @@ impl NodeState {
             mesh_limiter: Arc::new(ratelimit::AttemptLimiter::new(policy())),
             sessions: Arc::new(sessions::SessionStore::new()),
             clock: Arc::new(hlc::Clock::new(node_id)),
-            store: Arc::new(store::Store::open(&tempfile::tempdir().unwrap().keep(), 1 << 40).unwrap()),
+            store: Arc::new(store::Store::open(&data_dir, 1 << 40).unwrap()),
             transfers: Arc::new(transfer::Transfers::with_tuning(transfer::Tuning {
                 request_timeout: Duration::from_millis(400),
                 manifest_retry: Duration::from_millis(400),

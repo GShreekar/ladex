@@ -12,6 +12,7 @@ use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 use warp::Filter;
 
+use crate::identity::Identity;
 use crate::store::CHUNK_SIZE;
 use crate::types::{FileMetadata, Holder, NodeId, TextMessage};
 use crate::{files_api, mesh, ratelimit, server, state, tls, NodeState};
@@ -27,15 +28,16 @@ static NEXT_MESSAGE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Default)]
 pub struct NodeConfig {
-    pub node_id: NodeId,
+    // The node's name; its id comes from a key generated for it.
+    pub name: String,
     pub passphrase: Option<String>,
     pub peers: Vec<SocketAddr>,
     pub tls: bool,
 }
 
 impl NodeConfig {
-    pub fn named(node_id: &str) -> Self {
-        Self { node_id: node_id.to_string(), ..Default::default() }
+    pub fn named(name: &str) -> Self {
+        Self { name: name.to_string(), ..Default::default() }
     }
 
     pub fn passphrase(mut self, passphrase: &str) -> Self {
@@ -72,7 +74,10 @@ pub async fn spawn_node(config: NodeConfig) -> NodeHandle {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.expect("bind a loopback port");
     let addr = listener.local_addr().expect("read the bound address");
 
-    let mut state = NodeState::for_tests_node(&config.node_id, config.passphrase.as_deref());
+    let identity = Identity::generate();
+    let mut state = NodeState::for_tests_node(identity.node_id(), config.passphrase.as_deref());
+    state.identity = Arc::new(identity);
+    state.node_name = config.name.clone();
     state.http_port = addr.port();
     state.local_ip = Some(addr.ip());
     // Every test node dials from 127.0.0.1, so that one address must not look like a guesser.
@@ -109,7 +114,7 @@ pub async fn spawn_node(config: NodeConfig) -> NodeHandle {
     let node = NodeHandle { state, addr, server };
     for peer in &config.peers {
         if let Err(e) = node.connect(*peer).await {
-            tracing::warn!("Test node {}: could not join {peer}: {e}", config.node_id);
+            tracing::warn!("Test node {}: could not join {peer}: {e}", config.name);
         }
     }
     node

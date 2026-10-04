@@ -8,7 +8,7 @@ use clap::Parser;
 use std::time::Duration;
 
 use ladex_core::types::{self, *};
-use ladex_core::{auth, discovery, files_api, handlers, hlc, identity, mdns, mesh, persist, ratelimit, server, sessions, state, store, tls, transfer, websocket, NodeState};
+use ladex_core::{auth, discovery, files_api, handlers, hlc, identity, mdns, mesh, persist, ratelimit, server, sessions, state, store, tls, transfer, trust, websocket, NodeState};
 use include_dir::{include_dir, Dir};
 
 // Embed the static directory at compile time
@@ -253,6 +253,13 @@ async fn main() {
         }
     };
     let node_id: NodeId = identity.node_id().to_string();
+    let trust = match trust::TrustStore::open(&data_dir) {
+        Ok(trust) => Arc::new(trust),
+        Err(e) => {
+            eprintln!("Error: {e:#}");
+            std::process::exit(1);
+        }
+    };
     let saved = persist::load(&data_dir);
 
     tracing::info!("Node ID: {node_id} (key kept in {key_location})");
@@ -323,6 +330,8 @@ async fn main() {
         files:                Arc::new(RwLock::new(HashMap::new())),
         messages:             Arc::new(RwLock::new(Vec::new())),
         node_id:              node_id.clone(),
+        identity:             Arc::new(identity),
+        trust,
         mesh_peers:           Arc::new(RwLock::new(HashMap::new())),
         passphrase,
         tls_fingerprint,
