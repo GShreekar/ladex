@@ -17,7 +17,7 @@ function startNode(n, extraArgs = []) {
     const dir = path.join(ROOT, `n${n}`);
     fs.mkdirSync(path.join(dir, 'home'), { recursive: true });
     const port = 9000 + n * 10;
-    const args = [PASS, '--port', String(port), '--no-discovery', '--data-dir', path.join(dir, 'files'), '--stall-timeout-secs', '8', ...extraArgs];
+    const args = [PASS, '--port', String(port), '--no-discovery', '--no-keychain', '--data-dir', path.join(dir, 'files'), '--stall-timeout-secs', '8', ...extraArgs];
     const log = fs.openSync(path.join(ROOT, `n${n}.log`), 'a');
     procs[n] = spawn(BIN, args, { env: { ...process.env, HOME: path.join(dir, 'home') }, stdio: ['ignore', log, log] });
     return { port, base: `localhost:${port + 1}` };

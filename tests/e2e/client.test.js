@@ -17,7 +17,7 @@ const sha = (b) => crypto.createHash('sha256').update(b).digest('hex');
 function start(n, extra = []) {
     fs.mkdirSync(path.join(ROOT, `n${n}/home`), { recursive: true });
     const port = 9300 + n * 10; const log = fs.openSync(path.join(ROOT, `n${n}.log`), 'w');
-    procs.push(spawn(BIN, [PASS, '--port', String(port), '--no-discovery', '--data-dir', path.join(ROOT, `n${n}/files`), '--stall-timeout-secs', '10', ...extra], { env: { ...process.env, HOME: path.join(ROOT, `n${n}/home`) }, stdio: ['ignore', log, log] }));
+    procs.push(spawn(BIN, [PASS, '--port', String(port), '--no-discovery', '--no-keychain', '--data-dir', path.join(ROOT, `n${n}/files`), '--stall-timeout-secs', '10', ...extra], { env: { ...process.env, HOME: path.join(ROOT, `n${n}/home`) }, stdio: ['ignore', log, log] }));
     return `localhost:${port + 1}`;
 }
 const login = async (b) => (await fetch(`http://${b}/auth`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ passphrase: PASS }) })).headers.get('set-cookie').match(/auth=([0-9a-f]+)/)[1];

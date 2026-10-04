@@ -5,11 +5,10 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 use warp::Filter;
 use clap::Parser;
-use rand::Rng;
 use std::time::Duration;
 
 use ladex_core::types::{self, *};
-use ladex_core::{auth, discovery, files_api, handlers, hlc, mdns, mesh, persist, ratelimit, server, sessions, state, store, tls, transfer, websocket, NodeState};
+use ladex_core::{auth, discovery, files_api, handlers, hlc, identity, mdns, mesh, persist, ratelimit, server, sessions, state, store, tls, transfer, websocket, NodeState};
 use include_dir::{include_dir, Dir};
 
 // Embed the static directory at compile time
@@ -84,6 +83,11 @@ struct Args {
     /// Most disk space, in GiB, that shared files may use on this node.
     #[arg(long, default_value = "20")]
     storage_limit_gb: u64,
+
+    /// Keep this node's private key in a file in the data directory instead
+    /// of the OS keychain.
+    #[arg(long)]
+    no_keychain: bool,
 }
 
 
@@ -238,16 +242,20 @@ async fn main() {
     }
 
     // ── node identity ────────────────────────────────────────────────────
-    // node_id identifies THIS machine on the mesh.  Different from a browser
-    // tab's session_id.  Created on the first run and kept in the data directory.
+    // node_id identifies THIS machine on the mesh (not a browser tab). It is
+    // derived from the node's key, which is made on the first run.
     let data_dir = args.data_dir.clone().unwrap_or_else(|| tls::config_dir().join("files"));
-    let saved = persist::load(&data_dir);
-    let node_id: NodeId = match &saved {
-        Some(saved) => saved.node_id.clone(),
-        None => format!("node_{:016x}", rand::thread_rng().gen::<u64>()),
+    let (identity, key_location) = match identity::load_or_create(&data_dir, !args.no_keychain) {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            eprintln!("Error: {e:#}");
+            std::process::exit(1);
+        }
     };
+    let node_id: NodeId = identity.node_id().to_string();
+    let saved = persist::load(&data_dir);
 
-    tracing::info!("Node ID: {node_id}");
+    tracing::info!("Node ID: {node_id} (key kept in {key_location})");
 
     // ── BUG-03 fix: TLS setup ────────────────────────────────────────────
     // Must happen before `state` is built: connect_to_peer (dialed from the
@@ -339,6 +347,10 @@ async fn main() {
     state::load_catalog_from_store(&state).await;
     if let Some(saved) = &saved {
         persist::restore(&state, saved).await;
+        if saved.node_id != node_id {
+            tracing::info!("Node ID changed from {} to {node_id}, now derived from the node's key", saved.node_id);
+            state::adopt_node_id(&state, &saved.node_id).await;
+        }
     }
     let saver = persist::spawn_saver(state.clone(), &data_dir, saved.as_ref());
 

@@ -7,7 +7,6 @@ edition.workspace = true
 ladex-core.workspace = true
 warp.workspace = true
 tokio.workspace = true
-rand.workspace = true
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

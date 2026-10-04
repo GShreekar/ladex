@@ -383,6 +383,36 @@ pub async fn reassert_holdership(state: &NodeState) {
     }
 }
 
+/// This node used to go by `old_id` (before ids came from the node's key):
+/// what it uploaded and holds is moved over to its current id, with fresh
+/// stamps so the change wins over copies other nodes still have.
+pub async fn adopt_node_id(state: &NodeState, old_id: &str) {
+    let changed: Vec<FileMetadata> = {
+        let mut files = state.files.write().await;
+        files
+            .values_mut()
+            .filter(|f| f.uploader_node == old_id || f.holders.contains_key(old_id))
+            .map(|file| {
+                let now = state.clock.now();
+                if file.uploader_node == old_id {
+                    file.uploader_node = state.node_id.clone();
+                }
+                if let Some(held) = file.holders.get(old_id).map(|h| h.present) {
+                    file.set_holder(old_id, false, now.clone());
+                    if held {
+                        file.set_holder(&state.node_id, true, now.clone());
+                    }
+                }
+                file.version = now;
+                file.clone()
+            })
+            .collect()
+    };
+    for entry in changed {
+        publish_entry(state, entry).await;
+    }
+}
+
 /// Apply an incoming peer sync and fan out the updated peer list to local tabs.
 pub async fn apply_peer_sync(state: &NodeState, incoming: Vec<PeerInfo>, from: &str) {
     let (accepted, clock_problem) = accept_from_mesh(state, incoming, validate::incoming_peer, |p| &p.version);
@@ -974,5 +1004,35 @@ mod tests {
         assert!(!files["file_inside"].deleted && !files["folder_real"].deleted);
         assert!(!files["file_elsewhere"].deleted, "another node's files are its own business");
         assert!(!files["file_loose"].deleted);
+    }
+
+    #[tokio::test]
+    async fn a_new_node_id_takes_over_what_the_old_one_uploaded_and_held() {
+        let state = NodeState::for_tests_node("node_new", None);
+        let old_version = stamp(1, 0, "node_a");
+        state.files.write().await.insert("file_mine".into(), file("file_mine", old_version.clone()));
+
+        adopt_node_id(&state, "node_a").await;
+
+        let files = state.files.read().await;
+        let mine = &files["file_mine"];
+        assert_eq!(mine.uploader_node, "node_new");
+        assert!(mine.is_held_by("node_new") && !mine.is_held_by("node_a"));
+        assert!(mine.version > old_version);
+    }
+
+    #[tokio::test]
+    async fn adopting_a_new_node_id_leaves_other_nodes_files_alone() {
+        let state = NodeState::for_tests_node("node_new", None);
+        let mut theirs = file("file_theirs", stamp(1, 0, "node_b"));
+        theirs.uploader_node = "node_b".into();
+        theirs.holders = [("node_b".to_string(), Holder { since: stamp(1, 0, "node_b"), present: true })].into();
+        state.files.write().await.insert("file_theirs".into(), theirs.clone());
+
+        adopt_node_id(&state, "node_a").await;
+
+        let files = state.files.read().await;
+        assert_eq!(files["file_theirs"].version, theirs.version);
+        assert_eq!(files["file_theirs"].uploader_node, "node_b");
     }
 }

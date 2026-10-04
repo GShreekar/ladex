@@ -17,7 +17,7 @@ let proc;
 function start(pass = PASS) {
     fs.mkdirSync(path.join(ROOT, 'home'), { recursive: true });
     const log = fs.openSync(path.join(ROOT, 'node.log'), 'a');
-    proc = spawn(BIN, [pass, '--port', String(PORT), '--no-discovery', '--data-dir', path.join(ROOT, 'files')], {
+    proc = spawn(BIN, [pass, '--port', String(PORT), '--no-discovery', '--no-keychain', '--data-dir', path.join(ROOT, 'files')], {
         env: { ...process.env, HOME: path.join(ROOT, 'home') }, stdio: ['ignore', log, log],
     });
 }

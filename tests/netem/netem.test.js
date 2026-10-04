@@ -60,7 +60,7 @@ const netem = (n, spec) => sh(`tc -n ${n.ns} qdisc replace dev eth0 root netem $
 function start(n, peers) {
     fs.mkdirSync(path.join(n.dir, 'home'), { recursive: true });
     const log = fs.openSync(path.join(n.dir, 'node.log'), 'a');
-    const args = [PASS, '--port', String(PORT), '--no-discovery', '--no-tls', '--data-dir', path.join(n.dir, 'files'),
+    const args = [PASS, '--port', String(PORT), '--no-discovery', '--no-tls', '--no-keychain', '--data-dir', path.join(n.dir, 'files'),
         ...peers.flatMap((p) => ['--peer', `${p.ip}:${PORT}`])];
     n.proc = spawn('ip', ['netns', 'exec', n.ns, BIN, ...args], {
         env: { ...process.env, HOME: path.join(n.dir, 'home'), RUST_LOG: 'info' }, stdio: ['ignore', log, log],

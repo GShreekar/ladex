@@ -11,7 +11,7 @@ const procs = [];
 function start(n, extra = []) {
     fs.mkdirSync(path.join(ROOT, `n${n}/home`), { recursive: true });
     const port = 9200 + n * 10; const log = fs.openSync(path.join(ROOT, `n${n}.log`), 'w');
-    procs.push(spawn(BIN, [PASS, '--port', String(port), '--no-discovery', '--data-dir', path.join(ROOT, `n${n}/files`), '--stall-timeout-secs', '10', ...extra], { env: { ...process.env, HOME: path.join(ROOT, `n${n}/home`) }, stdio: ['ignore', log, log] }));
+    procs.push(spawn(BIN, [PASS, '--port', String(port), '--no-discovery', '--no-keychain', '--data-dir', path.join(ROOT, `n${n}/files`), '--stall-timeout-secs', '10', ...extra], { env: { ...process.env, HOME: path.join(ROOT, `n${n}/home`) }, stdio: ['ignore', log, log] }));
     return `localhost:${port + 1}`;
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

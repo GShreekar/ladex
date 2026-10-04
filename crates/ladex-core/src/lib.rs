@@ -18,6 +18,7 @@ pub mod tls;
 pub mod bitmap;
 pub mod files_api;
 pub mod hlc;
+pub mod identity;
 pub mod mdns;
 pub mod ratelimit;
 pub mod server;
