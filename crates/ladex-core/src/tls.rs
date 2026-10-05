@@ -16,9 +16,7 @@ pub fn install_crypto_provider() {
 
 /// Every local, non-loopback IPv4 address, for the printed URLs and the certificate's names.
 // Virtual and container interfaces aren't reachable from other devices, so their addresses are never advertised.
-const VIRTUAL_IFACE_PREFIXES: &[&str] = &[
-    "docker", "br-", "veth", "virbr", "tun", "tap", "podman", "lxcbr", "vmnet", "vboxnet",
-];
+const VIRTUAL_IFACE_PREFIXES: &[&str] = &["docker", "br-", "veth", "virbr", "tun", "tap", "podman", "lxcbr", "vmnet", "vboxnet"];
 
 fn is_virtual_iface(name: &str) -> bool {
     VIRTUAL_IFACE_PREFIXES.iter().any(|p| name.starts_with(p))
@@ -42,9 +40,7 @@ pub fn local_ipv4_addresses() -> Vec<IpAddr> {
 }
 
 pub fn config_dir() -> PathBuf {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| ".".to_string());
+    let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home).join(".ladex")
 }
 
@@ -172,13 +168,8 @@ pub fn format_fingerprint(fingerprint: &[u8]) -> String {
     fingerprint.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(":")
 }
 
-fn build_server_config(
-    cert: CertificateDer<'static>,
-    key: PrivateKeyDer<'static>,
-) -> anyhow::Result<Arc<rustls::ServerConfig>> {
-    let config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert], key)?;
+fn build_server_config(cert: CertificateDer<'static>, key: PrivateKeyDer<'static>) -> anyhow::Result<Arc<rustls::ServerConfig>> {
+    let config = rustls::ServerConfig::builder().with_no_client_auth().with_single_cert(vec![cert], key)?;
     Ok(Arc::new(config))
 }
 
@@ -272,10 +263,8 @@ mod tests {
 
     #[test]
     fn old_addresses_are_remembered_after_the_current_ones() {
-        let all = certificate_names(
-            &names(&["localhost", "192.168.1.9"]),
-            &names(&["localhost", "192.168.1.5", "10.0.0.2", "ladex.local"]),
-        );
+        let all =
+            certificate_names(&names(&["localhost", "192.168.1.9"]), &names(&["localhost", "192.168.1.5", "10.0.0.2", "ladex.local"]));
         assert_eq!(all, names(&["localhost", "192.168.1.9", "192.168.1.5", "10.0.0.2"]));
     }
 

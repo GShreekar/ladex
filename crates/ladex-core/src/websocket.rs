@@ -80,8 +80,13 @@ pub async fn handle_websocket(ws: WebSocket, state: NodeState, auth: Option<Sess
 
     let outgoing_task = tokio::spawn(async move {
         while let Some(msg) = peer_rx.recv().await {
-            let json = match serde_json::to_string(&msg) { Ok(j) => j, Err(_) => continue };
-            if ws_tx.send(Message::text(json)).await.is_err() { break; }
+            let json = match serde_json::to_string(&msg) {
+                Ok(j) => j,
+                Err(_) => continue,
+            };
+            if ws_tx.send(Message::text(json)).await.is_err() {
+                break;
+            }
         }
     });
 
@@ -136,11 +141,16 @@ pub async fn handle_websocket(ws: WebSocket, state: NodeState, auth: Option<Sess
         let owned = {
             let mut owners = state.session_owners.write().await;
             let owned = owners.get(id).is_some_and(|o| o.conn_id == conn.id);
-            if owned { owners.remove(id); }
+            if owned {
+                owners.remove(id);
+            }
             owned
         };
         if owned {
-            { let mut s = state.local_senders.write().await; s.remove(id); }
+            {
+                let mut s = state.local_senders.write().await;
+                s.remove(id);
+            }
             cleanup_peer(&state, id).await;
         }
     }
@@ -203,7 +213,10 @@ async fn handle_client_message(
                 owners.insert(id.clone(), ConnOwner { conn_id: conn.id, auth_id: conn.auth_id.clone() });
             }
             conn.session_id = Some(id.clone());
-            { let mut s = state.local_senders.write().await; s.insert(id.clone(), peer_tx.clone()); }
+            {
+                let mut s = state.local_senders.write().await;
+                s.insert(id.clone(), peer_tx.clone());
+            }
 
             let peer = PeerInfo {
                 session_id: id.clone(),
@@ -285,9 +298,9 @@ async fn handle_client_message(
         ClientMessage::DeleteFile { session_id: _, file_id } => {
             let tombstones: Vec<FileMetadata> = {
                 let mut files = state.files.write().await;
-                let allowed = files.get(&file_id).is_some_and(|f| {
-                    !f.deleted && (f.uploader_id == bound || (conn.is_host && f.uploader_node == state.node_id))
-                });
+                let allowed = files
+                    .get(&file_id)
+                    .is_some_and(|f| !f.deleted && (f.uploader_id == bound || (conn.is_host && f.uploader_node == state.node_id)));
                 if !allowed {
                     Vec::new()
                 } else {
@@ -310,9 +323,14 @@ async fn handle_client_message(
             };
 
             if tombstones.is_empty() {
-                send_to(state, &bound, ServerMessage::Error {
-                    message: "Could not delete that file — it may not exist, already be removed, or not be yours".to_string(),
-                }).await;
+                send_to(
+                    state,
+                    &bound,
+                    ServerMessage::Error {
+                        message: "Could not delete that file — it may not exist, already be removed, or not be yours".to_string(),
+                    },
+                )
+                .await;
             } else {
                 for tombstone in &tombstones {
                     state::forget_file(state, &tombstone.id).await;
@@ -325,16 +343,22 @@ async fn handle_client_message(
 
         ClientMessage::OfferFileTo { session_id: from, target_session_id, file_id } => {
             mesh::route_signal(
-                state, &from, &target_session_id,
+                state,
+                &from,
+                &target_session_id,
                 ServerMessage::IncomingFileOffer { file_id, from_session_id: from.clone() },
-            ).await;
+            )
+            .await;
         }
 
         ClientMessage::DeclineFileOffer { session_id: from, target_session_id, file_id } => {
             mesh::route_signal(
-                state, &from, &target_session_id,
+                state,
+                &from,
+                &target_session_id,
                 ServerMessage::FileOfferDeclined { file_id, from_session_id: from.clone() },
-            ).await;
+            )
+            .await;
         }
     }
     Ok(())

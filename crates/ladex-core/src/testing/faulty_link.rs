@@ -1,8 +1,8 @@
 //! A lossy, delaying, reordering link between two in-process nodes, which must run without TLS.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
@@ -15,8 +15,17 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
 use super::{eventually, fully_connected, spawn_node, NodeConfig, NodeHandle};
+use crate::types::NodeId;
 
 const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+
+// Which link a node must go through to reach an address; nodes in every test share the process, so it is keyed by dialer.
+static DETOURS: LazyLock<Mutex<HashMap<(NodeId, SocketAddr), SocketAddr>>> = LazyLock::new(Default::default);
+
+/// Where `dialer` should dial to reach `target`: the `FaultyLink` between them, if there is one.
+pub(crate) fn detour(dialer: &str, target: SocketAddr) -> SocketAddr {
+    DETOURS.lock().unwrap().get(&(dialer.to_string(), target)).copied().unwrap_or(target)
+}
 
 /// What happens to each message crossing the link, in either direction.
 #[derive(Clone, Copy, Debug, Default)]
@@ -52,27 +61,36 @@ struct Shared {
 pub struct FaultyLink {
     shared: Arc<Shared>,
     relays: [JoinHandle<()>; 2],
+    detours: [(NodeId, SocketAddr); 2],
 }
 
 impl Drop for FaultyLink {
     fn drop(&mut self) {
         self.relays.iter().for_each(JoinHandle::abort);
+        let mut detours = DETOURS.lock().unwrap();
+        self.detours.iter().for_each(|key| {
+            detours.remove(key);
+        });
     }
 }
 
 impl FaultyLink {
-    /// Connects `b` to `a` through a new link; any reconnection between them goes through it too.
+    /// Connects `b` to `a` through a new link; any redial between them goes through it too.
     pub async fn join(a: &NodeHandle, b: &NodeHandle) -> FaultyLink {
         let listen = || TcpListener::bind((Ipv4Addr::LOCALHOST, 0));
         let (to_a, to_b) = (listen().await.expect("bind the link"), listen().await.expect("bind the link"));
         let (to_a_addr, to_b_addr) = (to_a.local_addr().unwrap(), to_b.local_addr().unwrap());
         let shared = Arc::new(Shared { faults: Mutex::new(Faults::default()), partitioned: watch::channel(false).0 });
+        let detours = [(a.state.node_id.clone(), b.addr), (b.state.node_id.clone(), a.addr)];
+        {
+            let mut registered = DETOURS.lock().unwrap();
+            registered.insert(detours[0].clone(), to_b_addr);
+            registered.insert(detours[1].clone(), to_a_addr);
+        }
         let link = FaultyLink {
-            relays: [
-                tokio::spawn(accept(to_a, a.addr, to_b_addr, shared.clone())),
-                tokio::spawn(accept(to_b, b.addr, to_a_addr, shared.clone())),
-            ],
+            relays: [tokio::spawn(accept(to_a, a.addr, shared.clone())), tokio::spawn(accept(to_b, b.addr, shared.clone()))],
             shared,
+            detours,
         };
         b.connect(to_a_addr).await.expect("b joins a through the link");
         link
@@ -92,21 +110,18 @@ impl FaultyLink {
     }
 }
 
-async fn accept(listener: TcpListener, target: SocketAddr, return_addr: SocketAddr, shared: Arc<Shared>) {
+async fn accept(listener: TcpListener, target: SocketAddr, shared: Arc<Shared>) {
     loop {
         let Ok((stream, _)) = listener.accept().await else { continue };
         if !*shared.partitioned.borrow() {
-            tokio::spawn(relay(stream, target, return_addr, shared.clone()));
+            tokio::spawn(relay(stream, target, shared.clone()));
         }
     }
 }
 
-async fn relay(stream: TcpStream, target: SocketAddr, return_addr: SocketAddr, shared: Arc<Shared>) {
-    let config = WebSocketConfig {
-        max_message_size: Some(MAX_MESSAGE_BYTES),
-        max_frame_size: Some(MAX_MESSAGE_BYTES),
-        ..Default::default()
-    };
+async fn relay(stream: TcpStream, target: SocketAddr, shared: Arc<Shared>) {
+    let config =
+        WebSocketConfig { max_message_size: Some(MAX_MESSAGE_BYTES), max_frame_size: Some(MAX_MESSAGE_BYTES), ..Default::default() };
     let Ok(dialer) = tokio_tungstenite::accept_async_with_config(stream, Some(config)).await else { return };
     let url = format!("ws://{target}/mesh");
     let Ok((target, _)) = tokio_tungstenite::connect_async_with_config(&url, Some(config), false).await else { return };
@@ -114,18 +129,13 @@ async fn relay(stream: TcpStream, target: SocketAddr, return_addr: SocketAddr, s
     let (target_tx, target_rx) = target.split();
     let mut partitioned = shared.partitioned.subscribe();
     tokio::select! {
-        _ = forward(dialer_rx, target_tx, Some(return_addr), &shared) => {}
-        _ = forward(target_rx, dialer_tx, None, &shared) => {}
+        _ = forward(dialer_rx, target_tx, &shared) => {}
+        _ = forward(target_rx, dialer_tx, &shared) => {}
         _ = partitioned.wait_for(|cut| *cut) => {}
     }
 }
 
-async fn forward(
-    mut from: impl Stream<Item = Result<Message, WsError>> + Unpin,
-    mut to: impl Sink<Message> + Unpin,
-    redirect_hello_to: Option<SocketAddr>,
-    shared: &Shared,
-) {
+async fn forward(mut from: impl Stream<Item = Result<Message, WsError>> + Unpin, mut to: impl Sink<Message> + Unpin, shared: &Shared) {
     // Messages due at the same moment keep their order.
     let mut queue: BTreeMap<(Instant, u64), Message> = BTreeMap::new();
     let mut sequence = 0u64;
@@ -133,14 +143,11 @@ async fn forward(
         let next_due = queue.keys().next().map(|(due, _)| *due);
         tokio::select! {
             incoming = from.next() => {
-                let mut message = match incoming {
+                let message = match incoming {
                     Some(Ok(message)) if message.is_text() || message.is_binary() => message,
                     Some(Ok(message)) if !message.is_close() => continue,
                     _ => return,
                 };
-                if let Some(addr) = redirect_hello_to {
-                    message = redirect_hello(message, addr);
-                }
                 let roll = shared.faults.lock().unwrap().roll();
                 if let Some(wait) = roll {
                     queue.insert((Instant::now() + wait, sequence), message);
@@ -155,17 +162,6 @@ async fn forward(
             }
         }
     }
-}
-
-fn redirect_hello(message: Message, addr: SocketAddr) -> Message {
-    let Message::Text(text) = &message else { return message };
-    let Ok(mut hello) = serde_json::from_str::<serde_json::Value>(text) else { return message };
-    if hello["type"] != "hello" {
-        return message;
-    }
-    hello["ip"] = addr.ip().to_string().into();
-    hello["http_port"] = addr.port().into();
-    Message::Text(hello.to_string())
 }
 
 /// Nodes where every pair talks through its own `FaultyLink`.

@@ -136,11 +136,17 @@ pub fn load_or_create(dir: &Path, use_keychain: bool) -> anyhow::Result<(Identit
     load_or_create_with(keychain.as_ref().map(|k| k as &dyn SecretStore), &KeyFile(file.clone()), file)
 }
 
-fn load_or_create_with(keychain: Option<&dyn SecretStore>, file: &dyn SecretStore, file_path: PathBuf) -> anyhow::Result<(Identity, KeyLocation)> {
+fn load_or_create_with(
+    keychain: Option<&dyn SecretStore>,
+    file: &dyn SecretStore,
+    file_path: PathBuf,
+) -> anyhow::Result<(Identity, KeyLocation)> {
     let mut keychain_error = None;
     if let Some(keychain) = keychain {
         match keychain.read() {
-            Ok(Some(secret)) => return Ok((Identity::from_stored(&secret).context("the key in the OS keychain is damaged")?, KeyLocation::Keychain)),
+            Ok(Some(secret)) => {
+                return Ok((Identity::from_stored(&secret).context("the key in the OS keychain is damaged")?, KeyLocation::Keychain))
+            }
             Ok(None) => {}
             Err(e) => keychain_error = Some(e),
         }
@@ -153,7 +159,9 @@ fn load_or_create_with(keychain: Option<&dyn SecretStore>, file: &dyn SecretStor
 
     // A locked keychain may already hold this node's key; making a new one would split its identity.
     if let Some(e) = keychain_error {
-        anyhow::bail!("could not read this node's key from the OS keychain ({e}). Unlock it, or run with --no-keychain to keep the key in a file");
+        anyhow::bail!(
+            "could not read this node's key from the OS keychain ({e}). Unlock it, or run with --no-keychain to keep the key in a file"
+        );
     }
 
     let identity = Identity::generate();

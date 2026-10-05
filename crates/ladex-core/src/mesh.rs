@@ -1,10 +1,9 @@
 //! The mesh layer: connections between nodes, heartbeats, reconnects and message dispatch.
 
-
-use crate::types::*;
 use crate::handshake::{self, Reason};
-use crate::server::{peer_ip, PeerAddr};
 use crate::revocation::{self, Revocation, Verdict};
+use crate::server::{peer_ip, PeerAddr};
+use crate::types::*;
 use crate::{pairing, state, NodeState};
 
 use futures_util::stream::{SplitSink, SplitStream};
@@ -20,9 +19,9 @@ use warp::{Rejection, Reply};
 
 pub const PROTOCOL_VERSION: u32 = 6;
 
-const HEARTBEAT_INTERVAL:  Duration = Duration::from_secs(5);
-const HEARTBEAT_TIMEOUT:   Duration = Duration::from_secs(15);
-const RECONNECT_GIVE_UP:   Duration = Duration::from_secs(600);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
+const RECONNECT_GIVE_UP: Duration = Duration::from_secs(600);
 const DATA_QUEUE_FRAMES: usize = 8;
 // Mesh messages carry whole catalog and chat snapshots, so they may be far larger than a tab's.
 const MAX_MESH_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
@@ -42,20 +41,20 @@ impl std::error::Error for AuthFailure {}
 
 #[derive(Debug, Clone)]
 pub struct MeshPeerHandle {
-    pub node_id:    NodeId,
-    pub node_name:  String,
-    pub addr:       SocketAddr,
-    pub http_port:  u16,
-    pub sender:     mpsc::UnboundedSender<MeshMessage>,
+    pub node_id: NodeId,
+    pub node_name: String,
+    pub addr: SocketAddr,
+    pub http_port: u16,
+    pub sender: mpsc::UnboundedSender<MeshMessage>,
     /// Binary chunk frames; bounded so a slow link holds the sender back.
-    pub data:       mpsc::Sender<Vec<u8>>,
+    pub data: mpsc::Sender<Vec<u8>>,
     /// Limits how many chunk requests from this peer are served at once.
     pub serve_slots: Arc<tokio::sync::Semaphore>,
-    pub last_seen:  Instant,
+    pub last_seen: Instant,
     /// Latest measured RTT to this peer (ms); None until the first Pong.
-    pub rtt_ms:     Option<u32>,
+    pub rtt_ms: Option<u32>,
     /// Ends the connection, as when the peer is revoked.
-    pub hang_up:    Arc<Notify>,
+    pub hang_up: Arc<Notify>,
 }
 
 pub type MeshPeers = Arc<RwLock<HashMap<NodeId, MeshPeerHandle>>>;
@@ -63,34 +62,67 @@ pub type MeshPeers = Arc<RwLock<HashMap<NodeId, MeshPeerHandle>>>;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MeshMessage {
-    Ping { ts: u64 },
-    Pong { ts: u64 },
+    Ping {
+        ts: u64,
+    },
+    Pong {
+        ts: u64,
+    },
 
-    CatalogSync  { files:    Vec<FileMetadata> },
-    PeerSync     { peers:    Vec<PeerInfo>     },
-    ChatSync     { messages: Vec<TextMessage>  },
-    ChatMessage  { message:  TextMessage       },
+    CatalogSync {
+        files: Vec<FileMetadata>,
+    },
+    PeerSync {
+        peers: Vec<PeerInfo>,
+    },
+    ChatSync {
+        messages: Vec<TextMessage>,
+    },
+    ChatMessage {
+        message: TextMessage,
+    },
 
     /// A node still fetching a file says which chunks it has, so others can fetch from it too.
-    ChunkMap { file_id: String, chunks: u32, bitmap: String },
-    GetManifest { file_id: String },
+    ChunkMap {
+        file_id: String,
+        chunks: u32,
+        bitmap: String,
+    },
+    GetManifest {
+        file_id: String,
+    },
     /// The file's chunk hashes, as hex (32 bytes per chunk).
-    Manifest { file_id: String, size: u64, hashes: String },
+    Manifest {
+        file_id: String,
+        size: u64,
+        hashes: String,
+    },
     /// Ask for chunks; they come back as binary frames, not as messages.
-    GetChunks { file_id: String, indices: Vec<u32> },
-    ChunkError { file_id: String, index: u32, reason: String },
+    GetChunks {
+        file_id: String,
+        indices: Vec<u32>,
+    },
+    ChunkError {
+        file_id: String,
+        index: u32,
+        reason: String,
+    },
 
     /// Routes a WebRTC payload between browser tabs on different nodes.
     SignalRelay {
-        to_node_id:   NodeId,
+        to_node_id: NodeId,
         from_node_id: NodeId,
-        payload:      serde_json::Value,
+        payload: serde_json::Value,
     },
 
     /// Keys no longer trusted, each signed by the node that revoked it.
-    Revocations { revocations: Vec<Revocation> },
+    Revocations {
+        revocations: Vec<Revocation>,
+    },
 
-    Goodbye { node_id: NodeId },
+    Goodbye {
+        node_id: NodeId,
+    },
 }
 
 /// What each node tells the other during the handshake, besides its name and key.
@@ -252,10 +284,7 @@ async fn peer_departed_cleanup(state: &NodeState, departed_node_id: &NodeId) {
         changed
     };
     if !departed_peers.is_empty() {
-        crate::websocket::broadcast(
-            state,
-            ServerMessage::PeerSync { peers: departed_peers.clone() },
-        ).await;
+        crate::websocket::broadcast(state, ServerMessage::PeerSync { peers: departed_peers.clone() }).await;
         for peer in departed_peers {
             state::push_peer_to_mesh(&state.mesh_peers, peer).await;
         }
@@ -301,11 +330,7 @@ pub fn spawn_reconnect(addr: IpAddr, http_port: u16, state: NodeState, peer_node
             if state.mesh_peers.read().await.contains_key(&peer_node_id) {
                 return;
             }
-            let delay_secs = if attempt < delays_secs.len() {
-                delays_secs[attempt]
-            } else {
-                30
-            };
+            let delay_secs = if attempt < delays_secs.len() { delays_secs[attempt] } else { 30 };
             tokio::time::sleep(Duration::from_secs(delay_secs) + stagger).await;
             attempt += 1;
             if state.mesh_peers.read().await.contains_key(&peer_node_id) {
@@ -313,7 +338,10 @@ pub fn spawn_reconnect(addr: IpAddr, http_port: u16, state: NodeState, peer_node
             }
             tracing::info!("Reconnect: attempt {attempt} to {addr}:{http_port} ({peer_node_id})");
             match connect_to_peer(addr, http_port, state.clone()).await {
-                Ok(()) => { tracing::info!("Reconnect: success to {peer_node_id}"); return; }
+                Ok(()) => {
+                    tracing::info!("Reconnect: success to {peer_node_id}");
+                    return;
+                }
                 Err(e) if e.downcast_ref::<AuthFailure>().is_some() => {
                     tracing::warn!("Reconnect: giving up on {peer_node_id}: {e}");
                     return;
@@ -349,7 +377,9 @@ pub fn spawn_heartbeat(
         interval.tick().await;
         loop {
             interval.tick().await;
-            if !is_current_connection(&state, &peer_node_id, &sender).await { return; }
+            if !is_current_connection(&state, &peer_node_id, &sender).await {
+                return;
+            }
 
             let ts = chrono::Utc::now().timestamp_millis() as u64;
             let _ = sender.send(MeshMessage::Ping { ts });
@@ -358,7 +388,8 @@ pub fn spawn_heartbeat(
 
             let timed_out = {
                 let peers = state.mesh_peers.read().await;
-                peers.get(&peer_node_id)
+                peers
+                    .get(&peer_node_id)
                     .filter(|h| h.sender.same_channel(&sender))
                     .is_some_and(|h| h.last_seen.elapsed() > HEARTBEAT_TIMEOUT)
             };
@@ -399,7 +430,9 @@ async fn handle_inbound(ws: WebSocket, remote_ip: IpAddr, state: NodeState) {
             tracing::warn!(
                 "Mesh inbound: no usable address for {} (ip={:?}, http_port={}) — \
                  reconnect after disconnect will not be possible for this peer",
-                peer.node_id, intro.ip, intro.http_port
+                peer.node_id,
+                intro.ip,
+                intro.http_port
             );
             "0.0.0.0:0".parse().unwrap()
         }
@@ -447,13 +480,12 @@ async fn complete_pairing<T: handshake::Transport>(
 }
 
 // ws:// and wss:// streams have different types, so both are boxed.
-type MeshSink = std::pin::Pin<Box<dyn futures_util::Sink<
-    tokio_tungstenite::tungstenite::Message,
-    Error = tokio_tungstenite::tungstenite::Error,
-> + Send>>;
-type MeshSource = std::pin::Pin<Box<dyn futures_util::Stream<
-    Item = Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>,
-> + Send>>;
+type MeshSink = std::pin::Pin<
+    Box<dyn futures_util::Sink<tokio_tungstenite::tungstenite::Message, Error = tokio_tungstenite::tungstenite::Error> + Send>,
+>;
+type MeshSource = std::pin::Pin<
+    Box<dyn futures_util::Stream<Item = Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>> + Send>,
+>;
 
 fn mesh_ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
     tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
@@ -473,25 +505,30 @@ pub async fn pair_with_peer(addr: IpAddr, http_port: u16, state: NodeState) -> a
 }
 
 async fn dial(addr: IpAddr, http_port: u16, state: NodeState, pairing: bool) -> anyhow::Result<String> {
+    // In tests a FaultyLink may stand between two nodes, and every dial between them must go through it.
+    #[cfg(any(test, feature = "test-support"))]
+    let (addr, http_port) = {
+        let to = crate::testing::detour(&state.node_id, SocketAddr::new(addr, http_port));
+        (to.ip(), to.port())
+    };
     let tls_client_config = state.tls_client_config.clone();
     let url = format!("{}://{addr}:{http_port}/mesh", if tls_client_config.is_some() { "wss" } else { "ws" });
     tracing::info!("Mesh: dialing {url}");
 
     // Without TLS the fingerprint stays empty, so nothing rules out a man in the middle.
-    let (mut tt_tx, mut tt_rx, server_fingerprint): (MeshSink, MeshSource, Vec<u8>) =
-        if let Some(client_config) = tls_client_config {
-            let (ws_stream, _, fingerprint) = crate::tls::connect_wss(addr, http_port, "/mesh", client_config, mesh_ws_config())
-                .await
-                .map_err(|e| anyhow::anyhow!("WSS connect to {url} failed: {e}"))?;
-            let (tx, rx) = ws_stream.split();
-            (Box::pin(tx), Box::pin(rx), fingerprint)
-        } else {
-            let (ws_stream, _) = tokio_tungstenite::connect_async_with_config(&url, Some(mesh_ws_config()), false)
-                .await
-                .map_err(|e| anyhow::anyhow!("WS connect to {url} failed: {e}"))?;
-            let (tx, rx) = ws_stream.split();
-            (Box::pin(tx), Box::pin(rx), Vec::new())
-        };
+    let (mut tt_tx, mut tt_rx, server_fingerprint): (MeshSink, MeshSource, Vec<u8>) = if let Some(client_config) = tls_client_config {
+        let (ws_stream, _, fingerprint) = crate::tls::connect_wss(addr, http_port, "/mesh", client_config, mesh_ws_config())
+            .await
+            .map_err(|e| anyhow::anyhow!("WSS connect to {url} failed: {e}"))?;
+        let (tx, rx) = ws_stream.split();
+        (Box::pin(tx), Box::pin(rx), fingerprint)
+    } else {
+        let (ws_stream, _) = tokio_tungstenite::connect_async_with_config(&url, Some(mesh_ws_config()), false)
+            .await
+            .map_err(|e| anyhow::anyhow!("WS connect to {url} failed: {e}"))?;
+        let (tx, rx) = ws_stream.split();
+        (Box::pin(tx), Box::pin(rx), Vec::new())
+    };
 
     let our_intro = Intro::ours(&state);
     let mut transport = OutboundTransport { tx: &mut tt_tx, rx: &mut tt_rx };
@@ -504,34 +541,40 @@ async fn dial(addr: IpAddr, http_port: u16, state: NodeState, pairing: bool) -> 
     } else {
         handshake::connect(&mut transport, &local).await
     };
-    let peer = authenticated
-        .map_err(|e| {
-            let message = format!("Peer {url}: {e}");
-            if e.is_authentication() { anyhow::Error::new(AuthFailure(message)) } else { anyhow::anyhow!(message) }
-        })?;
+    let peer = authenticated.map_err(|e| {
+        let message = format!("Peer {url}: {e}");
+        if e.is_authentication() {
+            anyhow::Error::new(AuthFailure(message))
+        } else {
+            anyhow::anyhow!(message)
+        }
+    })?;
     tracing::info!("Mesh: {url} authenticated (peer: {})", peer.node_id);
     note_clock_skew(&state, &peer.name, Intro::theirs(&peer).now_ms).await;
     let (peer_node_id, peer_node_name) = (peer.node_id, peer.name);
     let connected_name = peer_node_name.clone();
 
-    let remote_addr: SocketAddr = format!("{addr}:{http_port}").parse()
-        .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
+    let remote_addr: SocketAddr = format!("{addr}:{http_port}").parse().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
 
     let (peer_tx, mut peer_rx) = mpsc::unbounded_channel::<MeshMessage>();
     let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(DATA_QUEUE_FRAMES);
     let hang_up = Arc::new(Notify::new());
-    let registered = register_peer(&state, MeshPeerHandle {
-        node_id:   peer_node_id.clone(),
-        node_name: peer_node_name.clone(),
-        addr:      remote_addr,
-        http_port,
-        sender:    peer_tx.clone(),
-        data:      data_tx,
-        serve_slots: Arc::new(tokio::sync::Semaphore::new(crate::transfer::SERVE_SLOTS)),
-        last_seen: Instant::now(),
-        rtt_ms:    None,
-        hang_up:   hang_up.clone(),
-    }).await;
+    let registered = register_peer(
+        &state,
+        MeshPeerHandle {
+            node_id: peer_node_id.clone(),
+            node_name: peer_node_name.clone(),
+            addr: remote_addr,
+            http_port,
+            sender: peer_tx.clone(),
+            data: data_tx,
+            serve_slots: Arc::new(tokio::sync::Semaphore::new(crate::transfer::SERVE_SLOTS)),
+            last_seen: Instant::now(),
+            rtt_ms: None,
+            hang_up: hang_up.clone(),
+        },
+    )
+    .await;
     if !registered {
         tracing::warn!("Mesh: duplicate after handshake with {peer_node_id} — dropping");
         return Ok(connected_name);
@@ -562,11 +605,11 @@ async fn dial(addr: IpAddr, http_port: u16, state: NodeState, pairing: bool) -> 
         }
     });
 
-    let state_rd   = state.clone();
+    let state_rd = state.clone();
     let peer_id_rd = peer_node_id.clone();
-    let sender_rd  = peer_tx.clone();
+    let sender_rd = peer_tx.clone();
     let write_abort = write_task.abort_handle();
-    let read_task  = tokio::spawn(async move {
+    let read_task = tokio::spawn(async move {
         loop {
             let result = tokio::select! {
                 result = tt_rx.next() => result,
@@ -577,13 +620,16 @@ async fn dial(addr: IpAddr, http_port: u16, state: NodeState, pairing: bool) -> 
                 Ok(msg) if msg.is_text() => {
                     let text = msg.to_text().unwrap_or("");
                     match serde_json::from_str::<MeshMessage>(text) {
-                        Ok(m)  => dispatch(&m, &peer_id_rd, &state_rd).await,
+                        Ok(m) => dispatch(&m, &peer_id_rd, &state_rd).await,
                         Err(e) => tracing::warn!("Mesh outbound: bad JSON from {peer_id_rd}: {e}"),
                     }
                 }
                 Ok(msg) if msg.is_binary() => crate::transfer::on_binary_frame(&state_rd, &peer_id_rd, &msg.into_data()),
                 Ok(msg) if msg.is_close() => break,
-                Err(e) => { tracing::warn!("Mesh outbound: WS error from {peer_id_rd}: {e}"); break; }
+                Err(e) => {
+                    tracing::warn!("Mesh outbound: WS error from {peer_id_rd}: {e}");
+                    break;
+                }
                 _ => {}
             }
         }
@@ -593,7 +639,9 @@ async fn dial(addr: IpAddr, http_port: u16, state: NodeState, pairing: bool) -> 
         }
     });
 
-    tokio::spawn(async move { tokio::select! { _ = write_task => {} _ = read_task => {} } });
+    tokio::spawn(async move {
+        tokio::select! { _ = write_task => {} _ = read_task => {} }
+    });
     Ok(connected_name)
 }
 
@@ -609,18 +657,22 @@ async fn run_connection(
     let (peer_tx, mut peer_rx) = mpsc::unbounded_channel::<MeshMessage>();
     let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(DATA_QUEUE_FRAMES);
     let hang_up = Arc::new(Notify::new());
-    let registered = register_peer(&state, MeshPeerHandle {
-        node_id:   peer_node_id.clone(),
-        node_name: peer_node_name.clone(),
-        addr,
-        http_port,
-        sender:    peer_tx.clone(),
-        data:      data_tx,
-        serve_slots: Arc::new(tokio::sync::Semaphore::new(crate::transfer::SERVE_SLOTS)),
-        last_seen: Instant::now(),
-        rtt_ms:    None,
-        hang_up:   hang_up.clone(),
-    }).await;
+    let registered = register_peer(
+        &state,
+        MeshPeerHandle {
+            node_id: peer_node_id.clone(),
+            node_name: peer_node_name.clone(),
+            addr,
+            http_port,
+            sender: peer_tx.clone(),
+            data: data_tx,
+            serve_slots: Arc::new(tokio::sync::Semaphore::new(crate::transfer::SERVE_SLOTS)),
+            last_seen: Instant::now(),
+            rtt_ms: None,
+            hang_up: hang_up.clone(),
+        },
+    )
+    .await;
     if !registered {
         return;
     }
@@ -659,13 +711,16 @@ async fn run_connection(
             Ok(msg) if msg.is_text() => {
                 let text = msg.to_str().unwrap_or("");
                 match serde_json::from_str::<MeshMessage>(text) {
-                    Ok(m)  => dispatch(&m, &peer_node_id, &state).await,
+                    Ok(m) => dispatch(&m, &peer_node_id, &state).await,
                     Err(e) => tracing::warn!("Mesh inbound: bad JSON from {peer_node_id}: {e}"),
                 }
             }
             Ok(msg) if msg.is_binary() => crate::transfer::on_binary_frame(&state, &peer_node_id, msg.as_bytes()),
             Ok(msg) if msg.is_close() => break,
-            Err(e) => { tracing::warn!("Mesh inbound: WS error from {peer_node_id}: {e}"); break; }
+            Err(e) => {
+                tracing::warn!("Mesh inbound: WS error from {peer_node_id}: {e}");
+                break;
+            }
             _ => {}
         }
     }
@@ -733,10 +788,7 @@ pub(crate) async fn dispatch(msg: &MeshMessage, from_node_id: &NodeId, state: &N
                 updated
             };
             if !updated_peers.is_empty() {
-                crate::websocket::broadcast(
-                    state,
-                    ServerMessage::PeerSync { peers: updated_peers },
-                ).await;
+                crate::websocket::broadcast(state, ServerMessage::PeerSync { peers: updated_peers }).await;
             }
         }
 
@@ -788,7 +840,9 @@ pub(crate) async fn dispatch(msg: &MeshMessage, from_node_id: &NodeId, state: &N
             }
             let senders = state.local_senders.read().await;
             match senders.get(&sid) {
-                Some(sender) => { let _ = sender.send(srv_msg); }
+                Some(sender) => {
+                    let _ = sender.send(srv_msg);
+                }
                 None => tracing::warn!("SignalRelay: no local tab {sid}"),
             }
         }
@@ -799,7 +853,6 @@ pub(crate) async fn dispatch(msg: &MeshMessage, from_node_id: &NodeId, state: &N
             tracing::info!("Mesh: Goodbye from {node_id}");
             remove_mesh_peer(state, node_id).await;
         }
-
     }
 }
 
@@ -877,8 +930,9 @@ async fn revocations_applied(state: &NodeState, from_node_id: Option<&NodeId>, r
 /// A relay may only carry a file offer or its refusal, from a device the sending node really hosts.
 async fn relay_is_legitimate(state: &NodeState, msg: &ServerMessage, sender_node: &NodeId) -> bool {
     let claimed_from = match msg {
-        ServerMessage::IncomingFileOffer { from_session_id, .. }
-        | ServerMessage::FileOfferDeclined { from_session_id, .. } => from_session_id,
+        ServerMessage::IncomingFileOffer { from_session_id, .. } | ServerMessage::FileOfferDeclined { from_session_id, .. } => {
+            from_session_id
+        }
         _ => return false,
     };
     let peers = state.local_peers.read().await;
@@ -886,12 +940,7 @@ async fn relay_is_legitimate(state: &NodeState, msg: &ServerMessage, sender_node
 }
 
 /// Routes a WebRTC signaling payload from a local tab to a tab that may be on another node.
-pub async fn route_signal(
-    state: &NodeState,
-    _from_session_id: &str,
-    to_session_id: &str,
-    srv_msg: ServerMessage,
-) {
+pub async fn route_signal(state: &NodeState, _from_session_id: &str, to_session_id: &str, srv_msg: ServerMessage) {
     let hosting_node_id: Option<NodeId> = {
         let peers = state.local_peers.read().await;
         peers.get(to_session_id).and_then(|p| p.hosting_node_id.clone())
@@ -915,11 +964,8 @@ pub async fn route_signal(
 
             let peers = state.mesh_peers.read().await;
             if let Some(peer) = peers.get(&target_node_id) {
-                let _ = peer.sender.send(MeshMessage::SignalRelay {
-                    to_node_id:   target_node_id,
-                    from_node_id: state.node_id.clone(),
-                    payload,
-                });
+                let _ =
+                    peer.sender.send(MeshMessage::SignalRelay { to_node_id: target_node_id, from_node_id: state.node_id.clone(), payload });
             } else {
                 tracing::warn!("route_signal: no mesh peer {target_node_id} for tab {to_session_id}");
             }

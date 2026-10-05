@@ -2,6 +2,9 @@
 name = "ladex-core"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
 
 [features]
 test-support = ["dep:tempfile"]
@@ -45,6 +48,7 @@ redb.workspace = true
 [dev-dependencies]
 # Turns on the testing module for this crate's own integration tests in tests/.
 ladex-core = { path = ".", features = ["test-support"] }
+proptest.workspace = true
 tempfile.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 warp = { workspace = true, features = ["test"] }

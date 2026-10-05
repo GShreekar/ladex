@@ -5,6 +5,9 @@ members = ["crates/ladex-core", "crates/ladex-cli"]
 [workspace.package]
 version = "2.1.0"
 edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/GShreekar/ladex"
+publish = false
 
 [workspace.dependencies]
 warp = { version = "0.4.1", features = ["websocket", "server"] }
@@ -41,6 +44,7 @@ http-body-util = "0.1"
 percent-encoding = "2"
 crc32fast = "1"
 tempfile = "3"
+proptest = "1"
 ed25519-dalek = "2"
 keyring = "4"
 data-encoding = "2"

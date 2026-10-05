@@ -6,46 +6,46 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::RwLock;
 
-pub mod types;
-pub mod websocket;
-pub mod handlers;
-pub mod mesh;
-pub mod pairing;
-pub mod revocation;
-pub mod persist;
-pub mod discovery;
-pub mod state;
 pub mod auth;
-pub mod tls;
 pub mod bitmap;
+pub mod discovery;
 pub mod files_api;
+pub mod handlers;
 pub mod handshake;
 pub mod hlc;
 pub mod identity;
 pub mod mdns;
+pub mod mesh;
+pub mod pairing;
+pub mod persist;
 pub mod ratelimit;
+pub mod revocation;
 pub mod server;
 pub mod sessions;
+pub mod state;
 pub mod store;
-pub mod transfer;
-pub mod trust;
-pub mod zip;
-pub mod validate;
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;
+pub mod tls;
+pub mod transfer;
+pub mod trust;
+pub mod types;
+pub mod validate;
+pub mod websocket;
+pub mod zip;
 
 use types::*;
 
 pub type LocalPeers = Arc<RwLock<HashMap<SessionId, PeerInfo>>>;
-pub type Files      = Arc<RwLock<HashMap<String, FileMetadata>>>;
-pub type Messages   = Arc<RwLock<Vec<types::TextMessage>>>;
+pub type Files = Arc<RwLock<HashMap<String, FileMetadata>>>;
+pub type Messages = Arc<RwLock<Vec<types::TextMessage>>>;
 
 #[derive(Clone)]
 pub struct NodeState {
-    pub local_peers:   LocalPeers,
+    pub local_peers: LocalPeers,
     pub local_senders: types::PeerSenders,
 
-    pub files:    Files,
+    pub files: Files,
     pub messages: Messages,
 
     /// This node's id, derived from its identity key.

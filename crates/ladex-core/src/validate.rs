@@ -21,8 +21,8 @@ pub const MAX_NODE_NAME_CHARS: usize = 128;
 pub const MAX_MESSAGE_CHARS: usize = 4000;
 
 const WINDOWS_RESERVED: [&str; 22] = [
-    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
-    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4",
+    "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
 ];
 
 // Control, invisible and bidi-override characters, which can make "photo\u{202E}gpj.exe" display as "photoexe.jpg".
@@ -39,11 +39,7 @@ fn is_forbidden_in_names(c: char) -> bool {
 
 /// Safe as a single file name on Windows, macOS and Linux.
 pub fn sanitize_file_name(name: &str) -> String {
-    let cleaned: String = name
-        .chars()
-        .filter(|c| !is_stripped(*c))
-        .map(|c| if is_forbidden_in_names(c) { '_' } else { c })
-        .collect();
+    let cleaned: String = name.chars().filter(|c| !is_stripped(*c)).map(|c| if is_forbidden_in_names(c) { '_' } else { c }).collect();
     let trimmed = cleaned.trim_start_matches(' ').trim_end_matches([' ', '.']);
     let mut name = if trimmed.is_empty() { "unnamed".to_string() } else { trimmed.to_string() };
 
@@ -77,11 +73,7 @@ fn truncate_to_bytes(name: &str) -> String {
 
 /// A path inside a shared folder; `.` and `..` parts are dropped so it never leaves the folder.
 pub fn sanitize_relative_path(path: &str) -> Option<String> {
-    let segments: Vec<String> = path
-        .split(['/', '\\'])
-        .filter(|part| !matches!(*part, "" | "." | ".."))
-        .map(sanitize_file_name)
-        .collect();
+    let segments: Vec<String> = path.split(['/', '\\']).filter(|part| !matches!(*part, "" | "." | "..")).map(sanitize_file_name).collect();
     if segments.is_empty() || segments.len() > MAX_PATH_DEPTH {
         return None;
     }
@@ -103,10 +95,7 @@ pub fn is_valid_sha256(s: &str) -> bool {
 
 pub fn sanitize_mime(mime: &str) -> String {
     const FALLBACK: &str = "application/octet-stream";
-    let is_token = |part: &str| {
-        !part.is_empty()
-            && part.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$&^_.+-".contains(&b))
-    };
+    let is_token = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$&^_.+-".contains(&b));
     match mime.split_once('/') {
         Some((kind, subtype)) if mime.len() <= MAX_MIME_LEN && is_token(kind) && is_token(subtype) => mime.to_string(),
         _ => FALLBACK.to_string(),
@@ -120,11 +109,7 @@ pub fn clean_label(s: &str, max: usize) -> String {
 
 /// Chat text, keeping newlines and tabs; None when nothing is left.
 pub fn clean_message(s: &str) -> Option<String> {
-    let cleaned: String = s
-        .chars()
-        .filter(|c| matches!(c, '\n' | '\t') || !is_stripped(*c))
-        .take(MAX_MESSAGE_CHARS)
-        .collect();
+    let cleaned: String = s.chars().filter(|c| matches!(c, '\n' | '\t') || !is_stripped(*c)).take(MAX_MESSAGE_CHARS).collect();
     let cleaned = cleaned.trim().to_string();
     (!cleaned.is_empty()).then_some(cleaned)
 }

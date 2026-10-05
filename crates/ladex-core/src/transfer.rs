@@ -102,12 +102,12 @@ pub fn plan(want: &[u32], in_flight: &HashMap<u32, Vec<usize>>, sources: &[Sourc
         if already.is_some() && !endgame {
             continue;
         }
-        let best = (0..sources.len())
-            .filter(|&s| room[s] > 0 && sources[s].has(index) && !already.is_some_and(|a| a.contains(&s)))
-            .max_by(|&a, &b| {
+        let best = (0..sources.len()).filter(|&s| room[s] > 0 && sources[s].has(index) && !already.is_some_and(|a| a.contains(&s))).max_by(
+            |&a, &b| {
                 let score = |s: usize| sources[s].speed_bps.max(1.0) / (sources[s].in_flight + assigned[s] + 1) as f64;
                 score(a).total_cmp(&score(b)).then(b.cmp(&a))
-            });
+            },
+        );
         if let Some(s) = best {
             room[s] -= 1;
             assigned[s] += 1;
@@ -634,7 +634,8 @@ mod tests {
 
     #[test]
     fn rare_chunks_beat_common_ones_when_nobody_is_reading() {
-        let sources = [source("a", Some(&[0, 1, 2, 3]), 4, 0, 0.0), source("b", Some(&[0, 1, 2]), 4, 0, 0.0), source("c", Some(&[0, 1]), 4, 0, 0.0)];
+        let sources =
+            [source("a", Some(&[0, 1, 2, 3]), 4, 0, 0.0), source("b", Some(&[0, 1, 2]), 4, 0, 0.0), source("c", Some(&[0, 1]), 4, 0, 0.0)];
         assert_eq!(priority_order(&have(4, &[]), &[], &sources), [3, 2, 0, 1]);
     }
 

@@ -31,6 +31,21 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.0"
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest

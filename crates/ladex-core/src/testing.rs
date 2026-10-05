@@ -17,6 +17,7 @@ use crate::types::{FileMetadata, Holder, NodeId, TextMessage};
 use crate::{files_api, mesh, ratelimit, server, state, tls, NodeState};
 
 mod faulty_link;
+pub(crate) use faulty_link::detour;
 pub use faulty_link::{Faults, FaultyLink, LinkedMesh};
 
 const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -87,8 +88,7 @@ pub async fn spawn_node(config: NodeConfig) -> NodeHandle {
 
     let acceptor = if config.tls {
         tls::install_crypto_provider();
-        let (server_config, fingerprint) =
-            tls::ephemeral_server_identity(&["127.0.0.1".to_string()]).expect("generate a certificate");
+        let (server_config, fingerprint) = tls::ephemeral_server_identity(&["127.0.0.1".to_string()]).expect("generate a certificate");
         state.tls_fingerprint = fingerprint;
         state.tls_client_config = Some(tls::build_client_config());
         Some(TlsAcceptor::from(server_config))

@@ -282,9 +282,15 @@ mod tests {
                     extra = &extra[8..];
                     v
                 };
-                if usize_ == u32::MAX as u64 { usize_ = take(true); }
-                if csize == u32::MAX as u64 { csize = take(true); }
-                if offset == u32::MAX as u64 { offset = take(true); }
+                if usize_ == u32::MAX as u64 {
+                    usize_ = take(true);
+                }
+                if csize == u32::MAX as u64 {
+                    csize = take(true);
+                }
+                if offset == u32::MAX as u64 {
+                    offset = take(true);
+                }
             }
             assert_eq!(csize, usize_, "stored");
             let local = offset as usize;

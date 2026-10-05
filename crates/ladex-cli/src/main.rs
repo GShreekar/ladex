@@ -1,20 +1,23 @@
+use clap::Parser;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::RwLock;
 use warp::Filter;
-use clap::Parser;
-use std::time::Duration;
 
-use ladex_core::types::{self, *};
-use ladex_core::{auth, discovery, files_api, handlers, hlc, identity, mdns, mesh, pairing, persist, ratelimit, server, sessions, state, store, tls, transfer, trust, websocket, NodeState};
 use include_dir::{include_dir, Dir};
+use ladex_core::types::{self, *};
+use ladex_core::{
+    auth, discovery, files_api, handlers, hlc, identity, mdns, mesh, pairing, persist, ratelimit, server, sessions, state, store, tls,
+    transfer, trust, websocket, NodeState,
+};
 
 static STATIC_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/../../static");
 
 #[derive(Parser)]
-#[command(name = "ladex")]
+#[command(name = "ladex", version)]
 #[command(about = "LADEX - Local Area Data Exchange", long_about = None)]
 struct Args {
     /// Passphrase for browser logins and for joining the mesh; without one, anyone on the network can do both.
@@ -65,12 +68,10 @@ struct Args {
     no_keychain: bool,
 }
 
-
 /// Resolves the browser's login session; `None` without a passphrase, otherwise a missing session is rejected.
 fn with_session(state: NodeState, api: bool) -> impl Filter<Extract = (Option<sessions::SessionHandle>,), Error = warp::Rejection> + Clone {
-    warp::cookie::optional("auth")
-        .and(warp::any().map(move || state.clone()))
-        .and_then(move |token: Option<String>, state: NodeState| async move {
+    warp::cookie::optional("auth").and(warp::any().map(move || state.clone())).and_then(
+        move |token: Option<String>, state: NodeState| async move {
             if state.passphrase.is_none() {
                 return Ok(None);
             }
@@ -79,7 +80,8 @@ fn with_session(state: NodeState, api: bool) -> impl Filter<Extract = (Option<se
                 None if api => Err(warp::reject::custom(Unauthorized)),
                 None => Err(warp::reject::custom(AuthenticationRequired)),
             }
-        })
+        },
+    )
 }
 
 fn with_auth(state: NodeState) -> impl Filter<Extract = (), Error = warp::Rejection> + Clone {
@@ -109,8 +111,7 @@ fn require_same_origin() -> impl Filter<Extract = (), Error = warp::Rejection> +
     warp::header::optional::<String>("origin")
         .and(warp::header::optional::<String>("host"))
         .and_then(|origin: Option<String>, host: Option<String>| async move {
-            let origin_host = origin.as_deref()
-                .and_then(|o| o.strip_prefix("https://").or_else(|| o.strip_prefix("http://")));
+            let origin_host = origin.as_deref().and_then(|o| o.strip_prefix("https://").or_else(|| o.strip_prefix("http://")));
             match (origin_host, host.as_deref()) {
                 (Some(o), Some(h)) if o == h => Ok(()),
                 _ => Err(warp::reject::custom(InvalidOrigin)),
@@ -123,7 +124,11 @@ fn require_same_origin() -> impl Filter<Extract = (), Error = warp::Rejection> +
 fn reject_browser_origin() -> impl Filter<Extract = (), Error = warp::Rejection> + Clone {
     warp::header::optional::<String>("origin")
         .and_then(|origin: Option<String>| async move {
-            if origin.is_none() { Ok(()) } else { Err(warp::reject::custom(InvalidOrigin)) }
+            if origin.is_none() {
+                Ok(())
+            } else {
+                Err(warp::reject::custom(InvalidOrigin))
+            }
         })
         .untuple_one()
 }
@@ -138,7 +143,8 @@ async fn handle_rejection(err: warp::Rejection) -> Result<Box<dyn warp::Reply>, 
     } else if err.is_not_found() {
         Ok(Box::new(warp::reply::with_status("Not Found", warp::http::StatusCode::NOT_FOUND)) as Box<dyn warp::Reply>)
     } else {
-        Ok(Box::new(warp::reply::with_status("Internal Server Error", warp::http::StatusCode::INTERNAL_SERVER_ERROR)) as Box<dyn warp::Reply>)
+        Ok(Box::new(warp::reply::with_status("Internal Server Error", warp::http::StatusCode::INTERNAL_SERVER_ERROR))
+            as Box<dyn warp::Reply>)
     }
 }
 
@@ -147,11 +153,7 @@ async fn serve_login_page() -> Result<Box<dyn warp::Reply>, warp::Rejection> {
     if let Some(file) = STATIC_DIR.get_file(&lookup) {
         let mime = mime_guess::from_path(&lookup).first_or_octet_stream().to_string();
         let bytes = file.contents().to_vec();
-        Ok(Box::new(warp::reply::with_header(
-            warp::reply::html(bytes),
-            "content-type",
-            mime,
-        )) as Box<dyn warp::Reply>)
+        Ok(Box::new(warp::reply::with_header(warp::reply::html(bytes), "content-type", mime)) as Box<dyn warp::Reply>)
     } else {
         Err(warp::reject::not_found())
     }
@@ -256,29 +258,29 @@ async fn main() {
     println!("Shared files are kept in {} (up to {} GiB)", data_dir.display(), args.storage_limit_gb);
 
     let state = NodeState {
-        local_peers:          Arc::new(RwLock::new(HashMap::new())),
-        local_senders:        Arc::new(RwLock::new(HashMap::new())),
-        files:                Arc::new(RwLock::new(HashMap::new())),
-        messages:             Arc::new(RwLock::new(Vec::new())),
-        node_id:              node_id.clone(),
-        identity:             Arc::new(identity),
+        local_peers: Arc::new(RwLock::new(HashMap::new())),
+        local_senders: Arc::new(RwLock::new(HashMap::new())),
+        files: Arc::new(RwLock::new(HashMap::new())),
+        messages: Arc::new(RwLock::new(Vec::new())),
+        node_id: node_id.clone(),
+        identity: Arc::new(identity),
         trust,
-        pairings:             Arc::new(pairing::Pairings::new()),
-        mesh_peers:           Arc::new(RwLock::new(HashMap::new())),
+        pairings: Arc::new(pairing::Pairings::new()),
+        mesh_peers: Arc::new(RwLock::new(HashMap::new())),
         passphrase,
         tls_fingerprint,
         auth_limiter,
         mesh_limiter,
-        store:                store.clone(),
-        transfers:            Arc::new(transfer::Transfers::with_tuning(transfer::Tuning {
+        store: store.clone(),
+        transfers: Arc::new(transfer::Transfers::with_tuning(transfer::Tuning {
             stall_timeout: Duration::from_secs(args.stall_timeout_secs),
             ..Default::default()
         })),
-        sessions:             Arc::new(sessions::SessionStore::new()),
-        clock:                Arc::new(hlc::Clock::new(node_id.clone())),
-        session_owners:       Arc::new(RwLock::new(HashMap::new())),
-        connection_counter:   Arc::new(AtomicU64::new(1)),
-        clock_alert_at:       Arc::new(Mutex::new(None)),
+        sessions: Arc::new(sessions::SessionStore::new()),
+        clock: Arc::new(hlc::Clock::new(node_id.clone())),
+        session_owners: Arc::new(RwLock::new(HashMap::new())),
+        connection_counter: Arc::new(AtomicU64::new(1)),
+        clock_alert_at: Arc::new(Mutex::new(None)),
         tls_client_config,
         http_port: args.port,
         local_ip: primary_local_ip,
@@ -321,8 +323,8 @@ async fn main() {
 
     if !args.no_discovery {
         let announce_packet = discovery::build_announce(&state, args.port);
-        let discovery_port  = args.discovery_port;
-        let state_disc      = state.clone();
+        let discovery_port = args.discovery_port;
+        let state_disc = state.clone();
 
         tokio::spawn(async move {
             match discovery::DiscoveryService::bind(discovery_port).await {
@@ -396,18 +398,18 @@ async fn main() {
                         message: "No other LADEX nodes found on this network after 10 seconds. \
                                   If you expect other devices, check: (1) all devices on same \
                                   Wi-Fi, (2) AP/client isolation disabled on router, (3) UDP \
-                                  port 7878 and TCP port 8080 not blocked.".to_string(),
+                                  port 7878 and TCP port 8080 not blocked."
+                            .to_string(),
                     },
-                ).await;
+                )
+                .await;
             }
         });
     }
 
     let app_state_login = state.clone();
-    let login_route = warp::path("login")
-        .and(warp::get())
-        .and(warp::any().map(move || app_state_login.clone()))
-        .and_then(|s: NodeState| async move {
+    let login_route =
+        warp::path("login").and(warp::get()).and(warp::any().map(move || app_state_login.clone())).and_then(|s: NodeState| async move {
             if s.passphrase.is_some() {
                 serve_login_page().await
             } else {
@@ -453,12 +455,10 @@ async fn main() {
         .and_then(handlers::revoke_session);
 
     let request = || {
-        with_api_auth(state.clone())
-            .and(warp::ext::optional::<server::PeerAddr>())
-            .and(warp::any().map({
-                let state = state.clone();
-                move || state.clone()
-            }))
+        with_api_auth(state.clone()).and(warp::ext::optional::<server::PeerAddr>()).and(warp::any().map({
+            let state = state.clone();
+            move || state.clone()
+        }))
     };
     let pairing_routes = {
         let status = warp::path!("api" / "pairing").and(warp::get()).and(request()).and_then(handlers::pairing_status);
@@ -509,36 +509,24 @@ async fn main() {
         }))
         .and_then(handlers::check_auth_status);
 
-    let static_route = warp::path("static")
-        .and(warp::path::tail())
-        .and_then(|tail: warp::filters::path::Tail| async move {
-            let lookup = tail.as_str().trim_start_matches('/').to_string();
-            let lookup = if lookup.is_empty() { "index.html".to_string() } else { lookup };
-            if let Some(file) = STATIC_DIR.get_file(&lookup) {
-                let mime = mime_guess::from_path(&lookup).first_or_octet_stream().to_string();
-                let bytes = file.contents().to_vec();
-                Ok::<_, warp::Rejection>(warp::reply::with_header(
-                    warp::reply::html(bytes),
-                    "content-type",
-                    mime,
-                ))
-            } else {
-                Err(warp::reject::not_found())
-            }
-        });
+    let static_route = warp::path("static").and(warp::path::tail()).and_then(|tail: warp::filters::path::Tail| async move {
+        let lookup = tail.as_str().trim_start_matches('/').to_string();
+        let lookup = if lookup.is_empty() { "index.html".to_string() } else { lookup };
+        if let Some(file) = STATIC_DIR.get_file(&lookup) {
+            let mime = mime_guess::from_path(&lookup).first_or_octet_stream().to_string();
+            let bytes = file.contents().to_vec();
+            Ok::<_, warp::Rejection>(warp::reply::with_header(warp::reply::html(bytes), "content-type", mime))
+        } else {
+            Err(warp::reject::not_found())
+        }
+    });
 
-    let favicon_route = warp::path("favicon.ico")
-        .and(warp::get())
-        .and_then(|| async move {
-            match STATIC_DIR.get_file("favicon.svg") {
-                Some(file) => Ok(warp::reply::with_header(
-                    warp::reply::html(file.contents().to_vec()),
-                    "content-type",
-                    "image/svg+xml",
-                )),
-                None => Err(warp::reject::not_found()),
-            }
-        });
+    let favicon_route = warp::path("favicon.ico").and(warp::get()).and_then(|| async move {
+        match STATIC_DIR.get_file("favicon.svg") {
+            Some(file) => Ok(warp::reply::with_header(warp::reply::html(file.contents().to_vec()), "content-type", "image/svg+xml")),
+            None => Err(warp::reject::not_found()),
+        }
+    });
 
     let mesh_state = state.clone();
     let mesh_route = warp::path("mesh")
@@ -557,27 +545,18 @@ async fn main() {
         .and(warp::any().map(move || app_state_ws.clone()))
         .and_then(websocket::websocket_handler);
 
-    let index = warp::path::end()
-        .and(with_auth(state.clone()))
-        .and_then(|| async move {
-            let lookup = "index.html".to_string();
-            if let Some(file) = STATIC_DIR.get_file(&lookup) {
-                let mime = mime_guess::from_path(&lookup).first_or_octet_stream().to_string();
-                let bytes = file.contents().to_vec();
-                Ok::<_, warp::Rejection>(warp::reply::with_header(
-                    warp::reply::html(bytes),
-                    "content-type",
-                    mime,
-                ))
-            } else {
-                Err(warp::reject::not_found())
-            }
-        });
+    let index = warp::path::end().and(with_auth(state.clone())).and_then(|| async move {
+        let lookup = "index.html".to_string();
+        if let Some(file) = STATIC_DIR.get_file(&lookup) {
+            let mime = mime_guess::from_path(&lookup).first_or_octet_stream().to_string();
+            let bytes = file.contents().to_vec();
+            Ok::<_, warp::Rejection>(warp::reply::with_header(warp::reply::html(bytes), "content-type", mime))
+        } else {
+            Err(warp::reject::not_found())
+        }
+    });
 
-    let cors = warp::cors()
-        .allow_any_origin()
-        .allow_headers(vec!["content-type"])
-        .allow_methods(vec!["GET", "POST", "PUT", "DELETE"]);
+    let cors = warp::cors().allow_any_origin().allow_headers(vec!["content-type"]).allow_methods(vec!["GET", "POST", "PUT", "DELETE"]);
 
     // More specific routes first; /mesh must come before /ws.
     let routes = login_route
@@ -596,19 +575,15 @@ async fn main() {
         .with(cors)
         .recover(handle_rejection);
 
-    let local_ip = primary_local_ip.map(|ip| ip.to_string())
-        .unwrap_or_else(|| "YOUR_IP".to_string());
+    let local_ip = primary_local_ip.map(|ip| ip.to_string()).unwrap_or_else(|| "YOUR_IP".to_string());
 
     let state_shutdown = state.clone();
     let tls_enabled = tls_server_config.is_some();
 
     let mdns_handle = mdns::advertise(&local_ips, args.port, tls_enabled);
 
-    let local_http_port: Option<u16> = if tls_enabled {
-        Some(args.local_port.unwrap_or(if args.port == u16::MAX { args.port - 1 } else { args.port + 1 }))
-    } else {
-        None
-    };
+    let local_http_port: Option<u16> =
+        if tls_enabled { Some(args.local_port.unwrap_or(if args.port == u16::MAX { args.port - 1 } else { args.port + 1 })) } else { None };
     let local_listener = match local_http_port {
         Some(port) => match tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port))).await {
             Ok(listener) => Some(listener),
@@ -688,9 +663,7 @@ fn print_qr_code(url: &str) {
     use qrcode::{render::unicode, QrCode};
     match QrCode::new(url) {
         Ok(code) => {
-            let qr = code.render::<unicode::Dense1x2>()
-                .quiet_zone(false)
-                .build();
+            let qr = code.render::<unicode::Dense1x2>().quiet_zone(false).build();
             println!("\nScan to open on your phone:\n{qr}");
         }
         Err(e) => tracing::warn!("QR code: failed to encode {url}: {e}"),
@@ -704,9 +677,7 @@ mod tests {
     const LAN_IP: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 20));
 
     async fn status_for(state: &NodeState, cookie: Option<&str>) -> u16 {
-        let protected = with_session(state.clone(), true)
-            .map(|_| "ok")
-            .recover(|_| async { Ok::<_, std::convert::Infallible>("denied") });
+        let protected = with_session(state.clone(), true).map(|_| "ok").recover(|_| async { Ok::<_, std::convert::Infallible>("denied") });
         let mut request = warp::test::request().path("/api");
         if let Some(token) = cookie {
             request = request.header("cookie", format!("auth={token}"));

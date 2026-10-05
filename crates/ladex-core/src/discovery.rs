@@ -10,8 +10,8 @@ use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
 
 use crate::mesh;
-use crate::NodeState;
 use crate::types::hostname;
+use crate::NodeState;
 
 // After a failed authentication, wait before redialing: 15 s, doubling up to 10 minutes.
 const AUTH_BACKOFF_BASE: Duration = Duration::from_secs(15);
@@ -99,10 +99,7 @@ impl DiscoveryService {
         // TTL=1: never leave the local segment
         socket.set_multicast_ttl_v4(1)?;
 
-        Ok(Self {
-            socket: Arc::new(socket),
-            discovery_port,
-        })
+        Ok(Self { socket: Arc::new(socket), discovery_port })
     }
 
     /// Broadcasts `packet` every `ANNOUNCE_INTERVAL`, forever.
@@ -118,14 +115,10 @@ impl DiscoveryService {
     }
 
     /// Listens for announces and dials newly seen nodes; the smaller node id dials first, to avoid double connects.
-    pub async fn listen_loop(
-        &self,
-        state: NodeState,
-    ) -> anyhow::Result<()> {
+    pub async fn listen_loop(&self, state: NodeState) -> anyhow::Result<()> {
         let mut buf = [0u8; 2048];
 
-        let seen: Arc<RwLock<HashMap<String, (Instant, SocketAddr)>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let seen: Arc<RwLock<HashMap<String, (Instant, SocketAddr)>>> = Arc::new(RwLock::new(HashMap::new()));
         let auth_backoff: AuthBackoff = Arc::new(Mutex::new(HashMap::new()));
 
         let seen_clone = seen.clone();
@@ -207,12 +200,7 @@ impl DiscoveryService {
                     }
                 }
 
-                tracing::info!(
-                    "Discovery: new peer {} at {}:{} — connecting",
-                    peer_node_id,
-                    peer_ip,
-                    peer_http_port
-                );
+                tracing::info!("Discovery: new peer {} at {}:{} — connecting", peer_node_id, peer_ip, peer_http_port);
 
                 match mesh::connect_to_peer(peer_ip, peer_http_port, state_spawn).await {
                     Ok(()) => {
@@ -222,11 +210,7 @@ impl DiscoveryService {
                         if e.downcast_ref::<mesh::AuthFailure>().is_some() {
                             record_auth_failure(&auth_backoff, &peer_node_id);
                         }
-                        tracing::warn!(
-                            "Discovery: mesh connect to {}:{} failed: {e}",
-                            peer_ip,
-                            peer_http_port
-                        );
+                        tracing::warn!("Discovery: mesh connect to {}:{} failed: {e}", peer_ip, peer_http_port);
                     }
                 }
             });
@@ -235,19 +219,13 @@ impl DiscoveryService {
 }
 
 /// Tears down mesh connections to nodes not heard from in `STALE_THRESHOLD`.
-async fn staleness_sweeper(
-    seen: Arc<RwLock<HashMap<String, (Instant, SocketAddr)>>>,
-    state: NodeState,
-) {
+async fn staleness_sweeper(seen: Arc<RwLock<HashMap<String, (Instant, SocketAddr)>>>, state: NodeState) {
     loop {
         tokio::time::sleep(SWEEP_INTERVAL).await;
 
         let stale: Vec<String> = {
             let map = seen.read().await;
-            map.iter()
-                .filter(|(_, (last, _))| last.elapsed() > STALE_THRESHOLD)
-                .map(|(id, _)| id.clone())
-                .collect()
+            map.iter().filter(|(_, (last, _))| last.elapsed() > STALE_THRESHOLD).map(|(id, _)| id.clone()).collect()
         };
 
         for node_id in &stale {
@@ -278,7 +256,6 @@ pub fn build_announce(state: &NodeState, http_port: u16) -> AnnouncePacket {
         secured: state.passphrase.is_some(),
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -382,16 +359,20 @@ mod tests {
 
     #[test]
     fn fields_of_the_wrong_type_do_not_parse() {
-        let port_as_string = br#"{"type":"ladex_announce","node_id":"n","node_name":"x","http_port":"80","protocol_version":4,"secured":false}"#;
-        let secured_as_number = br#"{"type":"ladex_announce","node_id":"n","node_name":"x","http_port":80,"protocol_version":4,"secured":1}"#;
+        let port_as_string =
+            br#"{"type":"ladex_announce","node_id":"n","node_name":"x","http_port":"80","protocol_version":4,"secured":false}"#;
+        let secured_as_number =
+            br#"{"type":"ladex_announce","node_id":"n","node_name":"x","http_port":80,"protocol_version":4,"secured":1}"#;
         assert!(parse(port_as_string).is_none());
         assert!(parse(secured_as_number).is_none());
     }
 
     #[test]
     fn a_port_outside_the_u16_range_does_not_parse() {
-        let port_too_big = br#"{"type":"ladex_announce","node_id":"n","node_name":"x","http_port":70000,"protocol_version":4,"secured":false}"#;
-        let negative_port = br#"{"type":"ladex_announce","node_id":"n","node_name":"x","http_port":-1,"protocol_version":4,"secured":false}"#;
+        let port_too_big =
+            br#"{"type":"ladex_announce","node_id":"n","node_name":"x","http_port":70000,"protocol_version":4,"secured":false}"#;
+        let negative_port =
+            br#"{"type":"ladex_announce","node_id":"n","node_name":"x","http_port":-1,"protocol_version":4,"secured":false}"#;
         assert!(parse(port_too_big).is_none());
         assert!(parse(negative_port).is_none());
     }

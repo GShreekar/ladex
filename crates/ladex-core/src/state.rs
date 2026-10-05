@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use crate::hlc::{ClockError, Stamp};
 use crate::types::*;
 use crate::validate;
-use crate::NodeState;
 use crate::websocket;
+use crate::NodeState;
 
 const TOMBSTONE_TTL_MS: u64 = 60 * 60 * 1000;
 const UNHELD_TTL_MS: u64 = 24 * 60 * 60 * 1000;
@@ -67,8 +67,7 @@ pub fn evict_old_tombstones(local: &mut HashMap<String, FileMetadata>, capacity:
     if local.len() < capacity {
         return;
     }
-    let mut tombstones: Vec<(Stamp, String)> =
-        local.values().filter(|f| f.deleted).map(|f| (f.version.clone(), f.id.clone())).collect();
+    let mut tombstones: Vec<(Stamp, String)> = local.values().filter(|f| f.deleted).map(|f| (f.version.clone(), f.id.clone())).collect();
     tombstones.sort();
     let excess = local.len() + 1 - capacity;
     for (_, id) in tombstones.into_iter().take(excess) {
@@ -78,11 +77,7 @@ pub fn evict_old_tombstones(local: &mut HashMap<String, FileMetadata>, capacity:
 
 /// Merges `incoming` messages into `local`, keeping the first copy of each id.
 pub fn merge_messages(local: &mut Vec<TextMessage>, incoming: Vec<TextMessage>) {
-    let mut index: HashMap<String, usize> = local
-        .iter()
-        .enumerate()
-        .map(|(i, m)| (m.id.clone(), i))
-        .collect();
+    let mut index: HashMap<String, usize> = local.iter().enumerate().map(|(i, m)| (m.id.clone(), i)).collect();
 
     for msg in incoming {
         if !index.contains_key(&msg.id) {
@@ -236,10 +231,8 @@ pub async fn collect_garbage(state: &NodeState) {
 
 async fn collect_garbage_with(state: &NodeState, partial_ttl: std::time::Duration, orphan_ttl_ms: u64) {
     for blob in state.store.all() {
-        let abandoned = !blob.is_complete()
-            && !blob.is_being_written()
-            && !state.transfers.is_downloading(blob.id())
-            && blob.idle_for() >= partial_ttl;
+        let abandoned =
+            !blob.is_complete() && !blob.is_being_written() && !state.transfers.is_downloading(blob.id()) && blob.idle_for() >= partial_ttl;
         if abandoned {
             tracing::info!("Store: removing {} (partly received, untouched for a long time)", blob.id());
             state.store.remove(blob.id());
@@ -355,7 +348,6 @@ pub async fn apply_peer_sync(state: &NodeState, incoming: Vec<PeerInfo>, from: &
     }
 }
 
-
 /// Caps the in-memory chat history, dropping the oldest messages.
 const MAX_CHAT_MESSAGES: usize = 500;
 pub fn prune_messages(messages: &mut Vec<TextMessage>) {
@@ -370,12 +362,8 @@ pub async fn apply_chat_sync(state: &NodeState, incoming: Vec<TextMessage>) {
     let incoming: Vec<TextMessage> = incoming.into_iter().filter_map(validate::incoming_message).collect();
     let new_messages: Vec<TextMessage> = {
         let mut messages = state.messages.write().await;
-        let existing_ids: std::collections::HashSet<String> =
-            messages.iter().map(|m| m.id.clone()).collect();
-        let new_ones: Vec<TextMessage> = incoming.iter()
-            .filter(|m| !existing_ids.contains(&m.id))
-            .cloned()
-            .collect();
+        let existing_ids: std::collections::HashSet<String> = messages.iter().map(|m| m.id.clone()).collect();
+        let new_ones: Vec<TextMessage> = incoming.iter().filter(|m| !existing_ids.contains(&m.id)).cloned().collect();
         merge_messages(&mut messages, incoming);
         prune_messages(&mut messages);
         new_ones
@@ -408,9 +396,7 @@ use crate::mesh::{MeshMessage, MeshPeers};
 /// Broadcast a single file entry to all connected mesh peers.
 pub async fn push_file_to_mesh(mesh_peers: &MeshPeers, file: FileMetadata) {
     let peers = mesh_peers.read().await;
-    let msg = MeshMessage::CatalogSync {
-        files: vec![file],
-    };
+    let msg = MeshMessage::CatalogSync { files: vec![file] };
     for handle in peers.values() {
         let _ = handle.sender.send(msg.clone());
     }
@@ -440,9 +426,7 @@ pub async fn push_message_to_mesh(mesh_peers: &MeshPeers, message: TextMessage) 
 /// Broadcast updated peer info (e.g. on Join) to all connected mesh peers.
 pub async fn push_peer_to_mesh(mesh_peers: &MeshPeers, peer: PeerInfo) {
     let peers = mesh_peers.read().await;
-    let msg = MeshMessage::PeerSync {
-        peers: vec![peer],
-    };
+    let msg = MeshMessage::PeerSync { peers: vec![peer] };
     for handle in peers.values() {
         let _ = handle.sender.send(msg.clone());
     }
@@ -631,11 +615,7 @@ mod tests {
 
     #[test]
     fn the_oldest_tombstones_are_evicted_first_to_make_room() {
-        let mut local = catalog(vec![
-            tombstone("t1", stamp(1, 0, "a")),
-            tombstone("t2", stamp(2, 0, "a")),
-            file("live", stamp(3, 0, "a")),
-        ]);
+        let mut local = catalog(vec![tombstone("t1", stamp(1, 0, "a")), tombstone("t2", stamp(2, 0, "a")), file("live", stamp(3, 0, "a"))]);
         evict_old_tombstones(&mut local, 3);
         assert!(!local.contains_key("t1") && local.contains_key("t2") && local.contains_key("live"));
     }
@@ -830,7 +810,12 @@ mod tests {
     #[tokio::test]
     async fn a_peer_sync_without_a_stamp_is_ignored() {
         let state = NodeState::for_tests(None);
-        apply_peer_sync(&state, vec![peer("p1", Stamp::default(), false), peer("p2", stamp(crate::hlc::wall_clock_ms(), 0, "a"), false)], "node_a").await;
+        apply_peer_sync(
+            &state,
+            vec![peer("p1", Stamp::default(), false), peer("p2", stamp(crate::hlc::wall_clock_ms(), 0, "a"), false)],
+            "node_a",
+        )
+        .await;
         let peers = state.local_peers.read().await;
         assert!(peers.contains_key("p2") && !peers.contains_key("p1"));
     }

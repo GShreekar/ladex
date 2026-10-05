@@ -144,11 +144,21 @@ fn same_origin(headers: &HeaderMap) -> bool {
 }
 
 fn content_disposition(name: &str) -> String {
-    const ATTR_CHAR: &AsciiSet = &NON_ALPHANUMERIC.remove(b'!').remove(b'#').remove(b'$').remove(b'&').remove(b'+').remove(b'-').remove(b'.').remove(b'^').remove(b'_').remove(b'`').remove(b'|').remove(b'~');
-    let ascii: String = name
-        .chars()
-        .map(|c| if (c.is_ascii_graphic() || c == ' ') && !matches!(c, '"' | '\\' | '%' | ';') { c } else { '_' })
-        .collect();
+    const ATTR_CHAR: &AsciiSet = &NON_ALPHANUMERIC
+        .remove(b'!')
+        .remove(b'#')
+        .remove(b'$')
+        .remove(b'&')
+        .remove(b'+')
+        .remove(b'-')
+        .remove(b'.')
+        .remove(b'^')
+        .remove(b'_')
+        .remove(b'`')
+        .remove(b'|')
+        .remove(b'~');
+    let ascii: String =
+        name.chars().map(|c| if (c.is_ascii_graphic() || c == ' ') && !matches!(c, '"' | '\\' | '%' | ';') { c } else { '_' }).collect();
     format!("attachment; filename=\"{ascii}\"; filename*=UTF-8''{}", utf8_percent_encode(name, ATTR_CHAR))
 }
 
@@ -294,7 +304,13 @@ impl FilesApi {
         response
     }
 
-    async fn upload_inner(&self, headers: &HeaderMap, id: &str, auth: Option<SessionHandle>, body_slot: &mut Option<Incoming>) -> Response<ServerBody> {
+    async fn upload_inner(
+        &self,
+        headers: &HeaderMap,
+        id: &str,
+        auth: Option<SessionHandle>,
+        body_slot: &mut Option<Incoming>,
+    ) -> Response<ServerBody> {
         if !same_origin(headers) {
             return fail(StatusCode::FORBIDDEN, "cross-origin request refused");
         }
@@ -355,7 +371,10 @@ impl FilesApi {
         // The node says where it can continue from; the client must not skip ahead.
         let resume_at = (blob.leading_chunks() as u64 * CHUNK_SIZE).min(size);
         if offset > resume_at {
-            return json(StatusCode::CONFLICT, &serde_json::json!({ "success": false, "message": "resume from an earlier offset", "offset": resume_at }));
+            return json(
+                StatusCode::CONFLICT,
+                &serde_json::json!({ "success": false, "message": "resume from an earlier offset", "offset": resume_at }),
+            );
         }
 
         let Some(mut body) = body_slot.take() else {
@@ -424,11 +443,8 @@ impl FilesApi {
     }
 
     async fn upload_status(&self, req: Request<Incoming>, id: &str) -> Response<ServerBody> {
-        let size = req
-            .uri()
-            .query()
-            .and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix("size=")))
-            .and_then(|s| s.parse::<u64>().ok());
+        let size =
+            req.uri().query().and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix("size="))).and_then(|s| s.parse::<u64>().ok());
         let blob = self.state.store.get(id).filter(|b| Some(b.size()) == size && b.expected_root().is_none());
         let offset = blob.as_ref().map_or(0, |b| (b.leading_chunks() as u64 * CHUNK_SIZE).min(b.size()));
         let complete = blob.is_some_and(|b| b.is_complete());
@@ -450,7 +466,8 @@ impl FilesApi {
         };
         let size = blob.size();
 
-        let range_header = header_str(req.headers(), "range").filter(|_| range_still_valid(header_str(req.headers(), "if-range"), etag.as_deref()));
+        let range_header =
+            header_str(req.headers(), "range").filter(|_| range_still_valid(header_str(req.headers(), "if-range"), etag.as_deref()));
         let (status, start, end) = match parse_range(range_header, size) {
             None => (StatusCode::OK, 0, size.saturating_sub(1)),
             Some(Ok((start, end))) => (StatusCode::PARTIAL_CONTENT, start, end),

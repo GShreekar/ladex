@@ -234,10 +234,7 @@ fn decode(node_id: &str, bytes: &[u8]) -> anyhow::Result<TrustedNode> {
 
 fn decode_revocation(node_id: &str, bytes: &[u8]) -> anyhow::Result<Revocation> {
     let revocation: Revocation = serde_json::from_slice(bytes).with_context(|| format!("the revocation of {node_id} is damaged"))?;
-    anyhow::ensure!(
-        revocation.node_id() == node_id && revocation.is_signed(),
-        "the revocation of {node_id} does not hold up"
-    );
+    anyhow::ensure!(revocation.node_id() == node_id && revocation.is_signed(), "the revocation of {node_id} does not hold up");
     Ok(revocation)
 }
 

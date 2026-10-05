@@ -220,17 +220,11 @@ pub fn device_label(user_agent: &str) -> String {
     .find(|(needle, _)| user_agent.contains(needle))
     .map(|(_, name)| *name);
     // Order matters: Edge and Opera also say "Chrome", Chrome also says "Safari".
-    let browser = [
-        ("Edg/", "Edge"),
-        ("OPR/", "Opera"),
-        ("Firefox/", "Firefox"),
-        ("Chrome/", "Chrome"),
-        ("CriOS/", "Chrome"),
-        ("Safari/", "Safari"),
-    ]
-    .iter()
-    .find(|(needle, _)| user_agent.contains(needle))
-    .map(|(_, name)| *name);
+    let browser =
+        [("Edg/", "Edge"), ("OPR/", "Opera"), ("Firefox/", "Firefox"), ("Chrome/", "Chrome"), ("CriOS/", "Chrome"), ("Safari/", "Safari")]
+            .iter()
+            .find(|(needle, _)| user_agent.contains(needle))
+            .map(|(_, name)| *name);
     match (browser, os) {
         (Some(browser), Some(os)) => format!("{browser} on {os}"),
         (Some(only), None) | (None, Some(only)) => only.to_string(),

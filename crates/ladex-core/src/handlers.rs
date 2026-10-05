@@ -8,15 +8,15 @@ use warp::{Rejection, Reply};
 
 // The loopback listener can't use `Secure`: Safari refuses Secure cookies on http://localhost.
 fn cookie_attributes(secure: bool) -> &'static str {
-    if secure { "; Secure" } else { "" }
+    if secure {
+        "; Secure"
+    } else {
+        ""
+    }
 }
 
 fn session_cookie(token: &str, secure: bool) -> String {
-    format!(
-        "auth={token}; Path=/; Max-Age={}; HttpOnly; SameSite=Strict{}",
-        SESSION_LIFETIME.as_secs(),
-        cookie_attributes(secure)
-    )
+    format!("auth={token}; Path=/; Max-Age={}; HttpOnly; SameSite=Strict{}", SESSION_LIFETIME.as_secs(), cookie_attributes(secure))
 }
 
 fn clearing_cookie(secure: bool) -> String {
@@ -24,10 +24,7 @@ fn clearing_cookie(secure: bool) -> String {
 }
 
 fn json_error(message: &str, status: StatusCode) -> Box<dyn Reply> {
-    Box::new(warp::reply::with_status(
-        warp::reply::json(&AuthResponse { success: false, message: Some(message.to_string()) }),
-        status,
-    ))
+    Box::new(warp::reply::with_status(warp::reply::json(&AuthResponse { success: false, message: Some(message.to_string()) }), status))
 }
 
 pub async fn check_auth_status(auth_cookie: Option<String>, peer: Option<PeerAddr>, state: NodeState) -> Result<impl Reply, Rejection> {
@@ -113,11 +110,7 @@ struct SessionsResponse {
     sessions: Vec<SessionSummary>,
 }
 
-pub async fn list_sessions(
-    session: Option<SessionHandle>,
-    peer: Option<PeerAddr>,
-    state: NodeState,
-) -> Result<impl Reply, Rejection> {
+pub async fn list_sessions(session: Option<SessionHandle>, peer: Option<PeerAddr>, state: NodeState) -> Result<impl Reply, Rejection> {
     let manage = can_manage(peer);
     let current = session.map(|s| s.id);
     let sessions = if state.passphrase.is_none() {
@@ -125,12 +118,7 @@ pub async fn list_sessions(
     } else {
         state.sessions.list().into_iter().filter(|s| manage || Some(&s.id) == current.as_ref()).collect()
     };
-    Ok(warp::reply::json(&SessionsResponse {
-        auth_required: state.passphrase.is_some(),
-        can_manage: manage,
-        current,
-        sessions,
-    }))
+    Ok(warp::reply::json(&SessionsResponse { auth_required: state.passphrase.is_some(), can_manage: manage, current, sessions }))
 }
 
 pub async fn revoke_session(
@@ -325,10 +313,7 @@ mod tests {
     }
 
     async fn login(state: &NodeState, passphrase: &str, addr: &str, tls: bool) -> warp::reply::Response {
-        authenticate(request(passphrase), peer(addr, tls), Some("Firefox/130 Linux".into()), state.clone())
-            .await
-            .unwrap()
-            .into_response()
+        authenticate(request(passphrase), peer(addr, tls), Some("Firefox/130 Linux".into()), state.clone()).await.unwrap().into_response()
     }
 
     async fn body_text(response: warp::reply::Response) -> String {
@@ -359,7 +344,9 @@ mod tests {
         let over_tls = login(&state, "pw", LAN, true).await;
         let plain = login(&state, "pw", "127.0.0.1:50000", false).await;
         let flags = |r: &warp::reply::Response| r.headers().get("set-cookie").unwrap().to_str().unwrap().to_string();
-        assert!(flags(&over_tls).contains("; Secure") && flags(&over_tls).contains("HttpOnly") && flags(&over_tls).contains("SameSite=Strict"));
+        assert!(
+            flags(&over_tls).contains("; Secure") && flags(&over_tls).contains("HttpOnly") && flags(&over_tls).contains("SameSite=Strict")
+        );
         assert!(!flags(&plain).contains("Secure") && flags(&plain).contains("HttpOnly"));
     }
 

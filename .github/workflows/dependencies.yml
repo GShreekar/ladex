@@ -1,0 +1,38 @@
+name: Dependencies
+
+on:
+  push:
+    branches: [main, v3]
+    paths: ["**/Cargo.toml", "Cargo.lock", "deny.toml", ".github/workflows/dependencies.yml"]
+  pull_request:
+    paths: ["**/Cargo.toml", "Cargo.lock", "deny.toml", ".github/workflows/dependencies.yml"]
+  # New advisories are published without any change here.
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+jobs:
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  audit:
+    name: cargo-audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: Audit
+        run: cargo audit --deny warnings

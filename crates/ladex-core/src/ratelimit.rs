@@ -113,12 +113,7 @@ mod tests {
     const OTHER_IP: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 11));
 
     fn policy(global_cap: Option<(usize, Duration)>) -> Policy {
-        Policy {
-            free_attempts: 3,
-            base_lockout: Duration::from_secs(10),
-            max_lockout: Duration::from_secs(80),
-            global_cap,
-        }
+        Policy { free_attempts: 3, base_lockout: Duration::from_secs(10), max_lockout: Duration::from_secs(80), global_cap }
     }
 
     #[test]
@@ -199,9 +194,7 @@ mod tests {
     #[test]
     fn guessing_from_many_addresses_hits_the_global_cap() {
         let limiter = AttemptLimiter::new(browser_login_policy());
-        let allowed = (0..1000u32)
-            .filter(|i| limiter.begin(IpAddr::V4(std::net::Ipv4Addr::from(*i))).is_ok())
-            .count();
+        let allowed = (0..1000u32).filter(|i| limiter.begin(IpAddr::V4(std::net::Ipv4Addr::from(*i))).is_ok()).count();
         assert_eq!(allowed, 30);
     }
 

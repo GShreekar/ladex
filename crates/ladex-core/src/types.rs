@@ -148,44 +148,25 @@ pub enum ClientMessage {
 
     /// The user changed their nickname after joining.
     #[serde(rename = "set_nickname")]
-    SetNickname {
-        session_id: SessionId,
-        nickname: String,
-    },
+    SetNickname { session_id: SessionId, nickname: String },
 
     #[serde(rename = "ping")]
-    Ping {
-        session_id: SessionId,
-    },
+    Ping { session_id: SessionId },
 
     #[serde(rename = "text_message")]
-    TextMessage {
-        session_id: SessionId,
-        content: String,
-    },
+    TextMessage { session_id: SessionId, content: String },
 
     /// Unshares a file; only its uploader may.
     #[serde(rename = "delete_file")]
-    DeleteFile {
-        session_id: SessionId,
-        file_id: String,
-    },
+    DeleteFile { session_id: SessionId, file_id: String },
 
     /// Points one peer at a file; the recipient gets a consent prompt.
     #[serde(rename = "offer_file_to")]
-    OfferFileTo {
-        session_id: SessionId,
-        target_session_id: SessionId,
-        file_id: String,
-    },
+    OfferFileTo { session_id: SessionId, target_session_id: SessionId, file_id: String },
 
     /// The offer's recipient declined it.
     #[serde(rename = "decline_file_offer")]
-    DeclineFileOffer {
-        session_id: SessionId,
-        target_session_id: SessionId,
-        file_id: String,
-    },
+    DeclineFileOffer { session_id: SessionId, target_session_id: SessionId, file_id: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -193,78 +174,50 @@ pub enum ClientMessage {
 pub enum ServerMessage {
     /// A new peer joined the network
     #[serde(rename = "peer_joined")]
-    PeerJoined {
-        peer: PeerInfo,
-        total_peers: usize,
-    },
+    PeerJoined { peer: PeerInfo, total_peers: usize },
 
     /// A peer left the network
     #[serde(rename = "peer_left")]
-    PeerLeft {
-        session_id: SessionId,
-        total_peers: usize,
-    },
+    PeerLeft { session_id: SessionId, total_peers: usize },
 
     /// Full file catalog (sent on join and whenever the catalog changes)
     #[serde(rename = "file_list_update")]
-    FileListUpdate {
-        files: Vec<FileMetadata>,
-    },
+    FileListUpdate { files: Vec<FileMetadata> },
 
     /// A single file was removed (host went offline, no remaining hosts)
     #[serde(rename = "file_removed")]
-    FileRemoved {
-        file_id: String,
-    },
+    FileRemoved { file_id: String },
 
     /// Incremental peer list update (e.g. an RTT change).
     #[serde(rename = "peer_sync")]
-    PeerSync {
-        peers: Vec<PeerInfo>,
-    },
+    PeerSync { peers: Vec<PeerInfo> },
 
     #[serde(rename = "error")]
-    Error {
-        message: String,
-    },
+    Error { message: String },
 
     #[serde(rename = "pong")]
     Pong,
 
     #[serde(rename = "text_message")]
-    TextMessage {
-        message: TextMessage,
-    },
+    TextMessage { message: TextMessage },
 
     #[serde(rename = "message_history")]
-    MessageHistory {
-        messages: Vec<TextMessage>,
-    },
+    MessageHistory { messages: Vec<TextMessage> },
 
     /// No mesh peers found after 10 s, likely AP isolation; the tab shows a warning.
     #[serde(rename = "no_peers_warning")]
-    NoPeersWarning {
-        message: String,
-    },
+    NoPeersWarning { message: String },
 
     /// Someone offers to send this file directly; the tab asks for consent.
     #[serde(rename = "incoming_file_offer")]
-    IncomingFileOffer {
-        file_id: String,
-        from_session_id: SessionId,
-    },
+    IncomingFileOffer { file_id: String, from_session_id: SessionId },
 
     /// The peer we offered a file to declined it.
     #[serde(rename = "file_offer_declined")]
-    FileOfferDeclined {
-        file_id: String,
-        from_session_id: SessionId,
-    },
+    FileOfferDeclined { file_id: String, from_session_id: SessionId },
 }
 
 /// System hostname, or a fallback label if it can't be read.
 pub fn hostname() -> String {
-    gethostname::gethostname()
-        .into_string()
-        .unwrap_or_else(|_| "LADEX Node".to_string())
+    gethostname::gethostname().into_string().unwrap_or_else(|_| "LADEX Node".to_string())
 }

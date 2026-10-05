@@ -133,14 +133,11 @@ struct Saver {
 impl Saver {
     async fn snapshot(&mut self, state: &NodeState) -> Saved {
         let now = hlc::wall_clock_ms();
-        let live: Vec<KnownPeer> = state
-            .mesh_peers
-            .read()
-            .await
-            .values()
-            .map(|p| KnownPeer { ip: p.addr.ip(), port: p.http_port, last_seen_ms: now })
-            .collect();
-        self.peers.retain(|old| now.saturating_sub(old.last_seen_ms) < PEER_MEMORY_MS && !live.iter().any(|p| p.ip == old.ip && p.port == old.port));
+        let live: Vec<KnownPeer> =
+            state.mesh_peers.read().await.values().map(|p| KnownPeer { ip: p.addr.ip(), port: p.http_port, last_seen_ms: now }).collect();
+        self.peers.retain(|old| {
+            now.saturating_sub(old.last_seen_ms) < PEER_MEMORY_MS && !live.iter().any(|p| p.ip == old.ip && p.port == old.port)
+        });
         self.peers.extend(live);
         self.peers.sort_by_key(|p| std::cmp::Reverse(p.last_seen_ms));
         self.peers.truncate(MAX_KNOWN_PEERS);
@@ -182,12 +179,7 @@ pub fn spawn_saver(state: NodeState, dir: &Path, saved: Option<&Saved>) -> Flush
         (Some(passphrase), _) => Some(new_login_tag(passphrase)),
         (None, _) => None,
     };
-    let saver = Saver {
-        path: path_in(dir),
-        login,
-        peers: saved.map(|s| s.peers.clone()).unwrap_or_default(),
-        last_written: Vec::new(),
-    };
+    let saver = Saver { path: path_in(dir), login, peers: saved.map(|s| s.peers.clone()).unwrap_or_default(), last_written: Vec::new() };
     let saver = std::sync::Arc::new(tokio::sync::Mutex::new(saver));
     let flusher = Flusher { state: state.clone(), saver: saver.clone() };
     tokio::spawn(async move {

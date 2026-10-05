@@ -20,7 +20,8 @@ async fn a_revoked_node_is_dropped_by_the_whole_mesh() {
     assert_eq!(mesh::revoke_node(&a.state, stolen.node_id()).await.unwrap(), Revoked::Now);
 
     assert!(eventually(async || has_revoked(b, stolen)).await, "the revocation never reached b");
-    let dropped = eventually(async || !is_connected(a, stolen).await && !is_connected(b, stolen).await && stolen.mesh_peers().await.is_empty()).await;
+    let dropped =
+        eventually(async || !is_connected(a, stolen).await && !is_connected(b, stolen).await && stolen.mesh_peers().await.is_empty()).await;
     assert!(dropped, "the revoked node is still connected");
     assert!(is_connected(a, b).await);
     assert!(stolen.connect(b.addr).await.is_err());

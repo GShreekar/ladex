@@ -130,7 +130,9 @@ impl std::fmt::Display for Failure {
         match self {
             Failure::Refused(reason) => write!(f, "refused the peer: {reason}"),
             Failure::RejectedBy(reason) => write!(f, "rejected by the peer: {reason}"),
-            Failure::ProofFailed => f.write_str("the peer failed to prove the passphrase and its key: wrong passphrase, or the connection is being intercepted"),
+            Failure::ProofFailed => {
+                f.write_str("the peer failed to prove the passphrase and its key: wrong passphrase, or the connection is being intercepted")
+            }
             Failure::Declined => f.write_str("the pairing was declined on this device"),
             Failure::DeclinedByPeer => f.write_str("the pairing was declined on the other device"),
             Failure::Malformed(what) => write!(f, "malformed handshake: {what}"),
@@ -172,7 +174,9 @@ async fn dial<T: Transport>(transport: &mut T, local: &Local<'_>, purpose: Purpo
     send_frame(transport, &hello).await?;
 
     let (server, proof, signature) = match recv_frame(transport).await? {
-        Frame::Reply { name, public_key, pake, intro, proof, signature } => (Side::remote(name, &public_key, pake, intro)?, proof, signature),
+        Frame::Reply { name, public_key, pake, intro, proof, signature } => {
+            (Side::remote(name, &public_key, pake, intro)?, proof, signature)
+        }
         Frame::Rejected { reason } => return Err(Failure::RejectedBy(reason)),
         _ => return Err(Failure::Malformed("expected a reply")),
     };
@@ -191,7 +195,11 @@ async fn dial<T: Transport>(transport: &mut T, local: &Local<'_>, purpose: Purpo
 }
 
 /// Reads the dialer's hello unless its IP is locked out; finish with `accept`, `start_pairing` or `refuse`.
-pub async fn receive_hello<'a, T: Transport>(transport: &mut T, limiter: &'a AttemptLimiter, remote_ip: IpAddr) -> Result<Incoming<'a>, Failure> {
+pub async fn receive_hello<'a, T: Transport>(
+    transport: &mut T,
+    limiter: &'a AttemptLimiter,
+    remote_ip: IpAddr,
+) -> Result<Incoming<'a>, Failure> {
     let ticket = match limiter.begin(remote_ip) {
         Ok(ticket) => ticket,
         Err(retry_after) => return Err(reject(transport, Reason::RateLimited { retry_after_secs: retry_after.as_secs().max(1) }).await),
@@ -342,10 +350,7 @@ impl<'a> Pairing<'a> {
             admission.succeed();
         }
         let peer = session.peer;
-        local
-            .trust
-            .trust(&peer.public_key, &peer.name, TrustedVia::Pairing, crate::hlc::wall_clock_ms())
-            .map_err(Failure::TrustStore)?;
+        local.trust.trust(&peer.public_key, &peer.name, TrustedVia::Pairing, crate::hlc::wall_clock_ms()).map_err(Failure::TrustStore)?;
         Ok(peer.into_peer())
     }
 }
@@ -478,12 +483,8 @@ impl Side {
             Role::Client => Spake2::<Ed25519Group>::start_a(&password, &client, &server),
             Role::Server => Spake2::<Ed25519Group>::start_b(&password, &client, &server),
         };
-        let side = Side {
-            name: local.name.to_string(),
-            public_key: local.identity.public_key(),
-            pake: message,
-            intro: local.intro.to_string(),
-        };
+        let side =
+            Side { name: local.name.to_string(), public_key: local.identity.public_key(), pake: message, intro: local.intro.to_string() };
         (pake, side)
     }
 
@@ -549,7 +550,8 @@ fn authenticate(identity: &Identity, key: &hmac::Key, role: Role, transcript: &T
 }
 
 fn holds_key(public_key: &VerifyingKey, role: Role, transcript: &Transcript, signature: &[u8]) -> bool {
-    Signature::from_slice(signature).is_ok_and(|signature| identity::verify(public_key, &transcript.input(SIGNATURE_LABEL, role), &signature))
+    Signature::from_slice(signature)
+        .is_ok_and(|signature| identity::verify(public_key, &transcript.input(SIGNATURE_LABEL, role), &signature))
 }
 
 fn shares_session_key(key: &hmac::Key, role: Role, transcript: &Transcript, proof: &[u8]) -> bool {
@@ -558,7 +560,16 @@ fn shares_session_key(key: &hmac::Key, role: Role, transcript: &Transcript, proo
 
 // To join, sharing the SPAKE2 key means knowing the passphrase; a paired node may join on its key alone.
 #[allow(clippy::too_many_arguments)] // every input to the check, kept side by side
-fn admit(local: &Local<'_>, purpose: Purpose, peer: &Side, key: &hmac::Key, role: Role, transcript: &Transcript, proof: &[u8], signature: &[u8]) -> Result<(), Failure> {
+fn admit(
+    local: &Local<'_>,
+    purpose: Purpose,
+    peer: &Side,
+    key: &hmac::Key,
+    role: Role,
+    transcript: &Transcript,
+    proof: &[u8],
+    signature: &[u8],
+) -> Result<(), Failure> {
     if !holds_key(&peer.public_key, role, transcript, signature) {
         return Err(Failure::ProofFailed);
     }
@@ -586,10 +597,7 @@ fn remember(local: &Local<'_>, peer: &Side) -> Result<(), Failure> {
     if local.passphrase.is_none() {
         return Ok(());
     }
-    local
-        .trust
-        .trust(&peer.public_key, &peer.name, TrustedVia::Passphrase, crate::hlc::wall_clock_ms())
-        .map_err(Failure::TrustStore)?;
+    local.trust.trust(&peer.public_key, &peer.name, TrustedVia::Passphrase, crate::hlc::wall_clock_ms()).map_err(Failure::TrustStore)?;
     Ok(())
 }
 
@@ -833,16 +841,41 @@ mod tests {
         assert!(matches!(server.serve(&mut server_end).await, Err(Failure::ProofFailed)));
     }
 
-    #[tokio::test]
-    async fn the_wire_never_carries_the_passphrase() {
-        let passphrase = "correct horse battery staple";
-        let (dialer, server) = (Node::new("a", Some(passphrase)), Node::new("b", Some(passphrase)));
-        let (a, b, recorded) = recording_pipe();
-        handshake_over(&dialer, &server, (a, b)).await.0.unwrap();
-        let wire = recorded.lock().unwrap().concat();
-        let hashed = hex::encode(digest::digest(&digest::SHA256, passphrase.as_bytes()));
-        assert!(!String::from_utf8_lossy(&wire).contains(passphrase));
-        assert!(!String::from_utf8_lossy(&wire).contains(&hashed));
+    // Every frame as sent, plus every hex field in it decoded, so a value hidden in hex is found too.
+    fn wire_contents(frames: &[Vec<u8>]) -> Vec<Vec<u8>> {
+        let mut contents = frames.to_vec();
+        for frame in frames {
+            let Ok(serde_json::Value::Object(fields)) = serde_json::from_slice(frame) else { continue };
+            contents.extend(fields.values().filter_map(|value| value.as_str().and_then(|text| hex::decode(text).ok())));
+        }
+        contents
+    }
+
+    fn passphrase_derivations(passphrase: &str) -> Vec<Vec<u8>> {
+        let sha256 = digest::digest(&digest::SHA256, passphrase.as_bytes()).as_ref().to_vec();
+        let sha512 = digest::digest(&digest::SHA512, passphrase.as_bytes()).as_ref().to_vec();
+        vec![passphrase.as_bytes().to_vec(), hex::encode(&sha256).into_bytes(), hex::encode(&sha512).into_bytes(), sha256, sha512]
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(32))]
+
+        #[test]
+        fn handshake_transcripts_never_contain_passphrase_derived_bytes(passphrase in "\\PC{8,40}") {
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+            let frames = runtime.block_on(async {
+                let (dialer, server) = (Node::new("a", Some(&passphrase)), Node::new("b", Some(&passphrase)));
+                let (a, b, recorded) = recording_pipe();
+                handshake_over(&dialer, &server, (a, b)).await.0.unwrap();
+                let frames = recorded.lock().unwrap().clone();
+                frames
+            });
+            let contents = wire_contents(&frames);
+            for secret in passphrase_derivations(&passphrase) {
+                let leaked = contents.iter().any(|content| content.windows(secret.len()).any(|window| window == secret.as_slice()));
+                proptest::prop_assert!(!leaked, "the handshake carried bytes derived from {passphrase:?}");
+            }
+        }
     }
 
     #[tokio::test]
@@ -855,11 +888,18 @@ mod tests {
             let local = victim.local();
             let (pake, client) = Side::start(Role::Client, &local, Purpose::Join);
             let hello = Frame::Hello {
-                protocol: PROTOCOL, secured: true, pairing: false, name: client.name.clone(),
-                public_key: client.public_key.as_bytes().to_vec(), pake: client.pake.clone(), intro: client.intro.clone(),
+                protocol: PROTOCOL,
+                secured: true,
+                pairing: false,
+                name: client.name.clone(),
+                public_key: client.public_key.as_bytes().to_vec(),
+                pake: client.pake.clone(),
+                intro: client.intro.clone(),
             };
             send_frame(&mut a, &hello).await.unwrap();
-            let Frame::Reply { name, public_key, pake: server_pake, intro, .. } = recv_frame(&mut a).await.unwrap() else { panic!("expected a reply") };
+            let Frame::Reply { name, public_key, pake: server_pake, intro, .. } = recv_frame(&mut a).await.unwrap() else {
+                panic!("expected a reply")
+            };
             let server_side = Side::remote(name, &public_key, server_pake, intro).unwrap();
             let transcript = Transcript::new(PROTOCOL, true, Purpose::Join, CERT, &client, &server_side);
             let key = hmac::Key::new(hmac::HMAC_SHA256, &pake.finish(&server_side.pake).unwrap());
@@ -1014,7 +1054,8 @@ mod tests {
     #[test]
     fn transcript_fields_cannot_be_shifted_between_each_other() {
         let identity = Identity::generate();
-        let side = |name: &str, intro: &str| Side { name: name.into(), public_key: identity.public_key(), pake: vec![], intro: intro.into() };
+        let side =
+            |name: &str, intro: &str| Side { name: name.into(), public_key: identity.public_key(), pake: vec![], intro: intro.into() };
         let shifted_left = Transcript::new(1, true, Purpose::Join, b"", &side("ab", ""), &side("c", ""));
         let shifted_right = Transcript::new(1, true, Purpose::Join, b"", &side("a", "b"), &side("c", ""));
         assert_ne!(shifted_left.0.as_ref(), shifted_right.0.as_ref());
