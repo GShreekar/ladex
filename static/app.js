@@ -33,8 +33,7 @@ class LADEXApp {
         this.init();
     }
 
-    // A tab keeps its id across a reload (so it still owns what it shared),
-    // but two tabs never share one.
+    // Kept across reloads so a tab still owns what it shared, but never shared between tabs.
     generateSessionId() {
         try {
             const saved = sessionStorage.getItem('ladex_session');

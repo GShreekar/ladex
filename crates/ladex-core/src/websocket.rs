@@ -346,8 +346,7 @@ async fn cleanup_peer(state: &NodeState, session_id: &SessionId) {
         peers.remove(session_id);
         peers.len()
     };
-    // Files are held by nodes, not by the tab that shared them, so closing a
-    // tab leaves them where they are.
+    // Files live on the node, so closing the tab that shared them leaves them shared.
     broadcast(state, ServerMessage::PeerLeft { session_id: session_id.clone(), total_peers: peers_count }).await;
     state::push_peer_left_to_mesh(&state.mesh_peers, session_id.clone(), state.clock.now()).await;
 }

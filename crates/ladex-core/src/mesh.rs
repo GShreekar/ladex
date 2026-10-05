@@ -23,8 +23,7 @@ const HEARTBEAT_INTERVAL:  Duration = Duration::from_secs(5);
 const HEARTBEAT_TIMEOUT:   Duration = Duration::from_secs(15);
 const RECONNECT_GIVE_UP:   Duration = Duration::from_secs(600);
 const DATA_QUEUE_FRAMES: usize = 8;
-// Mesh messages are full catalog / chat snapshots, so allow far more than a
-// browser tab may send, but not the library default of 64 MiB.
+// Mesh messages carry whole catalog and chat snapshots, so they may be far larger than a tab's.
 const MAX_MESH_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 const CLOCK_SKEW_WARN_MS: i64 = 2 * 60 * 1000;
 
@@ -281,8 +280,7 @@ pub fn spawn_reconnect(addr: IpAddr, http_port: u16, state: NodeState, peer_node
         tracing::debug!("Reconnect: no dialable address for {peer_node_id} — not attempting");
         return;
     }
-    // When both nodes redial each other, the one with the higher id waits a
-    // little longer, so the other's dial usually lands first instead of colliding.
+    // The higher id waits a little longer, so two nodes redialing each other don't collide.
     let stagger = if state.node_id > peer_node_id { Duration::from_secs(1) } else { Duration::ZERO };
     tokio::spawn(async move {
         let started = Instant::now();
@@ -472,8 +470,7 @@ async fn dial(addr: IpAddr, http_port: u16, state: NodeState, pairing: bool) -> 
     let url = format!("{}://{addr}:{http_port}/mesh", if tls_client_config.is_some() { "wss" } else { "ws" });
     tracing::info!("Mesh: dialing {url}");
 
-    // The fingerprint stays empty without TLS (--no-tls); the handshake then
-    // has nothing to bind to and a man in the middle can't be ruled out.
+    // Without TLS the fingerprint stays empty, so nothing rules out a man in the middle.
     let (mut tt_tx, mut tt_rx, server_fingerprint): (MeshSink, MeshSource, Vec<u8>) =
         if let Some(client_config) = tls_client_config {
             let (ws_stream, _, fingerprint) = crate::tls::connect_wss(addr, http_port, "/mesh", client_config, mesh_ws_config())
@@ -735,8 +732,7 @@ pub(crate) async fn dispatch(msg: &MeshMessage, from_node_id: &NodeId, state: &N
         }
 
         MeshMessage::SignalRelay { to_node_id, from_node_id: from, payload } => {
-            // The mesh is one hop, so the relay's sender is the peer on this
-            // connection, and it is only ever addressed to us.
+            // The mesh is one hop, so a relay always comes from this peer and is addressed to us.
             if from != from_node_id || to_node_id != &state.node_id {
                 tracing::warn!("SignalRelay from {from_node_id} with mismatched addressing — dropped");
                 return;
