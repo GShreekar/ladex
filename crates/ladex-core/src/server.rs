@@ -1,10 +1,4 @@
-// Accepts connections (TLS or plain) and serves the warp routes over hyper.
-//
-// warp 0.4's own server doesn't expose the client's address to filters, and the
-// old TLS proxy in front of it hid every client behind 127.0.0.1. Serving the
-// connections ourselves lets us attach the real peer address (and whether the
-// connection is TLS) to each request as a `PeerAddr` extension, which the rate
-// limiters, session management and the cookie's `Secure` flag need.
+//! Accepts TLS or plain connections and serves the warp routes, attaching each client's real address to its requests.
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -23,8 +17,7 @@ use warp::Reply;
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub type ServerBody = UnsyncBoxBody<Bytes, BoxError>;
 
-/// Handles the requests warp can't: uploads and downloads stream their
-/// bodies, which warp's filters have no way to do.
+/// Handles the requests warp can't: streamed upload and download bodies.
 pub trait Api: Clone + Send + Sync + 'static {
     fn claims(&self, path: &str) -> bool;
     fn handle(&self, req: hyper::Request<Incoming>, peer: PeerAddr) -> impl Future<Output = hyper::Response<ServerBody>> + Send;
@@ -43,7 +36,7 @@ pub struct PeerAddr {
     pub tls: bool,
 }
 
-// Key used for rate limiting; requests without an address share one bucket.
+/// Key used for rate limiting; requests without an address share one bucket.
 pub fn peer_ip(peer: Option<PeerAddr>) -> IpAddr {
     peer.map(|p| p.addr.ip()).unwrap_or(IpAddr::from([0, 0, 0, 0]))
 }
@@ -52,10 +45,7 @@ pub fn is_tls(peer: Option<PeerAddr>) -> bool {
     peer.is_some_and(|p| p.tls)
 }
 
-// Requests whose Host header isn't one of these are refused. Needed on the
-// plain-HTTP loopback listener: without TLS, a web page on another site could
-// point its own domain at 127.0.0.1 (DNS rebinding) and talk to this node as
-// if it were same-origin. Its Host header would still be that other domain.
+/// Host headers accepted on the loopback listener; stops DNS rebinding from making another site look same-origin.
 pub type AllowedHosts = Vec<String>;
 
 fn host_allowed(allowed: &AllowedHosts, host: Option<&hyper::header::HeaderValue>) -> bool {

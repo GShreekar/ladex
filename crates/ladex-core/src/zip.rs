@@ -1,12 +1,4 @@
-// A streaming zip writer, for downloading a folder as one file in browsers
-// that can't save into a directory.
-//
-// Files are stored uncompressed and their sizes are known in advance, so the
-// archive can be produced as the file chunks arrive, never held in memory, and
-// its exact length is known before the first byte is sent (the download shows
-// real progress). Only the CRC isn't known until a file has been read, so each
-// entry carries it in a trailing "data descriptor". Entries and archives too
-// large for the classic format use zip64.
+//! A streaming zip writer for folder downloads: stored entries with data descriptors, and zip64 when needed.
 
 use crc32fast::Hasher;
 
@@ -23,7 +15,7 @@ const NEEDS_ZIP64: u32 = u32::MAX;
 
 pub const CLASSIC_LIMIT: u64 = u32::MAX as u64;
 
-// MS-DOS date and time, as zip stores them.
+/// MS-DOS date and time, as zip stores them.
 pub fn dos_time(when: chrono::DateTime<chrono::Utc>) -> (u16, u16) {
     use chrono::{Datelike, Timelike};
     let year = (when.year().clamp(1980, 2107) - 1980) as u16;
@@ -52,7 +44,6 @@ struct Open {
 }
 
 pub struct ZipWriter {
-    // Entries or archives at or above this size use zip64 (the real limit, except in tests).
     threshold: u64,
     offset: u64,
     open: Option<Open>,
@@ -74,7 +65,7 @@ impl ZipWriter {
         Self { threshold, offset: 0, open: None, finished: Vec::new() }
     }
 
-    // The header that must be sent before this file's bytes.
+    /// The header that must be sent before this file's bytes.
     pub fn start_file(&mut self, name: &str, size: u64, time: (u16, u16)) -> Vec<u8> {
         assert!(self.open.is_none(), "the previous file was not finished");
         let zip64 = size >= self.threshold;
@@ -104,7 +95,7 @@ impl ZipWriter {
         out
     }
 
-    // Account for `data`, which the caller sends as the file's bytes.
+    /// Accounts for `data`, which the caller sends as the file's bytes.
     pub fn file_data(&mut self, data: &[u8]) {
         let open = self.open.as_mut().expect("no file is open");
         open.crc.update(data);
@@ -112,7 +103,7 @@ impl ZipWriter {
         self.offset += data.len() as u64;
     }
 
-    // The data descriptor that closes the file.
+    /// The data descriptor that closes the file.
     pub fn finish_file(&mut self) -> Vec<u8> {
         let open = self.open.take().expect("no file is open");
         assert_eq!(open.written, open.size, "the file was not the size it was announced as");
@@ -132,7 +123,7 @@ impl ZipWriter {
         out
     }
 
-    // The central directory and end records.
+    /// The central directory and end records.
     pub fn finish(&mut self) -> Vec<u8> {
         assert!(self.open.is_none(), "a file was left open");
         let directory_start = self.offset;
@@ -207,7 +198,7 @@ impl ZipWriter {
     }
 }
 
-// The exact size of the archive for these (name, size) entries, without producing it.
+/// The exact size of the archive for these (name, size) entries, without producing it.
 pub fn archive_length(entries: &[(String, u64)]) -> u64 {
     archive_length_with(entries, CLASSIC_LIMIT)
 }
@@ -217,7 +208,6 @@ fn archive_length_with(entries: &[(String, u64)], threshold: u64) -> u64 {
     let mut total = 0u64;
     for (name, size) in entries {
         total += writer.start_file(name, *size, (0, 0)).len() as u64;
-        // Only the length matters, not the bytes: advance without hashing them.
         writer.open.as_mut().unwrap().written = *size;
         writer.offset += *size;
         total += *size;
@@ -254,8 +244,6 @@ mod tests {
         ]
     }
 
-    // Reads the archive back with the `zip` reader semantics of Python, via a small independent parser:
-    // end record → central directory → local headers + data, checking every CRC.
     fn read_back(archive: &[u8]) -> Vec<(String, Vec<u8>)> {
         let u16_at = |i: usize| u16::from_le_bytes(archive[i..i + 2].try_into().unwrap()) as u64;
         let u32_at = |i: usize| u32::from_le_bytes(archive[i..i + 4].try_into().unwrap()) as u64;
@@ -299,7 +287,6 @@ mod tests {
                 if offset == u32::MAX as u64 { offset = take(true); }
             }
             assert_eq!(csize, usize_, "stored");
-            // The local header, then the bytes, then the descriptor.
             let local = offset as usize;
             assert_eq!(u32_at(local), LOCAL_HEADER as u64);
             let data_at = local + 30 + u16_at(local + 26) as usize + u16_at(local + 28) as usize;
@@ -323,7 +310,6 @@ mod tests {
 
     #[test]
     fn zip64_entries_and_directories_read_back_exactly() {
-        // A tiny threshold exercises every zip64 path: entry sizes, offsets, and the end records.
         for threshold in [1, 100, 5000, 20_000] {
             let archive = build(&files(), threshold);
             let back = read_back(&archive);
@@ -351,13 +337,12 @@ mod tests {
 
     #[test]
     fn dos_time_encodes_as_zip_expects() {
-        let when = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(); // 2023-11-14 22:13:20 UTC
+        let when = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
         let (time, date) = dos_time(when);
         assert_eq!((date >> 9) + 1980, 2023);
         assert_eq!((date >> 5) & 0xF, 11);
         assert_eq!(date & 0x1F, 14);
         assert_eq!((time >> 11, (time >> 5) & 0x3F, (time & 0x1F) * 2), (22, 13, 20));
-        // Dates before 1980 clamp rather than wrap.
         assert_eq!(dos_time(chrono::DateTime::from_timestamp(0, 0).unwrap()).1 >> 9, 0);
     }
 

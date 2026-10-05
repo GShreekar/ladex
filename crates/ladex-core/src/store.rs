@@ -1,16 +1,4 @@
-// On-disk storage for the files this node holds.
-//
-// A file is split into 1 MiB chunks, each with a SHA-256 hash. Every chunk is
-// verified before it is written, so chunks fetched from different nodes can be
-// mixed safely, and a corrupted copy is caught chunk by chunk, not at the end.
-// Together the chunk hashes and the size give the file's `manifest root`, which
-// the catalog carries; a manifest fetched from any node is checked against it.
-//
-// Layout, per file `<id>` under the store directory:
-//   <id>.data    the file's bytes, preallocated, written at chunk offsets
-//   <id>.hashes  32 bytes per chunk: the hash of each chunk we know
-//   <id>.json    which chunks we have, the manifest root, and the catalog entry
-// A partly received file survives a restart and carries on where it stopped.
+//! On-disk storage for the files this node holds: 1 MiB chunks, each checked against its SHA-256 before it is written.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -31,7 +19,6 @@ use crate::validate;
 pub const CHUNK_SIZE: u64 = 1 << 20;
 // Always leave this much free on the disk, whatever the quota says.
 const MIN_FREE_BYTES: u64 = 512 * 1024 * 1024;
-// Progress is saved to disk after this many chunk writes (and when a file completes).
 const PERSIST_EVERY_WRITES: u32 = 64;
 
 pub type ChunkHash = [u8; 32];
@@ -51,7 +38,7 @@ pub fn hash_chunk(data: &[u8]) -> ChunkHash {
     hash
 }
 
-// Identifies a file's exact contents: its size and every chunk hash.
+/// Identifies a file's exact contents: its size and every chunk hash.
 pub fn manifest_root(size: u64, hashes: &[ChunkHash]) -> String {
     let mut context = digest::Context::new(&digest::SHA256);
     context.update(b"ladex manifest v1");
@@ -143,9 +130,7 @@ struct State {
     have: Bitmap,
     hashes: Vec<ChunkHash>,
     hash_known: Bitmap,
-    // Set by whoever tells us what the file should be (the catalog), before any chunk is fetched.
     expected_root: Option<String>,
-    // Set once every chunk is present and the manifest checked out.
     sealed: Option<String>,
     entry: Option<FileMetadata>,
 }
@@ -171,10 +156,8 @@ pub struct Blob {
     state: Mutex<State>,
     changed: Notify,
     removed: AtomicBool,
-    // Only one upload may write a file at a time.
     writer: AtomicBool,
     writes_since_persist: AtomicU32,
-    // Milliseconds since the epoch of the last write (or of opening it).
     last_activity_ms: AtomicU64,
 }
 
@@ -224,7 +207,7 @@ impl Blob {
         self.removed.load(Ordering::Relaxed)
     }
 
-    // Held while an upload is writing this file; None if another one is.
+    /// Held while an upload is writing this file; None if another one is.
     pub fn try_write_lock(self: &Arc<Self>) -> Option<WriteGuard> {
         self.writer.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).ok()?;
         Some(WriteGuard(self.clone()))
@@ -234,7 +217,7 @@ impl Blob {
         self.writer.load(Ordering::Acquire)
     }
 
-    // How long since a chunk was last written (or the file opened).
+    /// How long since a chunk was last written (or the file opened).
     pub fn idle_for(&self) -> Duration {
         Duration::from_millis(now_ms().saturating_sub(self.last_activity_ms.load(Ordering::Relaxed)))
     }
@@ -251,7 +234,7 @@ impl Blob {
         self.state.lock().unwrap().hash_known.is_full()
     }
 
-    // The chunk hashes, once every one is known.
+    /// The chunk hashes, once every one is known.
     pub fn hashes(&self) -> Option<Vec<ChunkHash>> {
         let state = self.state.lock().unwrap();
         state.hash_known.is_full().then(|| state.hashes.clone())
@@ -265,17 +248,16 @@ impl Blob {
         self.state.lock().unwrap().entry = Some(entry);
     }
 
-    // Chunks from the start of the file that are all present: where an interrupted upload resumes.
+    /// How many chunks from the start are all present: where an interrupted upload resumes.
     pub fn leading_chunks(&self) -> u32 {
         self.state.lock().unwrap().have.leading_ones()
     }
 
-    // Wakes anyone waiting on this file (a chunk arrived, it completed, or it was removed).
     fn changed(&self) {
         self.changed.notify_waiters();
     }
 
-    // Waits until `index` is present. False on timeout or if the file is removed.
+    /// Waits until `index` is present; false on timeout or if the file is removed.
     pub async fn wait_for_chunk(&self, index: u32, timeout: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
@@ -305,10 +287,7 @@ impl Blob {
         .map_err(|e| io::Error::other(e.to_string()))?
     }
 
-    // Like `read_chunk`, but checks the bytes against the chunk's hash first.
-    // Disks fail quietly, and a browser can't tell, so a chunk that no longer
-    // matches is never served: it is dropped from what we have (so it gets
-    // fetched again from another node) and reported as an error.
+    /// Reads a chunk after checking it against its hash; a damaged chunk is dropped so it gets fetched again.
     pub async fn read_chunk_verified(&self, index: u32) -> io::Result<Vec<u8>> {
         let data = self.read_chunk(index).await?;
         let expected = {
@@ -323,7 +302,7 @@ impl Blob {
         Ok(data)
     }
 
-    // Forget a chunk that turned out to be damaged; the file is no longer complete.
+    /// Forgets a damaged chunk; the file is no longer complete.
     pub fn mark_corrupt(&self, index: u32) {
         {
             let mut state = self.state.lock().unwrap();
@@ -358,7 +337,7 @@ impl Blob {
         Ok(())
     }
 
-    // Upload path: the sender is the source of truth, so the hash is computed here.
+    /// Upload path: the sender is the source of truth, so the hash is computed here.
     pub async fn write_chunk_hashing(&self, index: u32, data: Vec<u8>) -> Result<ChunkHash, WriteError> {
         self.check_chunk(index, data.len())?;
         let hash = hash_chunk(&data);
@@ -366,7 +345,7 @@ impl Blob {
         Ok(hash)
     }
 
-    // Download path: the chunk must match the hash the manifest promised.
+    /// Download path: the chunk must match the hash the manifest promised.
     pub async fn write_chunk_verified(&self, index: u32, data: Vec<u8>) -> Result<(), WriteError> {
         self.check_chunk(index, data.len())?;
         let expected = {
@@ -399,7 +378,7 @@ impl Blob {
         Ok(())
     }
 
-    // Accepts a manifest from another node if it matches the root the catalog promised.
+    /// Accepts a manifest from another node if it matches the root the catalog promised.
     pub fn set_manifest(&self, hashes: Vec<ChunkHash>, root: &str) -> Result<(), &'static str> {
         if hashes.len() != self.chunks as usize {
             return Err("manifest has the wrong number of chunks");
@@ -429,7 +408,7 @@ impl Blob {
         self.state.lock().unwrap().expected_root.get_or_insert_with(|| root.to_string());
     }
 
-    // Once every chunk is present: fixes the manifest root and marks the file complete.
+    /// Once every chunk is present, fixes the manifest root and marks the file complete.
     pub fn seal(&self) -> Result<String, &'static str> {
         let mut state = self.state.lock().unwrap();
         if let Some(root) = &state.sealed {
@@ -498,7 +477,7 @@ pub struct Store {
 }
 
 impl Store {
-    // Opens the store, picking up files (and partial files) from earlier runs.
+    /// Opens the store, picking up files and partial files from earlier runs.
     pub fn open(root: &Path, quota: u64) -> io::Result<Self> {
         create_private_dir(root)?;
         let store = Self { root: root.to_path_buf(), quota, blobs: Mutex::new(HashMap::new()) };
@@ -565,7 +544,7 @@ impl Store {
         self.blobs.lock().unwrap().values().map(|b| b.size).sum()
     }
 
-    // The existing file with this id and size (to resume), or a new empty one.
+    /// The existing file with this id and size (to resume), or a new empty one.
     pub fn create(&self, id: &str, size: u64) -> Result<Arc<Blob>, StoreError> {
         if !validate::is_valid_id(id) {
             return Err(StoreError::InvalidId);
@@ -618,7 +597,7 @@ impl Store {
         Ok(blob)
     }
 
-    // Deletes a file and wakes anything waiting on it.
+    /// Deletes a file and wakes anything waiting on it.
     pub fn remove(&self, id: &str) {
         let blob = self.blobs.lock().unwrap().remove(id);
         if let Some(blob) = blob {
@@ -660,7 +639,6 @@ mod tests {
         (0..len).map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed)).collect()
     }
 
-    // Uploads `content` chunk by chunk, the way the HTTP upload does.
     async fn upload(blob: &Blob, content: &[u8]) {
         for index in 0..blob.chunk_count() {
             let start = index as usize * CHUNK_SIZE as usize;
@@ -730,10 +708,8 @@ mod tests {
         let (_dir2, other) = store(1 << 40);
         let copy = other.create("file_a", content.len() as u64).unwrap();
 
-        // Without a manifest nothing can be verified.
         assert_eq!(copy.write_chunk_verified(0, content[..CHUNK_SIZE as usize].to_vec()).await, Err(WriteError::NoManifest));
 
-        // A manifest that doesn't match the catalog's root is refused.
         let mut forged = source.hashes().unwrap();
         forged[0][0] ^= 1;
         assert!(copy.set_manifest(forged, &root).is_err());
@@ -845,7 +821,6 @@ mod tests {
         blob.write_chunk_hashing(0, vec![1; 10]).await.unwrap();
         assert!(waiter.await.unwrap());
 
-        // Removal releases waiters at once instead of leaving them to time out.
         let other = store.create("file_b", 10).unwrap();
         let waiter = {
             let other = other.clone();
@@ -882,7 +857,6 @@ mod tests {
         blob.seal().unwrap();
         assert_eq!(blob.read_chunk_verified(1).await.unwrap(), content[CHUNK_SIZE as usize..]);
 
-        // Bit rot: one byte changes in the second chunk.
         let path = dir.path().join("files/file_a.data");
         let mut raw = std::fs::read(&path).unwrap();
         raw[CHUNK_SIZE as usize + 9] ^= 0xff;
@@ -893,7 +867,6 @@ mod tests {
         assert!(!blob.has_chunk(1) && !blob.is_complete(), "and the file no longer counts as complete");
         assert!(blob.has_chunk(0));
 
-        // Fetching a good copy of just that chunk repairs the file.
         blob.write_chunk_verified(1, content[CHUNK_SIZE as usize..].to_vec()).await.unwrap();
         assert_eq!(blob.seal().unwrap(), manifest_root(content.len() as u64, &blob.hashes().unwrap()));
         assert_eq!(blob.read_chunk_verified(1).await.unwrap(), content[CHUNK_SIZE as usize..]);

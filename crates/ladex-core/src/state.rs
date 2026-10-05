@@ -1,30 +1,4 @@
-// ============================================================================
-// LADEX — Phase 4: Distributed State Merge
-//
-// Merges the three distributed state stores: file catalog, peer list, and chat
-// messages.
-//
-//   • Files and peers carry a hybrid-logical-clock `version` (hlc.rs).  On a
-//     conflict the entry with the greater version wins; equal versions keep
-//     what we have.  Wall-clock time is never compared, so a node with a fast
-//     or slow clock can't win conflicts it shouldn't.
-//
-//   • Everything that comes from another node is validated first (validate.rs)
-//     and its version is checked against our clock; entries that fail are
-//     dropped, and a clock that is far off is reported to the user.
-//
-//   • File and peer tombstones: instead of deleting outright, set
-//     `deleted`/`left` and propagate.  They are pruned after
-//     `TOMBSTONE_TTL_MS`, which must outlast any reasonable disconnection or a
-//     stale live entry from a node that was away would bring the file back.
-//
-//   • After each merge, the updated state is fanned out to all connected
-//     local browser tabs via `websocket::broadcast`.
-//
-//   • Full-state sync is sent immediately after the mesh handshake
-//     (see `mesh::post_handshake_sync`).  Incremental deltas are sent
-//     per-event (see `push_*` functions below).
-// ============================================================================
+//! Merges the file catalog, peer list and chat across nodes, and fans changes out to local tabs.
 
 use std::collections::HashMap;
 
@@ -39,10 +13,6 @@ const UNHELD_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 pub const MAX_CATALOG_ENTRIES: usize = 5000;
 const MAX_PEERS: usize = 2000;
 
-// ---------------------------------------------------------------------------
-// Merge: file catalog
-// ---------------------------------------------------------------------------
-
 fn merge_holders(into: &mut HashMap<NodeId, Holder>, from: HashMap<NodeId, Holder>) {
     for (node, holder) in from {
         match into.get(&node) {
@@ -54,12 +24,7 @@ fn merge_holders(into: &mut HashMap<NodeId, Holder>, from: HashMap<NodeId, Holde
     }
 }
 
-/// Merge `incoming` files into `local`. The entry with the greater `version`
-/// wins; holders are merged node by node (each node's own record is the
-/// newest stamp) whichever entry wins, so a node adding itself as a holder is
-/// never lost to a concurrent change elsewhere. New ids are skipped once
-/// `capacity` is reached, but updates to known ids still apply. Returns how
-/// many new entries were skipped for lack of room.
+/// Merges `incoming` into `local`: the greater `version` wins and holders merge per node. Returns how many new ids were skipped for lack of room.
 pub fn merge_files(local: &mut HashMap<String, FileMetadata>, incoming: Vec<FileMetadata>, capacity: usize) -> usize {
     let mut skipped = 0;
     for entry in incoming {
@@ -82,21 +47,17 @@ pub fn merge_files(local: &mut HashMap<String, FileMetadata>, incoming: Vec<File
     skipped
 }
 
-/// Remove tombstones older than `TOMBSTONE_TTL_MS`.  A stamp from the future
-/// (a peer with a fast clock, within the drift limit) is simply not old yet.
+/// Removes tombstones older than `TOMBSTONE_TTL_MS`.
 pub fn prune_tombstones(local: &mut HashMap<String, FileMetadata>, now_ms: u64) {
     local.retain(|_, f| !f.deleted || now_ms.saturating_sub(f.version.wall) < TOMBSTONE_TTL_MS);
 }
 
-/// Drop entries no node has held for a day: nobody can serve them, and the
-/// listing shouldn't keep them forever. A node that still has the file puts
-/// itself back as a holder when it reconnects (see `reassert_holdership`).
+/// Drops entries no node has held for a day.
 pub fn prune_unheld(local: &mut HashMap<String, FileMetadata>, now_ms: u64) {
     local.retain(|_, f| f.deleted || f.holder_nodes().next().is_some() || now_ms.saturating_sub(f.version.wall) < UNHELD_TTL_MS);
 }
 
-/// Same as `prune_tombstones`, for departed peers. Without it a correctly
-/// propagated departure would sit in `local_peers` forever.
+/// Removes departed-peer tombstones older than `TOMBSTONE_TTL_MS`.
 pub fn prune_peer_tombstones(local: &mut HashMap<SessionId, PeerInfo>, now_ms: u64) {
     local.retain(|_, p| !p.left || now_ms.saturating_sub(p.version.wall) < TOMBSTONE_TTL_MS);
 }
@@ -115,14 +76,8 @@ pub fn evict_old_tombstones(local: &mut HashMap<String, FileMetadata>, capacity:
     }
 }
 
-// ---------------------------------------------------------------------------
-// Merge: chat messages
-// ---------------------------------------------------------------------------
-
-/// Merge `incoming` messages into `local`, deduplicating by `message.id`.
-/// Messages are immutable, so the first copy we saw is kept.
+/// Merges `incoming` messages into `local`, keeping the first copy of each id.
 pub fn merge_messages(local: &mut Vec<TextMessage>, incoming: Vec<TextMessage>) {
-    // Build an index for O(1) lookup
     let mut index: HashMap<String, usize> = local
         .iter()
         .enumerate()
@@ -136,23 +91,10 @@ pub fn merge_messages(local: &mut Vec<TextMessage>, incoming: Vec<TextMessage>) 
         }
     }
 
-    // Keep messages in chronological order after merge.
     local.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
 }
 
-// ---------------------------------------------------------------------------
-// Merge: peer list
-// ---------------------------------------------------------------------------
-
-/// Merge `incoming` peer infos into `local`; the greater `version` wins.
-/// Peers from remote nodes are stored alongside local peers in `local_peers`
-/// so the browser tab's peer list is a unified view of the whole mesh.
-///
-/// Note: this writes to `NodeState::local_peers` (which the browser sees),
-/// NOT to `mesh_peers` (which is node handles).  The naming is slightly
-/// unfortunate but matches the existing field layout — `local_peers` is the
-/// *peer registry visible to the browser*, regardless of where those peers
-/// are physically connected.
+/// Merges `incoming` peers into the browser-visible `local_peers`; the greater `version` wins.
 pub fn merge_peers(local: &mut HashMap<SessionId, PeerInfo>, incoming: Vec<PeerInfo>) {
     for peer in incoming {
         match local.get(&peer.session_id) {
@@ -168,12 +110,7 @@ pub fn merge_peers(local: &mut HashMap<SessionId, PeerInfo>, incoming: Vec<PeerI
     }
 }
 
-// ---------------------------------------------------------------------------
-// High-level apply-and-fanout helpers
-// ---------------------------------------------------------------------------
-
-/// Keeps what survives validation and the clock check. Returns the first
-/// clock problem seen, if any, so the caller can report it once.
+/// Keeps what passes validation and the clock check; returns the first clock problem seen.
 fn accept_from_mesh<T>(
     state: &NodeState,
     incoming: Vec<T>,
@@ -228,10 +165,8 @@ pub async fn apply_catalog_sync(state: &NodeState, incoming: Vec<FileMetadata>, 
             tracing::warn!("Catalog full: ignored {skipped} new entries from {from}");
         }
         let unshared = ids.into_iter().filter(|id| files.get(id).is_some_and(|f| f.deleted)).collect();
-        // Return only non-deleted files for the browser (tombstones are internal)
         (live_files(&files), unshared)
     };
-    // Someone unshared these: our copy (if any) goes too.
     for id in unshared {
         forget_file(state, &id).await;
     }
@@ -259,8 +194,7 @@ pub async fn forget_file(state: &NodeState, id: &str) {
     }
 }
 
-/// Add or replace a catalog entry for a file this node holds: saves it with the
-/// file on disk (so it survives a restart), shows it to local tabs, and tells the mesh.
+/// Adds or replaces the entry for a file this node holds, saves it with the file, and tells local tabs and the mesh.
 pub async fn publish_entry(state: &NodeState, entry: FileMetadata) {
     if let Some(blob) = state.store.get(&entry.id) {
         blob.set_entry(entry.clone());
@@ -292,13 +226,10 @@ pub async fn add_self_as_holder(state: &NodeState, id: &str) {
     }
 }
 
-// A partly received file nobody has touched for this long is deleted.
 const ABANDONED_PARTIAL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
-// Files uploaded for a folder that was never published are deleted after this.
 const UNPUBLISHED_FOLDER_FILES_MS: u64 = 60 * 60 * 1000;
 
-/// Housekeeping for the disk: abandoned partial files, and files uploaded for a
-/// folder that never got published (the upload was cancelled or died).
+/// Deletes abandoned partial files and uploads for folders that were never published.
 pub async fn collect_garbage(state: &NodeState) {
     collect_garbage_with(state, ABANDONED_PARTIAL, UNPUBLISHED_FOLDER_FILES_MS).await;
 }
@@ -356,9 +287,7 @@ pub async fn load_catalog_from_store(state: &NodeState) {
     }
 }
 
-/// After syncing with the mesh: for every complete file on disk, make sure the
-/// catalog lists this node as a holder (other nodes took it off when we left),
-/// and delete our copy if the catalog says it was unshared meanwhile.
+/// Re-lists this node as a holder of every complete file on disk, and deletes copies of files unshared meanwhile.
 pub async fn reassert_holdership(state: &NodeState) {
     let mut changed = Vec::new();
     let mut unshared = Vec::new();
@@ -383,9 +312,7 @@ pub async fn reassert_holdership(state: &NodeState) {
     }
 }
 
-/// This node used to go by `old_id` (before ids came from the node's key):
-/// what it uploaded and holds is moved over to its current id, with fresh
-/// stamps so the change wins over copies other nodes still have.
+/// Moves what this node uploaded and holds from `old_id` to its current id, with fresh stamps.
 pub async fn adopt_node_id(state: &NodeState, old_id: &str) {
     let changed: Vec<FileMetadata> = {
         let mut files = state.files.write().await;
@@ -423,20 +350,13 @@ pub async fn apply_peer_sync(state: &NodeState, incoming: Vec<PeerInfo>, from: &
     if let Some(problem) = clock_problem {
         report_clock_problem(state, from, &problem).await;
     }
-    // Phase 6: broadcast incremental PeerSync to browser tabs so client-side
-    // host selection can incorporate RTT data from remote nodes.
     if !accepted.is_empty() {
         websocket::broadcast(state, ServerMessage::PeerSync { peers: accepted }).await;
     }
 }
 
 
-/// BUG-13 fix: cap the in-memory chat history so a long-running node
-/// doesn't accumulate it forever. Messages are kept sorted ascending by
-/// `created_at` everywhere they're inserted, so trimming the front drops
-/// the oldest ones. Chat history isn't authoritative state the way the
-/// file catalog is — silently aging out old messages is an acceptable
-/// tradeoff for bounded memory, same idea as the file tombstone TTL above.
+/// Caps the in-memory chat history, dropping the oldest messages.
 const MAX_CHAT_MESSAGES: usize = 500;
 pub fn prune_messages(messages: &mut Vec<TextMessage>) {
     if messages.len() > MAX_CHAT_MESSAGES {
@@ -445,19 +365,7 @@ pub fn prune_messages(messages: &mut Vec<TextMessage>) {
     }
 }
 
-/// Apply an incoming chat sync (a mesh peer's full history, sent once after
-/// its handshake — see mesh::post_handshake_sync) and fan out only the
-/// messages we didn't already have to local tabs.
-///
-/// BUG-13 fix: this used to broadcast `ServerMessage::MessageHistory` with
-/// the *entire*, ever-growing merged history on every single ChatSync —
-/// meaning every new mesh connection cost every local browser tab an
-/// O(history size) payload, even though a tab typically already has nearly
-/// all of it (it got its own full snapshot on `join`; see
-/// websocket.rs). The delta is broadcast the same way a freshly-sent local
-/// message already was — one `TextMessage` event per new message, which
-/// the client appends incrementally — instead of a snapshot that replaces
-/// the client's whole array (see app.js handleMessageHistory).
+/// Applies a peer's full chat history and sends local tabs only the messages that are new.
 pub async fn apply_chat_sync(state: &NodeState, incoming: Vec<TextMessage>) {
     let incoming: Vec<TextMessage> = incoming.into_iter().filter_map(validate::incoming_message).collect();
     let new_messages: Vec<TextMessage> = {
@@ -489,15 +397,11 @@ pub async fn apply_chat_message(state: &NodeState, message: TextMessage) {
             let mut messages = state.messages.write().await;
             messages.push(message.clone());
             messages.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
-            prune_messages(&mut messages); // BUG-13 fix
+            prune_messages(&mut messages);
         }
         websocket::broadcast(state, ServerMessage::TextMessage { message }).await;
     }
 }
-
-// ---------------------------------------------------------------------------
-// Push helpers — propagate local changes to all mesh peers
-// ---------------------------------------------------------------------------
 
 use crate::mesh::{MeshMessage, MeshPeers};
 
@@ -544,16 +448,13 @@ pub async fn push_peer_to_mesh(mesh_peers: &MeshPeers, peer: PeerInfo) {
     }
 }
 
-/// Broadcast a peer departure tombstone to all mesh peers.
-/// We reuse `PeerSync` with a peer marked `left: true` (BUG-08 fix) and
-/// `hosting_node_id: None`.  `version` must be a fresh stamp from this node's
-/// clock so the tombstone outranks the live record it replaces everywhere.
+/// Broadcasts a peer departure; `version` must be a fresh stamp so it outranks the live record.
 pub async fn push_peer_left_to_mesh(mesh_peers: &MeshPeers, session_id: SessionId, version: Stamp) {
     let departed = PeerInfo {
         session_id,
         connected_at: chrono::Utc::now(),
         user_agent: None,
-        hosting_node_id: None, // None = departed / offline
+        hosting_node_id: None,
         node_rtt_ms: None,
         left: true,
         left_at: Some(chrono::Utc::now()),
@@ -630,8 +531,6 @@ mod tests {
 
     #[test]
     fn holders_added_by_different_nodes_at_the_same_time_both_survive() {
-        // Each node only edits its own record, so neither update is lost
-        // even though the entry itself is identical on both sides.
         let base = file("f", stamp(10, 0, "node_a"));
         let mut one = catalog(vec![held_by(base.clone(), "node_b", true, stamp(20, 0, "node_b"))]);
         let mut two = catalog(vec![held_by(base.clone(), "node_c", true, stamp(21, 0, "node_c"))]);
@@ -663,12 +562,10 @@ mod tests {
         merge_files(&mut local, vec![left], 100);
         assert!(!local["f"].is_held_by("node_b"));
 
-        // A stale "present" from before it left must not bring it back...
         let stale = held_by(file("f", stamp(10, 0, "node_a")), "node_b", true, stamp(15, 0, "node_b"));
         merge_files(&mut local, vec![stale], 100);
         assert!(!local["f"].is_held_by("node_b"));
 
-        // ...but the node itself re-adding itself afterwards does.
         let back = held_by(file("f", stamp(10, 0, "node_a")), "node_b", true, stamp(40, 0, "node_b"));
         merge_files(&mut local, vec![back], 100);
         assert!(local["f"].is_held_by("node_b"));
@@ -704,8 +601,6 @@ mod tests {
         let fast = Clock::new("fast".into());
         let slow = Clock::new("slow".into());
         let created = file("f", fast.now());
-        // `slow` has seen the file, so its tombstone outranks it however
-        // far behind its wall clock is.
         slow.observe(&created.version).unwrap();
         let deletion = tombstone("f", slow.now());
 
@@ -915,7 +810,6 @@ mod tests {
         let files = state.files.read().await;
         assert_eq!(files.len(), 1);
         assert_eq!(files["f_ok"].name, ".._evil_name.txt");
-        // Whatever this node stamps next is ordered after what it just saw.
         assert!(state.clock.now() > remote);
     }
 
@@ -930,7 +824,6 @@ mod tests {
         let files = state.files.read().await;
         assert!(files.contains_key("sane") && !files.contains_key("future"));
         assert!(state.clock_alert_at.lock().unwrap().is_some());
-        // The bad stamp must not have dragged our clock forward.
         assert!(state.clock.now().wall < crate::hlc::wall_clock_ms() + 60_000);
     }
 

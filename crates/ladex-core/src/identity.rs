@@ -1,10 +1,4 @@
-// This node's long-lived identity: an Ed25519 key pair made on first run.
-// The node id is derived from the public key, so a node can only claim an id
-// whose private key it holds (once the handshake proves possession of it).
-//
-// The private key lives in the OS keychain where there is one (macOS Keychain,
-// Windows Credential Manager, the Secret Service on Linux), otherwise in a file
-// in the data directory that only this user can read.
+//! This node's Ed25519 identity, kept in the OS keychain or a private file; the node id is derived from the public key.
 
 use std::path::{Path, PathBuf};
 
@@ -133,8 +127,7 @@ fn keychain_account(dir: &Path) -> String {
     format!("node key for {}", dir.display())
 }
 
-/// Loads this node's identity, or creates one on first run. `use_keychain`
-/// false keeps the key in a file even where a keychain exists.
+/// Loads this node's identity, or creates one on first run; `use_keychain` false keeps the key in a file.
 pub fn load_or_create(dir: &Path, use_keychain: bool) -> anyhow::Result<(Identity, KeyLocation)> {
     crate::tls::create_private_dir(dir).with_context(|| format!("could not create {}", dir.display()))?;
     let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
@@ -158,8 +151,7 @@ fn load_or_create_with(keychain: Option<&dyn SecretStore>, file: &dyn SecretStor
         return Ok((identity, KeyLocation::File(file_path)));
     }
 
-    // A keychain that exists but can't be read (locked, access refused) may
-    // already hold this node's key: making a new one would split its identity.
+    // A locked keychain may already hold this node's key; making a new one would split its identity.
     if let Some(e) = keychain_error {
         anyhow::bail!("could not read this node's key from the OS keychain ({e}). Unlock it, or run with --no-keychain to keep the key in a file");
     }

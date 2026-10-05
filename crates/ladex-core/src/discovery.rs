@@ -1,37 +1,4 @@
-// ============================================================================
-// LADEX — Phase 2: UDP Multicast Discovery
-//
-// Each node broadcasts an AnnouncePacket every 2 seconds to the
-// administratively-scoped multicast group 239.255.42.99:7878.  The listen
-// loop picks up announces from other nodes and hands them off to the mesh
-// layer (Phase 3) to initiate a WebSocket connection.
-//
-// Design choices (from ROADMAP.md §2):
-//
-//   • Multicast group 239.255.42.99 is in the IPv4 "administratively scoped"
-//     range (239.0.0.0/8).  It will not be forwarded by routers even if
-//     IGMP snooping is misconfigured — ideal for LAN confinement.
-//
-//   • TTL is set to 1 so packets never leave the local segment.
-//
-//   • SO_REUSEADDR (+ SO_REUSEPORT on Linux/macOS) is required so that two
-//     ladex processes on the same machine (integration tests) can both bind
-//     the same multicast port.
-//
-//   • multicast_loop_v4(false) prevents a node from receiving its own
-//     announces.  We also double-check node_id in the listen loop as
-//     defense-in-depth (some OS/driver combos ignore the loop flag).
-//
-//   • Announces carry no secret: they are cleartext UDP that anyone on the LAN
-//     can read.  `secured` only says whether a passphrase is required, so open
-//     and secured meshes don't try to join each other.  The passphrase itself
-//     is verified by the SPAKE2 handshake in mesh.rs.
-//
-//   • Staleness: if we stop receiving announces from a node for 10 seconds
-//     (5 missed intervals), we treat it as gone and tear down the mesh
-//     connection.  This is independent of the WebSocket-level disconnect
-//     signal; whichever fires first wins.
-// ============================================================================
+//! UDP multicast discovery: nodes announce themselves on the LAN and dial the nodes they hear.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -46,8 +13,7 @@ use crate::mesh;
 use crate::NodeState;
 use crate::types::hostname;
 
-// After a failed authentication, wait before dialing that node again:
-// 15s, 30s, 60s, ... capped at 10 minutes.
+// After a failed authentication, wait before redialing: 15 s, doubling up to 10 minutes.
 const AUTH_BACKOFF_BASE: Duration = Duration::from_secs(15);
 const AUTH_BACKOFF_MAX: Duration = Duration::from_secs(600);
 
@@ -64,10 +30,6 @@ fn record_auth_failure(backoff: &AuthBackoff, node_id: &str) {
     map.insert(node_id.to_string(), (failures, Instant::now() + delay));
 }
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
 /// Administratively scoped IPv4 multicast address — never forwarded beyond LAN.
 const MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(239, 255, 42, 99);
 
@@ -80,31 +42,23 @@ const STALE_THRESHOLD: Duration = Duration::from_secs(10);
 /// How often the staleness sweeper runs.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 
-// ---------------------------------------------------------------------------
-// AnnouncePacket
-// ---------------------------------------------------------------------------
-
 /// JSON payload broadcast to the multicast group every `ANNOUNCE_INTERVAL`.
-///
-/// All fields are required; absent fields cause the packet to be silently
-/// dropped (defensive: never panic on a malformed foreign packet).
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AnnouncePacket {
     /// Discriminator — must equal `"ladex_announce"`.
     #[serde(rename = "type")]
     pub packet_type: String,
 
-    /// Unique node identifier.  On receive, skip if `node_id == self.node_id`.
+    /// Unique node identifier.
     pub node_id: String,
 
     /// Human-readable label for this node (hostname).
     pub node_name: String,
 
-    /// The TCP port this node's HTTP/WS server is listening on.
-    /// Used to construct the WebSocket URL for the mesh connection.
+    /// The TCP port this node's HTTP/WS server listens on.
     pub http_port: u16,
 
-    /// Protocol version.  Packets with a different version are silently ignored.
+    /// Protocol version; packets with another version are ignored.
     pub protocol_version: u32,
 
     /// Whether this node requires a passphrase.  Not a secret.
@@ -121,24 +75,15 @@ impl AnnouncePacket {
     }
 }
 
-// ---------------------------------------------------------------------------
-// DiscoveryService — wraps the multicast socket
-// ---------------------------------------------------------------------------
-
-/// Owns the multicast UDP socket.  Produces announce and listen loops that
-/// run as independent Tokio tasks.
+/// Owns the multicast UDP socket and runs the announce and listen loops.
 pub struct DiscoveryService {
     socket: Arc<UdpSocket>,
     discovery_port: u16,
 }
 
 impl DiscoveryService {
-    /// Bind and configure the multicast socket.
-    ///
-    /// Sets SO_REUSEADDR so that two ladex processes on the same host can
-    /// both join the multicast group (needed for on-host integration tests).
+    /// Binds the multicast socket, with SO_REUSEADDR so several nodes can share one host.
     pub async fn bind(discovery_port: u16) -> anyhow::Result<Self> {
-        // Use socket2 for fine-grained socket options before converting to Tokio.
         use socket2::{Domain, Protocol, Socket, Type};
         let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
         sock.set_reuse_address(true)?;
@@ -160,10 +105,7 @@ impl DiscoveryService {
         })
     }
 
-    // ── Announce loop ─────────────────────────────────────────────────────
-
-    /// Continuously broadcast `packet` every `ANNOUNCE_INTERVAL`.
-    /// Runs forever (until the task is cancelled / dropped).
+    /// Broadcasts `packet` every `ANNOUNCE_INTERVAL`, forever.
     pub async fn announce_loop(&self, packet: AnnouncePacket) -> anyhow::Result<()> {
         let payload = serde_json::to_vec(&packet)?;
         let target = SocketAddrV4::new(MULTICAST_ADDR, self.discovery_port);
@@ -175,32 +117,17 @@ impl DiscoveryService {
         }
     }
 
-    // ── Listen loop ───────────────────────────────────────────────────────
-
-    /// Listen for announces from other nodes.
-    ///
-    /// For each valid, previously-unseen announce:
-    ///   1. Update `seen` map with `Instant::now()` (for staleness tracking).
-    ///   2. Skip if already present in `mesh_peers` (avoid duplicate connects).
-    ///   3. Enforce deduplication tie-break: only the lexicographically
-    ///      *smaller* node_id initiates.  The larger waits 200ms then checks
-    ///      again — this prevents double-connect races when both nodes discover
-    ///      each other simultaneously.
-    ///   4. Spawn `mesh::connect_to_peer` as a background task.
+    /// Listens for announces and dials newly seen nodes; the smaller node id dials first, to avoid double connects.
     pub async fn listen_loop(
         &self,
         state: NodeState,
     ) -> anyhow::Result<()> {
         let mut buf = [0u8; 2048];
 
-        // Tracks the last time we heard an announce from each node_id.
-        // Keyed by node_id, value is (Instant, SocketAddr) so we can
-        // correlate with mesh_peers during the staleness sweep.
         let seen: Arc<RwLock<HashMap<String, (Instant, SocketAddr)>>> =
             Arc::new(RwLock::new(HashMap::new()));
         let auth_backoff: AuthBackoff = Arc::new(Mutex::new(HashMap::new()));
 
-        // Spawn the staleness sweeper as a sibling task.
         let seen_clone = seen.clone();
         let state_clone = state.clone();
         tokio::spawn(async move {
@@ -216,8 +143,7 @@ impl DiscoveryService {
                 }
             };
 
-            // Silently drop malformed / foreign packets — do not log at info,
-            // this will be noisy if other multicast apps share the port.
+            // Other multicast apps may share the port, so foreign packets are dropped without logging.
             let packet: AnnouncePacket = match serde_json::from_slice(&buf[..len]) {
                 Ok(p) => p,
                 Err(_) => continue,
@@ -233,18 +159,15 @@ impl DiscoveryService {
                 continue;
             }
 
-            // Update seen timestamp (staleness tracking)
             {
                 let mut map = seen.write().await;
                 map.insert(packet.node_id.clone(), (Instant::now(), from_addr));
             }
 
-            // Already connected to this node?  Update last_seen and skip.
             {
                 let peers = state.mesh_peers.read().await;
                 if let Some(_handle) = peers.get(&packet.node_id) {
-                    // Just bump last_seen so the staleness sweeper doesn't
-                    // tear down a live connection.
+                    // Keeps the staleness sweeper from tearing down a live connection.
                     drop(peers);
                     let mut peers = state.mesh_peers.write().await;
                     if let Some(h) = peers.get_mut(&packet.node_id) {
@@ -258,9 +181,6 @@ impl DiscoveryService {
                 continue;
             }
 
-            // Deduplication tie-break:
-            //   smaller node_id initiates immediately.
-            //   larger node_id waits 200ms then checks if a connection appeared.
             let peer_node_id = packet.node_id.clone();
             let peer_ip: IpAddr = from_addr.ip();
             let peer_http_port = packet.http_port;
@@ -270,18 +190,16 @@ impl DiscoveryService {
 
             tokio::spawn(async move {
                 if my_node_id > peer_node_id {
-                    // We are larger — wait and then check if peer already connected
                     tokio::time::sleep(Duration::from_millis(200)).await;
                     let already_connected = {
                         let peers = state_spawn.mesh_peers.read().await;
                         peers.contains_key(&peer_node_id)
                     };
                     if already_connected {
-                        return; // Peer beat us to it — skip
+                        return;
                     }
                 }
 
-                // Check one more time right before dialing (race window is tiny)
                 {
                     let peers = state_spawn.mesh_peers.read().await;
                     if peers.contains_key(&peer_node_id) {
@@ -316,18 +234,7 @@ impl DiscoveryService {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Staleness sweeper
-// ---------------------------------------------------------------------------
-
-/// Periodically checks `seen` for nodes we haven't heard from in
-/// `STALE_THRESHOLD` and tears down their mesh connections.
-///
-/// This is complementary to the WebSocket-level disconnect detection in
-/// `mesh.rs` — whichever fires first triggers cleanup.  Having both means
-/// we handle: (a) clean TCP closes, (b) dead connections where the TCP
-/// stack hasn't noticed yet (e.g. Wi-Fi roaming), (c) nodes that stopped
-/// sending announces but whose TCP connection is still technically up.
+/// Tears down mesh connections to nodes not heard from in `STALE_THRESHOLD`.
 async fn staleness_sweeper(
     seen: Arc<RwLock<HashMap<String, (Instant, SocketAddr)>>>,
     state: NodeState,
@@ -344,7 +251,6 @@ async fn staleness_sweeper(
         };
 
         for node_id in &stale {
-            // Only tear down if the mesh layer considers this peer connected.
             let was_connected = {
                 let peers = state.mesh_peers.read().await;
                 peers.contains_key(node_id)
@@ -357,15 +263,10 @@ async fn staleness_sweeper(
                 );
                 mesh::remove_mesh_peer(&state, node_id).await;
             }
-            // Remove from seen regardless (prevents log spam for already-cleaned nodes)
             seen.write().await.remove(node_id);
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Convenience: build AnnouncePacket from NodeState
-// ---------------------------------------------------------------------------
 
 pub fn build_announce(state: &NodeState, http_port: u16) -> AnnouncePacket {
     AnnouncePacket {

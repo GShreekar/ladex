@@ -10,6 +10,7 @@ pub mod types;
 pub mod websocket;
 pub mod handlers;
 pub mod mesh;
+pub mod pairing;
 pub mod persist;
 pub mod discovery;
 pub mod state;
@@ -34,52 +35,19 @@ pub mod testing;
 
 use types::*;
 
-// ---------------------------------------------------------------------------
-// Shared pub type aliases (kept short for use throughout the crate)
-// ---------------------------------------------------------------------------
-
 pub type LocalPeers = Arc<RwLock<HashMap<SessionId, PeerInfo>>>;
 pub type Files      = Arc<RwLock<HashMap<String, FileMetadata>>>;
 pub type Messages   = Arc<RwLock<Vec<types::TextMessage>>>;
 
-// ---------------------------------------------------------------------------
-// Phase 1 — NodeState
-//
-// Replaces AppState.  The conceptual split is:
-//
-//   local_peers / local_senders  — THIS node's own browser tab(s).
-//                                  Usually just one, but the design tolerates
-//                                  more without breaking.
-//
-//   files / messages             — Distributed/merged state.  In the current
-//                                  phase (MESH_MODE=false) this node is the
-//                                  sole source of truth.  Phase 4 adds
-//                                  last-write-wins merge across all nodes.
-//
-//   node_id                      — Identity of THIS node (machine) on the
-//                                  mesh.  Distinct from a browser session_id.
-//                                  Generated once at startup.
-//
-//   mesh_peers                   — Other nodes (machines) on the LAN mesh.
-//                                  Populated in Phase 3; empty until then.
-//
-//   passphrase                   — Gates both the browser login and the mesh
-//                                  handshake.  None = open node.
-// ---------------------------------------------------------------------------
-
 #[derive(Clone)]
 pub struct NodeState {
-    // ── local browser tab connections (unchanged from legacy AppState) ───
     pub local_peers:   LocalPeers,
     pub local_senders: types::PeerSenders,
 
-    // ── distributed/merged state ─────────────────────────────────────────
     pub files:    Files,
     pub messages: Messages,
 
-    // ── mesh identity & membership ───────────────────────────────────────
-    /// Unique identifier for this node (machine).  Stable across browser
-    /// reconnects — it lives in the Rust process, not the browser tab.
+    /// This node's id, derived from its identity key.
     pub node_id: NodeId,
 
     /// The key pair behind `node_id`; the mesh handshake proves possession of it.
@@ -88,18 +56,16 @@ pub struct NodeState {
     /// The nodes this one has accepted into its mesh, and those it has revoked.
     pub trust: Arc<trust::TrustStore>,
 
-    /// Connected mesh peer handles keyed by node_id.
-    /// Empty until Phase 3 (Mesh WebSocket Layer) is implemented.
+    /// Pairings with other nodes: whether they are accepted now, and codes waiting for an answer.
+    pub pairings: Arc<pairing::Pairings>,
+
+    /// Connected mesh peers, by node id.
     pub mesh_peers: mesh::MeshPeers,
 
-    // ── auth ─────────────────────────────────────────────────────────────
-    /// Shared passphrase.  Required for the browser login and proven (never
-    /// sent) in the mesh handshake.  None = open node.
+    /// Required for browser logins and proven (never sent) in the mesh handshake; None = open node.
     pub passphrase: Option<String>,
 
-    /// Fingerprint of this node's TLS certificate, bound into the mesh
-    /// handshake so a man in the middle can't pass for this node.  Empty
-    /// when TLS is disabled.
+    /// Fingerprint of this node's TLS certificate, bound into the mesh handshake; empty without TLS.
     pub tls_fingerprint: Vec<u8>,
 
     /// Throttles wrong guesses at the browser login.
@@ -125,29 +91,16 @@ pub struct NodeState {
     /// When the user was last shown a clock warning (they are rate limited).
     pub clock_alert_at: Arc<Mutex<Option<std::time::Instant>>>,
 
-    /// BUG-03 fix: rustls client config used by mesh::connect_to_peer to
-    /// dial other nodes over wss://. `None` means TLS is disabled
-    /// (--no-tls) and peers should be dialed over plain ws:// instead.
+    /// Client config for dialing peers over wss://; None with --no-tls.
     pub tls_client_config: Option<Arc<tokio_rustls::rustls::ClientConfig>>,
 
-    /// BUG-10 fix: this node's own HTTP/mesh listening port (the public
-    /// one, i.e. what `args.port` binds — see main() for the TLS-vs-plain
-    /// split). Self-reported in mesh::connect_to_peer's Hello so a peer we
-    /// dial *into* knows an address to reconnect to if the connection
-    /// later drops.
+    /// This node's public listening port, told to peers so they can redial it.
     pub http_port: u16,
 
-    /// BUG-10 fix: this node's own best-guess LAN IPv4 (same one used for
-    /// the "Access from network" banner and the TLS cert SANs). Also
-    /// self-reported in Hello — needed because, with TLS enabled, warp
-    /// only ever sees connections arriving from src/tls.rs's local
-    /// TLS-terminating proxy (127.0.0.1), never the real peer, so the
-    /// accepting side can't rely on the TCP-level remote address to learn
-    /// where a peer that dialed *us* actually is.
+    /// This node's best-guess LAN IPv4, told to peers so they can redial it.
     pub local_ip: Option<IpAddr>,
 
-    /// F5: this machine's hostname, shown to peers as the "hosted on"
-    /// label for every browser tab connected to this node.
+    /// This machine's hostname, shown to peers.
     pub node_name: String,
 }
 
@@ -180,6 +133,7 @@ impl NodeState {
             node_id: node_id.clone(),
             identity: Arc::new(identity::Identity::generate()),
             trust: Arc::new(trust::TrustStore::open(&data_dir).unwrap()),
+            pairings: Arc::new(pairing::Pairings::new()),
             mesh_peers: Arc::new(RwLock::new(HashMap::new())),
             passphrase: passphrase.map(String::from),
             tls_fingerprint: Vec::new(),

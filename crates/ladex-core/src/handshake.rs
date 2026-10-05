@@ -1,27 +1,9 @@
-// The mesh handshake, over any transport that carries whole frames both ways.
-//
-//   dialer -> Hello    { protocol, secured, name, public key, SPAKE2 message, intro }
-//   server -> Reply    { name, public key, SPAKE2 message, intro, proof, signature }
-//          or Rejected { reason }
-//   dialer -> Confirm  { proof, signature }
-//
-// Both sides run SPAKE2 with the passphrase, so the passphrase never crosses the
-// wire and a wrong guess costs one connection, with no offline attack. Each
-// side then sends a proof, HMAC(K, "ladex-confirm" ‖ role ‖ transcript), and an
-// Ed25519 signature over the same input with its identity key. The transcript
-// covers every field both sides sent plus the channel binding (the server's TLS
-// certificate fingerprint as each side saw it), so a man in the middle who
-// terminates TLS twice, or changes any field, makes the proofs fail; and the
-// signature means a node can only claim the id of a key it holds.
-//
-// Every incoming connection counts as a passphrase guess against its IP until it
-// proves otherwise (ratelimit.rs locks a guesser out for exponentially longer).
-// Nodes on a secured mesh are recorded in the trust store; a revoked key is
-// turned away even when it knows the passphrase.
+//! The mesh handshake: SPAKE2 with the passphrase (or a six-word code when pairing), bound to the TLS channel and signed with each node's identity key.
 
 use std::future::Future;
 use std::io;
 use std::net::IpAddr;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -35,20 +17,26 @@ use crate::trust::{Standing, TrustStore, TrustedVia};
 use crate::types::NodeId;
 use crate::validate;
 
-// How long to wait for each of the other side's frames.
 const STEP_TIMEOUT: Duration = Duration::from_secs(10);
+const PEER_DECISION_TIMEOUT: Duration = Duration::from_secs(180);
 const MAX_FRAME_BYTES: usize = 16 * 1024;
 pub const MAX_INTRO_BYTES: usize = 4096;
 // Ed25519 SPAKE2 messages are 33 bytes; anything much larger isn't one.
 const MAX_PAKE_MESSAGE_BYTES: usize = 64;
 
-// Fixed SPAKE2 identities: the dialer doesn't know the server's key up front,
-// so the real keys are bound through the transcript instead.
+// Fixed SPAKE2 identities: the dialer doesn't know the server's key up front, so the keys are bound through the transcript.
 const CLIENT_SPAKE_IDENTITY: &[u8] = b"ladex mesh client";
 const SERVER_SPAKE_IDENTITY: &[u8] = b"ladex mesh server";
 const TRANSCRIPT_LABEL: &[u8] = b"ladex mesh handshake v1";
 const PROOF_LABEL: &[u8] = b"ladex-confirm";
 const SIGNATURE_LABEL: &[u8] = b"ladex-sign";
+const DECISION_LABEL: &[u8] = b"ladex-pair-decision";
+const VERIFICATION_LABEL: &[u8] = b"ladex-sas";
+
+pub const VERIFICATION_WORDS: usize = 6;
+const BITS_PER_WORD: usize = 11;
+// The BIP-39 English list: 2048 common words, no two sharing their first four letters.
+static WORDLIST: LazyLock<Vec<&'static str>> = LazyLock::new(|| include_str!("verification_words.txt").lines().collect());
 
 /// Carries whole frames between two nodes, in order.
 pub trait Transport: Send {
@@ -89,6 +77,7 @@ pub enum Reason {
     Revoked,
     SelfConnection,
     Duplicate,
+    NotPairing,
 }
 
 impl std::fmt::Display for Reason {
@@ -100,6 +89,7 @@ impl std::fmt::Display for Reason {
             Reason::Revoked => f.write_str("the node has been revoked"),
             Reason::SelfConnection => f.write_str("a node cannot connect to itself"),
             Reason::Duplicate => f.write_str("the nodes are already connected"),
+            Reason::NotPairing => f.write_str("the node is not accepting pairings right now"),
         }
     }
 }
@@ -112,6 +102,10 @@ pub enum Failure {
     RejectedBy(Reason),
     /// Wrong passphrase, a key the peer doesn't hold, or someone in the middle.
     ProofFailed,
+    /// The person at this node said the pairing codes don't match, or didn't answer.
+    Declined,
+    /// The person at the other node did.
+    DeclinedByPeer,
     Malformed(&'static str),
     Closed,
     TimedOut,
@@ -137,6 +131,8 @@ impl std::fmt::Display for Failure {
             Failure::Refused(reason) => write!(f, "refused the peer: {reason}"),
             Failure::RejectedBy(reason) => write!(f, "rejected by the peer: {reason}"),
             Failure::ProofFailed => f.write_str("the peer failed to prove the passphrase and its key: wrong passphrase, or the connection is being intercepted"),
+            Failure::Declined => f.write_str("the pairing was declined on this device"),
+            Failure::DeclinedByPeer => f.write_str("the pairing was declined on the other device"),
             Failure::Malformed(what) => write!(f, "malformed handshake: {what}"),
             Failure::Closed => f.write_str("the peer closed the connection during the handshake"),
             Failure::TimedOut => f.write_str("the peer did not answer in time"),
@@ -148,13 +144,26 @@ impl std::fmt::Display for Failure {
 
 impl std::error::Error for Failure {}
 
-/// Runs the dialer's side of the handshake.
+/// Runs the dialer's side of the handshake to join the peer's mesh.
 pub async fn connect<T: Transport>(transport: &mut T, local: &Local<'_>) -> Result<Peer, Failure> {
-    let (pake, client) = Side::start(Role::Client, local);
+    let session = dial(transport, local, Purpose::Join).await?;
+    remember(local, &session.peer)?;
+    Ok(session.peer.into_peer())
+}
+
+/// Runs the dialer's side of a pairing up to the point where both people compare the code.
+pub async fn start_pairing<T: Transport>(transport: &mut T, local: &Local<'_>) -> Result<Pairing<'static>, Failure> {
+    let session = dial(transport, local, Purpose::Pair).await?;
+    Ok(Pairing::new(session, None))
+}
+
+async fn dial<T: Transport>(transport: &mut T, local: &Local<'_>, purpose: Purpose) -> Result<Session, Failure> {
+    let (pake, client) = Side::start(Role::Client, local, purpose);
     let secured = local.passphrase.is_some();
     let hello = Frame::Hello {
         protocol: local.protocol,
         secured,
+        pairing: purpose == Purpose::Pair,
         name: client.name.clone(),
         public_key: client.public_key.as_bytes().to_vec(),
         pake: client.pake.clone(),
@@ -171,61 +180,80 @@ pub async fn connect<T: Transport>(transport: &mut T, local: &Local<'_>) -> Resu
         return Err(Failure::Refused(Reason::Revoked));
     }
 
-    let transcript = Transcript::new(local.protocol, secured, local.channel_binding, &client, &server);
+    let transcript = Transcript::new(local.protocol, secured, purpose, local.channel_binding, &client, &server);
     let key = pake.finish(&server.pake).map_err(|_| Failure::Malformed("unusable SPAKE2 message"))?;
     let key = hmac::Key::new(hmac::HMAC_SHA256, &key);
-    if !is_authentic(&server.public_key, &key, Role::Server, &transcript, &proof, &signature) {
-        return Err(Failure::ProofFailed);
-    }
+    admit(local, purpose, &server, &key, Role::Server, &transcript, &proof, &signature)?;
     let (proof, signature) = authenticate(local.identity, &key, Role::Client, &transcript);
     send_frame(transport, &Frame::Confirm { proof, signature }).await?;
 
-    remember(local, &server)?;
-    Ok(server.into_peer())
+    Ok(Session { role: Role::Client, key, transcript, ours: client.public_key, peer: server })
 }
 
-/// Starts the server's side of the handshake: reads the dialer's hello, unless
-/// its IP is locked out. Finish with `Incoming::accept` or `Incoming::refuse`.
+/// Reads the dialer's hello unless its IP is locked out; finish with `accept`, `start_pairing` or `refuse`.
 pub async fn receive_hello<'a, T: Transport>(transport: &mut T, limiter: &'a AttemptLimiter, remote_ip: IpAddr) -> Result<Incoming<'a>, Failure> {
     let ticket = match limiter.begin(remote_ip) {
         Ok(ticket) => ticket,
         Err(retry_after) => return Err(reject(transport, Reason::RateLimited { retry_after_secs: retry_after.as_secs().max(1) }).await),
     };
-    let Frame::Hello { protocol, secured, name, public_key, pake, intro } = recv_frame(transport).await? else {
+    let admission = Admission { limiter, remote_ip, ticket };
+    let Frame::Hello { protocol, secured, pairing, name, public_key, pake, intro } = recv_frame(transport).await? else {
         return Err(Failure::Malformed("expected a hello"));
     };
     let client = Side::remote(name, &public_key, pake, intro)?;
-    Ok(Incoming { limiter, remote_ip, ticket, protocol, secured, client })
+    let purpose = if pairing { Purpose::Pair } else { Purpose::Join };
+    Ok(Incoming { admission, protocol, secured, purpose, client })
 }
 
 /// A dialer that has said hello but not yet proven anything.
 pub struct Incoming<'a> {
-    limiter: &'a AttemptLimiter,
-    remote_ip: IpAddr,
-    // Dropped unrefunded unless the dialer proves the passphrase, so the attempt counts as a guess.
-    ticket: Ticket,
+    admission: Admission<'a>,
     protocol: u32,
     secured: bool,
+    purpose: Purpose,
     client: Side,
 }
 
-impl Incoming<'_> {
-    /// The node id the dialer claims; not proven until `accept` succeeds.
+impl<'a> Incoming<'a> {
+    /// The node id the dialer claims; not proven until the handshake succeeds.
     pub fn claimed_node_id(&self) -> NodeId {
         identity::node_id_for(&self.client.public_key)
+    }
+
+    pub fn is_pairing(&self) -> bool {
+        self.purpose == Purpose::Pair
     }
 
     pub async fn refuse<T: Transport>(self, transport: &mut T, reason: Reason) -> Failure {
         reject(transport, reason).await
     }
 
-    /// Runs the rest of the server's side of the handshake.
+    /// Runs the rest of the server's side of the handshake for a dialer joining the mesh.
     pub async fn accept<T: Transport>(self, transport: &mut T, local: &Local<'_>) -> Result<Peer, Failure> {
+        if self.is_pairing() {
+            return Err(reject(transport, Reason::NotPairing).await);
+        }
+        let (session, admission) = self.respond(transport, local).await?;
+        admission.succeed();
+        remember(local, &session.peer)?;
+        Ok(session.peer.into_peer())
+    }
+
+    /// Runs the server's side of a pairing up to the point where both people compare the code.
+    pub async fn start_pairing<T: Transport>(self, transport: &mut T, local: &Local<'_>) -> Result<Pairing<'a>, Failure> {
+        if !self.is_pairing() {
+            return Err(Failure::Malformed("the dialer asked to join, not to pair"));
+        }
+        let (session, admission) = self.respond(transport, local).await?;
+        Ok(Pairing::new(session, Some(admission)))
+    }
+
+    async fn respond<T: Transport>(self, transport: &mut T, local: &Local<'_>) -> Result<(Session, Admission<'a>), Failure> {
         if let Some(reason) = self.reason_to_refuse(local)? {
             return Err(reject(transport, reason).await);
         }
-        let (pake, server) = Side::start(Role::Server, local);
-        let transcript = Transcript::new(self.protocol, self.secured, local.channel_binding, &self.client, &server);
+        let (pake, server) = Side::start(Role::Server, local, self.purpose);
+        let transcript = Transcript::new(self.protocol, self.secured, self.purpose, local.channel_binding, &self.client, &server);
         let key = pake.finish(&self.client.pake).map_err(|_| Failure::Malformed("unusable SPAKE2 message"))?;
         let key = hmac::Key::new(hmac::HMAC_SHA256, &key);
 
@@ -243,13 +271,9 @@ impl Incoming<'_> {
         let Frame::Confirm { proof, signature } = recv_frame(transport).await? else {
             return Err(Failure::Malformed("expected a confirmation"));
         };
-        if !is_authentic(&self.client.public_key, &key, Role::Client, &transcript, &proof, &signature) {
-            return Err(Failure::ProofFailed);
-        }
-        self.limiter.succeed(self.remote_ip, self.ticket);
-
-        remember(local, &self.client)?;
-        Ok(self.client.into_peer())
+        admit(local, self.purpose, &self.client, &key, Role::Client, &transcript, &proof, &signature)?;
+        let session = Session { role: Role::Server, key, transcript, ours: server.public_key, peer: self.client };
+        Ok((session, self.admission))
     }
 
     fn reason_to_refuse(&self, local: &Local<'_>) -> Result<Option<Reason>, Failure> {
@@ -268,12 +292,113 @@ impl Incoming<'_> {
     }
 }
 
+/// Two nodes that have exchanged keys and wait for both people to compare the code.
+pub struct Pairing<'a> {
+    session: Session,
+    admission: Option<Admission<'a>>,
+    code: [&'static str; VERIFICATION_WORDS],
+}
+
+impl<'a> Pairing<'a> {
+    fn new(session: Session, admission: Option<Admission<'a>>) -> Self {
+        let code = verification_code(&session.key, &session.ours, &session.peer.public_key);
+        Self { session, admission, code }
+    }
+
+    /// The words to show; the other device shows the same ones unless someone is in the middle.
+    pub fn code(&self) -> &[&'static str] {
+        &self.code
+    }
+
+    pub fn peer_node_id(&self) -> NodeId {
+        identity::node_id_for(&self.session.peer.public_key)
+    }
+
+    pub fn peer_name(&self) -> String {
+        validate::clean_label(&self.session.peer.name, validate::MAX_NODE_NAME_CHARS)
+    }
+
+    /// Sends this person's answer and waits for the other's; the keys are pinned only if both said yes.
+    pub async fn finish<T: Transport>(self, transport: &mut T, local: &Local<'_>, accepted: bool) -> Result<Peer, Failure> {
+        let Pairing { session, admission, .. } = self;
+        let proof = hmac::sign(&session.key, &decision_input(&session.transcript, session.role, accepted)).as_ref().to_vec();
+        send_frame(transport, &Frame::Decision { accepted, proof }).await?;
+        if !accepted {
+            return Err(Failure::Declined);
+        }
+
+        let Frame::Decision { accepted: peer_accepted, proof } = recv_frame_within(transport, PEER_DECISION_TIMEOUT).await? else {
+            return Err(Failure::Malformed("expected a decision"));
+        };
+        let peer_input = decision_input(&session.transcript, session.role.other(), peer_accepted);
+        if hmac::verify(&session.key, &peer_input, &proof).is_err() {
+            return Err(Failure::ProofFailed);
+        }
+        if !peer_accepted {
+            return Err(Failure::DeclinedByPeer);
+        }
+
+        if let Some(admission) = admission {
+            admission.succeed();
+        }
+        let peer = session.peer;
+        local
+            .trust
+            .trust(&peer.public_key, &peer.name, TrustedVia::Pairing, crate::hlc::wall_clock_ms())
+            .map_err(Failure::TrustStore)?;
+        Ok(peer.into_peer())
+    }
+}
+
+// HMAC(K, "ladex-sas" ‖ sorted public keys), 11 bits per word.
+fn verification_code(key: &hmac::Key, ours: &VerifyingKey, theirs: &VerifyingKey) -> [&'static str; VERIFICATION_WORDS] {
+    let (low, high) = if ours.as_bytes() <= theirs.as_bytes() { (ours, theirs) } else { (theirs, ours) };
+    let tag = hmac::sign(key, &[VERIFICATION_LABEL, low.as_bytes(), high.as_bytes()].concat());
+    let bits = u128::from_be_bytes(tag.as_ref()[..16].try_into().expect("an HMAC-SHA256 tag is 32 bytes"));
+    let word_mask = (1u128 << BITS_PER_WORD) - 1;
+    std::array::from_fn(|i| WORDLIST[((bits >> (128 - BITS_PER_WORD * (i + 1))) & word_mask) as usize])
+}
+
+fn decision_input(transcript: &Transcript, role: Role, accepted: bool) -> Vec<u8> {
+    let mut input = transcript.input(DECISION_LABEL, role);
+    input.push(u8::from(accepted));
+    input
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Purpose {
+    Join,
+    Pair,
+}
+
+struct Admission<'a> {
+    limiter: &'a AttemptLimiter,
+    remote_ip: IpAddr,
+    ticket: Ticket,
+}
+
+impl Admission<'_> {
+    fn succeed(self) {
+        self.limiter.succeed(self.remote_ip, self.ticket);
+    }
+}
+
+struct Session {
+    role: Role,
+    key: hmac::Key,
+    transcript: Transcript,
+    ours: VerifyingKey,
+    peer: Side,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Frame {
     Hello {
         protocol: u32,
         secured: bool,
+        #[serde(default)]
+        pairing: bool,
         name: String,
         #[serde(with = "hex_bytes")]
         public_key: Vec<u8>,
@@ -299,6 +424,11 @@ enum Frame {
         #[serde(with = "hex_bytes")]
         signature: Vec<u8>,
     },
+    Decision {
+        accepted: bool,
+        #[serde(with = "hex_bytes")]
+        proof: Vec<u8>,
+    },
     Rejected {
         reason: Reason,
     },
@@ -317,6 +447,13 @@ impl Role {
             Role::Server => b"server",
         }
     }
+
+    fn other(self) -> Role {
+        match self {
+            Role::Client => Role::Server,
+            Role::Server => Role::Client,
+        }
+    }
 }
 
 // What one side sent, exactly as sent: the transcript must match byte for byte.
@@ -328,8 +465,13 @@ struct Side {
 }
 
 impl Side {
-    fn start(role: Role, local: &Local<'_>) -> (Spake2<Ed25519Group>, Self) {
-        let password = Password::new(local.passphrase.unwrap_or("").as_bytes());
+    fn start(role: Role, local: &Local<'_>, purpose: Purpose) -> (Spake2<Ed25519Group>, Self) {
+        // A pairing has no shared secret yet; the code the two people compare stands in for it.
+        let password = match purpose {
+            Purpose::Join => local.passphrase.unwrap_or(""),
+            Purpose::Pair => "",
+        };
+        let password = Password::new(password.as_bytes());
         let client = SpakeIdentity::new(CLIENT_SPAKE_IDENTITY);
         let server = SpakeIdentity::new(SERVER_SPAKE_IDENTITY);
         let (pake, message) = match role {
@@ -370,12 +512,13 @@ impl Side {
 struct Transcript(digest::Digest);
 
 impl Transcript {
-    fn new(protocol: u32, secured: bool, channel_binding: &[u8], client: &Side, server: &Side) -> Self {
+    fn new(protocol: u32, secured: bool, purpose: Purpose, channel_binding: &[u8], client: &Side, server: &Side) -> Self {
         let mut context = digest::Context::new(&digest::SHA256);
-        let fields: [&[u8]; 12] = [
+        let fields: [&[u8]; 13] = [
             TRANSCRIPT_LABEL,
             &protocol.to_be_bytes(),
             &[u8::from(secured)],
+            &[u8::from(purpose == Purpose::Pair)],
             channel_binding,
             client.name.as_bytes(),
             client.public_key.as_bytes(),
@@ -405,16 +548,37 @@ fn authenticate(identity: &Identity, key: &hmac::Key, role: Role, transcript: &T
     (proof, signature)
 }
 
-fn is_authentic(public_key: &VerifyingKey, key: &hmac::Key, role: Role, transcript: &Transcript, proof: &[u8], signature: &[u8]) -> bool {
-    let knows_passphrase = hmac::verify(key, &transcript.input(PROOF_LABEL, role), proof).is_ok();
-    let holds_key = Signature::from_slice(signature)
-        .is_ok_and(|signature| identity::verify(public_key, &transcript.input(SIGNATURE_LABEL, role), &signature));
-    knows_passphrase && holds_key
+fn holds_key(public_key: &VerifyingKey, role: Role, transcript: &Transcript, signature: &[u8]) -> bool {
+    Signature::from_slice(signature).is_ok_and(|signature| identity::verify(public_key, &transcript.input(SIGNATURE_LABEL, role), &signature))
+}
+
+fn shares_session_key(key: &hmac::Key, role: Role, transcript: &Transcript, proof: &[u8]) -> bool {
+    hmac::verify(key, &transcript.input(PROOF_LABEL, role), proof).is_ok()
+}
+
+// To join, sharing the SPAKE2 key means knowing the passphrase; a paired node may join on its key alone.
+#[allow(clippy::too_many_arguments)] // every input to the check, kept side by side
+fn admit(local: &Local<'_>, purpose: Purpose, peer: &Side, key: &hmac::Key, role: Role, transcript: &Transcript, proof: &[u8], signature: &[u8]) -> Result<(), Failure> {
+    if !holds_key(&peer.public_key, role, transcript, signature) {
+        return Err(Failure::ProofFailed);
+    }
+    if shares_session_key(key, role, transcript, proof) {
+        return Ok(());
+    }
+    if purpose == Purpose::Join && is_paired(local.trust, &peer.public_key)? {
+        return Ok(());
+    }
+    Err(Failure::ProofFailed)
 }
 
 fn is_revoked(trust: &TrustStore, public_key: &VerifyingKey) -> Result<bool, Failure> {
     let standing = trust.standing(public_key).map_err(Failure::TrustStore)?;
     Ok(matches!(standing, Standing::Revoked))
+}
+
+fn is_paired(trust: &TrustStore, public_key: &VerifyingKey) -> Result<bool, Failure> {
+    let standing = trust.standing(public_key).map_err(Failure::TrustStore)?;
+    Ok(matches!(standing, Standing::Trusted(node) if node.trusted_via == TrustedVia::Pairing))
 }
 
 // An open mesh proves nothing about who joined it, so only a secured one vouches for a node.
@@ -430,7 +594,6 @@ fn remember(local: &Local<'_>, peer: &Side) -> Result<(), Failure> {
 }
 
 async fn reject<T: Transport>(transport: &mut T, reason: Reason) -> Failure {
-    // The dialer may already be gone; the refusal stands whether or not it hears why.
     if let Err(e) = send_frame(transport, &Frame::Rejected { reason: reason.clone() }).await {
         tracing::debug!("Handshake: could not tell the dialer it was refused ({reason}): {e}");
     }
@@ -443,7 +606,11 @@ async fn send_frame<T: Transport>(transport: &mut T, frame: &Frame) -> Result<()
 }
 
 async fn recv_frame<T: Transport>(transport: &mut T) -> Result<Frame, Failure> {
-    let received = tokio::time::timeout(STEP_TIMEOUT, transport.recv()).await.map_err(|_| Failure::TimedOut)?;
+    recv_frame_within(transport, STEP_TIMEOUT).await
+}
+
+async fn recv_frame_within<T: Transport>(transport: &mut T, timeout: Duration) -> Result<Frame, Failure> {
+    let received = tokio::time::timeout(timeout, transport.recv()).await.map_err(|_| Failure::TimedOut)?;
     let bytes = received.map_err(Failure::Transport)?.ok_or(Failure::Closed)?;
     if bytes.len() > MAX_FRAME_BYTES {
         return Err(Failure::Malformed("frame too large"));
@@ -498,7 +665,6 @@ mod tests {
 
     type Tamper = Box<dyn Fn(Vec<u8>) -> Vec<u8> + Send>;
 
-    // A middlebox between dialer and server that passes frames on, changing the dialer's with `tamper`.
     fn relay(tamper: Tamper) -> (Pipe, Pipe) {
         let (dialer, mut dialer_side) = pipe();
         let (mut server_side, server) = pipe();
@@ -519,7 +685,6 @@ mod tests {
         (dialer, server)
     }
 
-    // A pipe that also keeps a copy of every frame the dialer sends.
     fn recording_pipe() -> (Pipe, Pipe, Arc<Mutex<Vec<Vec<u8>>>>) {
         let recorded = Arc::new(Mutex::new(Vec::new()));
         let log = recorded.clone();
@@ -683,15 +848,15 @@ mod tests {
         let (mut a, mut b) = pipe();
         let impersonating = async {
             let local = victim.local();
-            let (pake, client) = Side::start(Role::Client, &local);
+            let (pake, client) = Side::start(Role::Client, &local, Purpose::Join);
             let hello = Frame::Hello {
-                protocol: PROTOCOL, secured: true, name: client.name.clone(),
+                protocol: PROTOCOL, secured: true, pairing: false, name: client.name.clone(),
                 public_key: client.public_key.as_bytes().to_vec(), pake: client.pake.clone(), intro: client.intro.clone(),
             };
             send_frame(&mut a, &hello).await.unwrap();
             let Frame::Reply { name, public_key, pake: server_pake, intro, .. } = recv_frame(&mut a).await.unwrap() else { panic!("expected a reply") };
             let server_side = Side::remote(name, &public_key, server_pake, intro).unwrap();
-            let transcript = Transcript::new(PROTOCOL, true, CERT, &client, &server_side);
+            let transcript = Transcript::new(PROTOCOL, true, Purpose::Join, CERT, &client, &server_side);
             let key = hmac::Key::new(hmac::HMAC_SHA256, &pake.finish(&server_side.pake).unwrap());
             let (proof, signature) = authenticate(&impostor, &key, Role::Client, &transcript);
             send_frame(&mut a, &Frame::Confirm { proof, signature }).await.unwrap();
@@ -845,8 +1010,8 @@ mod tests {
     fn transcript_fields_cannot_be_shifted_between_each_other() {
         let identity = Identity::generate();
         let side = |name: &str, intro: &str| Side { name: name.into(), public_key: identity.public_key(), pake: vec![], intro: intro.into() };
-        let shifted_left = Transcript::new(1, true, b"", &side("ab", ""), &side("c", ""));
-        let shifted_right = Transcript::new(1, true, b"", &side("a", "b"), &side("c", ""));
+        let shifted_left = Transcript::new(1, true, Purpose::Join, b"", &side("ab", ""), &side("c", ""));
+        let shifted_right = Transcript::new(1, true, Purpose::Join, b"", &side("a", "b"), &side("c", ""));
         assert_ne!(shifted_left.0.as_ref(), shifted_right.0.as_ref());
     }
 
@@ -854,10 +1019,197 @@ mod tests {
     fn a_proof_for_one_role_does_not_pass_for_the_other() {
         let identity = Identity::generate();
         let side = Side { name: "a".into(), public_key: identity.public_key(), pake: vec![], intro: String::new() };
-        let transcript = Transcript::new(1, true, b"", &side, &side);
+        let transcript = Transcript::new(1, true, Purpose::Join, b"", &side, &side);
         let key = hmac::Key::new(hmac::HMAC_SHA256, b"shared key");
         let (proof, signature) = authenticate(&identity, &key, Role::Client, &transcript);
-        assert!(is_authentic(&identity.public_key(), &key, Role::Client, &transcript, &proof, &signature));
-        assert!(!is_authentic(&identity.public_key(), &key, Role::Server, &transcript, &proof, &signature));
+        assert!(shares_session_key(&key, Role::Client, &transcript, &proof));
+        assert!(!shares_session_key(&key, Role::Server, &transcript, &proof));
+        assert!(holds_key(&identity.public_key(), Role::Client, &transcript, &signature));
+        assert!(!holds_key(&identity.public_key(), Role::Server, &transcript, &signature));
+    }
+
+    type PairingOutcome = (Vec<&'static str>, Result<Peer, Failure>);
+
+    async fn pair_as_dialer(node: &Node, transport: &mut Pipe, accepts: bool) -> PairingOutcome {
+        let local = node.local();
+        let pairing = start_pairing(transport, &local).await.unwrap();
+        (pairing.code().to_vec(), pairing.finish(transport, &local, accepts).await)
+    }
+
+    async fn pair_as_server(node: &Node, transport: &mut Pipe, accepts: bool) -> PairingOutcome {
+        let local = node.local();
+        let incoming = receive_hello(transport, &node.limiter, DIALER_IP).await.unwrap();
+        let pairing = incoming.start_pairing(transport, &local).await.unwrap();
+        (pairing.code().to_vec(), pairing.finish(transport, &local, accepts).await)
+    }
+
+    async fn pair(dialer: &Node, server: &Node, (dialer_accepts, server_accepts): (bool, bool)) -> (PairingOutcome, PairingOutcome) {
+        let (mut a, mut b) = pipe();
+        tokio::join!(pair_as_dialer(dialer, &mut a, dialer_accepts), pair_as_server(server, &mut b, server_accepts))
+    }
+
+    async fn pair_successfully(dialer: &Node, server: &Node) {
+        let ((_, dialed), (_, served)) = pair(dialer, server, (true, true)).await;
+        dialed.unwrap();
+        served.unwrap();
+    }
+
+    fn paired_via(node: &Node, other: &Node) -> Option<TrustedVia> {
+        match node.trust.standing(&other.identity.public_key()).unwrap() {
+            Standing::Trusted(record) => Some(record.trusted_via),
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn both_devices_show_the_same_six_words() {
+        let (dialer, server) = (Node::new("phone", Some("pw")), Node::new("laptop", Some("pw")));
+        let ((dialer_code, _), (server_code, _)) = pair(&dialer, &server, (true, true)).await;
+        assert_eq!(dialer_code.len(), VERIFICATION_WORDS);
+        assert_eq!(dialer_code, server_code);
+    }
+
+    #[tokio::test]
+    async fn every_word_of_the_code_comes_from_the_wordlist() {
+        let (dialer, server) = (Node::new("phone", Some("pw")), Node::new("laptop", Some("pw")));
+        let ((code, _), _) = pair(&dialer, &server, (true, true)).await;
+        assert!(code.iter().all(|word| WORDLIST.contains(word)), "{code:?}");
+    }
+
+    #[tokio::test]
+    async fn two_pairings_give_different_codes() {
+        let (dialer, server) = (Node::new("phone", Some("pw")), Node::new("laptop", Some("pw")));
+        let ((first, _), _) = pair(&dialer, &server, (true, true)).await;
+        let ((second, _), _) = pair(&dialer, &server, (true, true)).await;
+        assert_ne!(first, second);
+    }
+
+    #[tokio::test]
+    async fn when_both_people_confirm_each_node_pins_the_other() {
+        let (dialer, server) = (Node::new("phone", Some("pw")), Node::new("laptop", Some("pw")));
+        let ((_, dialed), (_, served)) = pair(&dialer, &server, (true, true)).await;
+        assert_eq!(dialed.unwrap().node_id, server.node_id());
+        assert_eq!(served.unwrap().node_id, dialer.node_id());
+        assert_eq!(paired_via(&dialer, &server), Some(TrustedVia::Pairing));
+        assert_eq!(paired_via(&server, &dialer), Some(TrustedVia::Pairing));
+    }
+
+    #[tokio::test]
+    async fn when_one_person_declines_nobody_is_pinned() {
+        let (dialer, server) = (Node::new("phone", Some("pw")), Node::new("laptop", Some("pw")));
+        let ((_, dialed), (_, served)) = pair(&dialer, &server, (true, false)).await;
+        assert!(matches!(dialed, Err(Failure::DeclinedByPeer)));
+        assert!(matches!(served, Err(Failure::Declined)));
+        assert_eq!(paired_via(&dialer, &server), None);
+        assert_eq!(paired_via(&server, &dialer), None);
+    }
+
+    #[tokio::test]
+    async fn nodes_with_different_passphrases_can_pair() {
+        let (dialer, server) = (Node::new("phone", Some("one")), Node::new("laptop", Some("two")));
+        let ((_, dialed), (_, served)) = pair(&dialer, &server, (true, true)).await;
+        assert!(dialed.is_ok() && served.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_man_in_the_middle_of_a_pairing_shows_different_codes() {
+        let (dialer, attacker, server) = (Node::new("phone", Some("pw")), Node::new("evil", Some("pw")), Node::new("laptop", Some("pw")));
+        let (mut dialer_end, mut attacker_to_dialer) = pipe();
+        let (mut attacker_to_server, mut server_end) = pipe();
+        let attacker_local = attacker.local();
+        let intercepting = async {
+            let incoming = receive_hello(&mut attacker_to_dialer, &attacker.limiter, DIALER_IP).await.unwrap();
+            let toward_dialer = incoming.start_pairing(&mut attacker_to_dialer, &attacker_local).await.unwrap();
+            let toward_server = start_pairing(&mut attacker_to_server, &attacker_local).await.unwrap();
+            (toward_dialer, toward_server)
+        };
+        let dialing = async { start_pairing(&mut dialer_end, &dialer.local()).await.unwrap().code().to_vec() };
+        let serving = async {
+            let incoming = receive_hello(&mut server_end, &server.limiter, DIALER_IP).await.unwrap();
+            incoming.start_pairing(&mut server_end, &server.local()).await.unwrap().code().to_vec()
+        };
+        let (_attacker, dialer_code, server_code) = tokio::join!(intercepting, dialing, serving);
+        assert_ne!(dialer_code, server_code);
+    }
+
+    #[tokio::test]
+    async fn a_forged_decision_is_rejected() {
+        let (dialer, server) = (Node::new("phone", Some("pw")), Node::new("laptop", Some("pw")));
+        let (mut a, mut b) = pipe();
+        let forging = async {
+            let pairing = start_pairing(&mut a, &dialer.local()).await.unwrap();
+            send_frame(&mut a, &Frame::Decision { accepted: true, proof: vec![0; 32] }).await.unwrap();
+            pairing
+        };
+        let (_pairing, (_, served)) = tokio::join!(forging, pair_as_server(&server, &mut b, true));
+        assert!(matches!(served, Err(Failure::ProofFailed)));
+        assert_eq!(paired_via(&server, &dialer), None);
+    }
+
+    #[tokio::test]
+    async fn paired_nodes_join_on_their_keys_without_sharing_a_passphrase() {
+        let (dialer, server) = (Node::new("phone", Some("one")), Node::new("laptop", Some("two")));
+        pair_successfully(&dialer, &server).await;
+        let (dialed, served) = handshake(&dialer, &server).await;
+        assert_eq!(dialed.unwrap().node_id, server.node_id());
+        assert_eq!(served.unwrap().node_id, dialer.node_id());
+    }
+
+    #[tokio::test]
+    async fn a_node_trusted_by_passphrase_alone_must_still_know_it() {
+        let dialer = Node::new("phone", Some("old"));
+        let server = Node::new("laptop", Some("old"));
+        handshake(&dialer, &server).await.0.unwrap();
+        let rotated = Node { passphrase: Some("new".into()), ..server };
+        let (dialed, _) = handshake(&dialer, &rotated).await;
+        assert!(matches!(dialed, Err(Failure::ProofFailed)));
+    }
+
+    #[tokio::test]
+    async fn a_paired_node_that_is_revoked_cannot_join() {
+        let (dialer, server) = (Node::new("phone", Some("one")), Node::new("laptop", Some("two")));
+        pair_successfully(&dialer, &server).await;
+        server.trust.revoke(&dialer.node_id()).unwrap();
+        let (dialed, _) = handshake(&dialer, &server).await;
+        assert!(matches!(dialed, Err(Failure::RejectedBy(Reason::Revoked))));
+    }
+
+    #[tokio::test]
+    async fn a_pairing_request_is_refused_by_a_node_that_only_accepts_joins() {
+        let (dialer, server) = (Node::new("phone", Some("pw")), Node::new("laptop", Some("pw")));
+        let (mut a, mut b) = pipe();
+        let local = dialer.local();
+        let (dialed, served) = tokio::join!(start_pairing(&mut a, &local), server.serve(&mut b));
+        assert!(matches!(dialed, Err(Failure::RejectedBy(Reason::NotPairing))));
+        assert!(matches!(served, Err(Failure::Refused(Reason::NotPairing))));
+    }
+
+    #[tokio::test]
+    async fn a_completed_pairing_does_not_count_against_the_dialers_ip() {
+        let (dialer, server) = (Node::new("phone", Some("pw")), Node::new("laptop", Some("pw")));
+        for _ in 0..5 {
+            pair_successfully(&dialer, &server).await;
+        }
+    }
+
+    #[test]
+    fn the_wordlist_has_2048_distinct_words() {
+        let distinct: std::collections::HashSet<&str> = WORDLIST.iter().copied().collect();
+        assert_eq!((WORDLIST.len(), distinct.len()), (1 << BITS_PER_WORD, 1 << BITS_PER_WORD));
+    }
+
+    #[test]
+    fn the_code_does_not_depend_on_which_side_computes_it() {
+        let (a, b) = (Identity::generate().public_key(), Identity::generate().public_key());
+        let key = hmac::Key::new(hmac::HMAC_SHA256, b"shared key");
+        assert_eq!(verification_code(&key, &a, &b), verification_code(&key, &b, &a));
+    }
+
+    #[test]
+    fn a_different_session_key_gives_a_different_code() {
+        let (a, b) = (Identity::generate().public_key(), Identity::generate().public_key());
+        let one = hmac::Key::new(hmac::HMAC_SHA256, b"key one");
+        let two = hmac::Key::new(hmac::HMAC_SHA256, b"key two");
+        assert_ne!(verification_code(&one, &a, &b), verification_code(&two, &a, &b));
     }
 }

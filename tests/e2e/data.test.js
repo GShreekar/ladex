@@ -1,5 +1,4 @@
-// End-to-end test against real LADEX processes. Needs a built binary
-// (cargo build; override with LADEX_BIN) and Node 22+. Run: node tests/e2e/data.test.js
+// End-to-end test against real LADEX processes; needs `cargo build` (or LADEX_BIN) and Node 22+. Run: node tests/e2e/data.test.js
 const { spawn } = require('node:child_process');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
@@ -87,7 +86,6 @@ const check = (name, ok, detail = '') => { console.log(`${ok ? 'PASS' : 'FAIL'} 
     const [c1, c2, c3] = [await join(n1.base, t1, 'peer_one'), await join(n2.base, t2, 'peer_two'), await join(n3.base, t3, 'peer_three')];
     await sleep(500);
 
-    // ---- upload to node 1
     const fileA = crypto.randomBytes(24 * MiB + 12345);
     let r = await upload(n1.base, t1, 'peer_one', 'file_a', fileA, { name: 'photo ünï.bin' });
     check('upload to node 1 is accepted', r.status === 201 && r.body.file && r.body.file.id === 'file_a', JSON.stringify(r));
@@ -97,12 +95,10 @@ const check = (name, ok, detail = '') => { console.log(`${ok ? 'PASS' : 'FAIL'} 
     r = await upload(n1.base, t1, 'peer_one', 'file_a', fileA, { name: 'photo ünï.bin' });
     check('uploading the same file again is harmless', r.status === 200, JSON.stringify(r.body));
 
-    // ---- download from node 1 itself
     let d = await download(n1.base, t1, 'file_a');
     check('node 1 serves its own file intact', d.status === 200 && sha(d.buf) === sha(fileA));
     check('download headers are safe', d.headers.get('content-type') === 'application/octet-stream' && d.headers.get('x-content-type-options') === 'nosniff' && d.headers.get('content-security-policy') === 'sandbox' && /^attachment; filename="photo _n_.bin"; filename\*=UTF-8''photo%20%C3%BCn%C3%AF\.bin$/.test(d.headers.get('content-disposition')), d.headers.get('content-disposition'));
 
-    // ---- download from node 2: it has nothing yet and streams it through while fetching
     d = await download(n2.base, t2, 'file_a');
     check('node 2 streams the file through while fetching it from node 1', d.status === 200 && sha(d.buf) === sha(fileA), d.error || '');
     check('content length is exact', d.buf && d.buf.length === fileA.length);
@@ -110,7 +106,6 @@ const check = (name, ok, detail = '') => { console.log(`${ok ? 'PASS' : 'FAIL'} 
     const listed = await c1.wait((m) => m.type === 'file_list_update' && m.files.some((f) => f.id === 'file_a' && Object.values(f.holders).filter((h) => h.present).length === 2), 8000);
     check('everyone learns node 2 is now a holder', !!listed);
 
-    // ---- ranges, from node 3 (cold)
     d = await download(n3.base, t3, 'file_a', 'bytes=10000000-10000099');
     check('a range request on a cold node returns exactly those bytes', d.status === 206 && d.buf.equals(fileA.subarray(10000000, 10000100)) && d.headers.get('content-range') === `bytes 10000000-10000099/${fileA.length}`, `${d.status} ${d.headers && d.headers.get('content-range')}`);
     d = await download(n3.base, t3, 'file_a', 'bytes=-1000');
@@ -127,16 +122,13 @@ const check = (name, ok, detail = '') => { console.log(`${ok ? 'PASS' : 'FAIL'} 
     d = await download(n3.base, t3, 'file_a');
     check('node 3 then gets the whole file', d.status === 200 && sha(d.buf) === sha(fileA));
 
-    // ---- the file outlives its uploader's node
     await stopNode(1);
     await sleep(1500);
-    // a fourth reader has to take it from the surviving nodes: drop node 3's copy knowledge by asking via node 2 after node 1 is gone
     d = await download(n2.base, t2, 'file_a');
     check('with node 1 gone, node 2 still serves the file', d.status === 200 && sha(d.buf) === sha(fileA));
     d = await download(n3.base, t3, 'file_a', 'bytes=100-199');
     check('and so does node 3', d.status === 206 && d.buf.equals(fileA.subarray(100, 200)));
 
-    // ---- a file that only the missing node has
     const n1b = startNode(1);
     await sleep(2500);
     const t1b = await login(n1b.base);
@@ -145,7 +137,6 @@ const check = (name, ok, detail = '') => { console.log(`${ok ? 'PASS' : 'FAIL'} 
     r = await upload(n1b.base, t1b, 'peer_one', 'file_b', fileB, { name: 'only-here.bin' });
     check('node 1 (restarted) accepts a new upload', r.status === 201, JSON.stringify(r.body));
     check('node 1 still lists the earlier file after its restart (from disk)', c1b.files().some((f) => f.id === 'file_a') || !!(await c1b.wait((m) => m.type === 'file_list_update' && m.files.some((f) => f.id === 'file_a'))));
-    // the other nodes redial a restarted node on a back-off timer, so wait until they have heard of the file
     check('node 2 hears of the new file once it reconnects', !!(await c2.wait((m) => m.type === 'file_list_update' && m.files.some((f) => f.id === 'file_b'), 20000)));
     await sleep(800);
     await stopNode(1);
@@ -153,7 +144,6 @@ const check = (name, ok, detail = '') => { console.log(`${ok ? 'PASS' : 'FAIL'} 
     d = await download(n2.base, t2, 'file_b');
     check('a file whose only holder is offline is reported as unavailable (503)', d.status === 503, `${d.status}`);
 
-    // ---- resume an interrupted upload
     const n1c = startNode(1);
     await sleep(2500);
     const t1c = await login(n1c.base);
@@ -177,7 +167,6 @@ const check = (name, ok, detail = '') => { console.log(`${ok ? 'PASS' : 'FAIL'} 
 
     await c2.wait((m) => m.type === 'file_list_update' && m.files.some((f) => f.id === 'file_c'), 20000);
 
-    // ---- who may do what
     r = await upload(n1c.base, 'deadbeef', 'peer_one', 'file_x', fileC.subarray(0, 100), {});
     check('upload without a login is refused', r.status === 401);
     r = await upload(n1c.base, t1c, 'peer_nobody', 'file_x', fileC.subarray(0, 100), {});
@@ -191,20 +180,18 @@ const check = (name, ok, detail = '') => { console.log(`${ok ? 'PASS' : 'FAIL'} 
     d = await download(n1c.base, t1c, 'file_nope');
     check('an unknown file is a 404', d.status === 404);
 
-    // ---- unsharing deletes everywhere
     c1c.send({ type: 'delete_file', session_id: 'peer_one', file_id: 'file_a' });
     await sleep(1500);
     check('unsharing removes the file from node 2 and node 3 disks', !fs.existsSync(path.join(ROOT, 'n2/files/file_a.data')) && !fs.existsSync(path.join(ROOT, 'n3/files/file_a.data')));
     d = await download(n2.base, t2, 'file_a');
     check('and it can no longer be downloaded', d.status === 404, d.status);
 
-    // ---- a corrupted copy on disk is never passed on
     const fileD = crypto.randomBytes(4 * MiB);
     r = await upload(n1c.base, t1c, 'peer_one', 'file_d', fileD, { name: 'd.bin' });
     check('upload for the corruption test', r.status === 201);
     await sleep(500);
     const fd = fs.openSync(path.join(ROOT, 'n1/files/file_d.data'), 'r+');
-    fs.writeSync(fd, Buffer.from([fileD[2 * MiB + 5] ^ 0xff]), 0, 1, 2 * MiB + 5); // flip a byte in chunk 2
+    fs.writeSync(fd, Buffer.from([fileD[2 * MiB + 5] ^ 0xff]), 0, 1, 2 * MiB + 5);
     fs.closeSync(fd);
     d = await download(n3.base, t3, 'file_d');
     check('a corrupted source never delivers corrupted bytes', !(d.buf && d.buf.length === fileD.length && sha(d.buf) !== sha(fileD)), `status ${d.status} len ${d.buf && d.buf.length}`);

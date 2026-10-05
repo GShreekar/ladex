@@ -1,9 +1,4 @@
-// F2: advertise this node over mDNS/DNS-SD so it's reachable as
-// ladex.local — alongside the existing IP-based URLs, not instead of them,
-// since .local resolution isn't universally supported (older Windows
-// without Bonjour, for example). Also registers a _ladex._tcp service so
-// generic mDNS browsers (dns-sd, avahi-browse, Android NSD, ...) can find
-// LADEX nodes on the network.
+//! Advertises this node over mDNS as ladex.local, alongside the IP-based URLs.
 
 use mdns_sd::{DaemonEvent, ServiceDaemon, ServiceInfo};
 use std::net::IpAddr;
@@ -17,9 +12,7 @@ pub struct MdnsHandle {
     fullname: String,
 }
 
-/// Starts the mDNS daemon and registers the host name + service.
-/// Never fatal: on any failure this just logs a warning and returns `None`
-/// — the app is fully usable over the direct IP either way.
+/// Starts the mDNS daemon and registers the host name and service; never fatal, returns None on failure.
 pub fn advertise(local_ips: &[IpAddr], port: u16, tls: bool) -> Option<MdnsHandle> {
     if local_ips.is_empty() {
         return None;
@@ -54,10 +47,7 @@ pub fn advertise(local_ips: &[IpAddr], port: u16, tls: bool) -> Option<MdnsHandl
     let host = HOST_NAME.trim_end_matches('.');
     println!("Access via mDNS: {scheme}://{host}:{port} (most phones/computers; Windows may need Bonjour installed)");
 
-    // A second LADEX node on the same network will also try to claim
-    // ladex.local — mDNS conflict resolution renames the loser to
-    // ladex-2.local, ladex-3.local, etc. Watch for that so we can tell the
-    // user the name that's actually in effect.
+    // Another node may already hold ladex.local and get this one renamed; watch for that to report the real name.
     if let Ok(monitor) = daemon.monitor() {
         tokio::spawn(async move {
             while let Ok(event) = monitor.recv_async().await {
@@ -75,9 +65,7 @@ pub fn advertise(local_ips: &[IpAddr], port: u16, tls: bool) -> Option<MdnsHandl
     Some(MdnsHandle { daemon, fullname })
 }
 
-/// Sends mDNS goodbye records so other devices don't keep this node cached
-/// after it exits. Best-effort — the records would just expire on their
-/// own TTL anyway if this is skipped or times out.
+/// Sends mDNS goodbye records so other devices drop this node; best-effort.
 pub async fn shutdown(handle: MdnsHandle) {
     if let Ok(recv) = handle.daemon.unregister(&handle.fullname) {
         let _ = tokio::time::timeout(Duration::from_millis(500), recv.recv_async()).await;

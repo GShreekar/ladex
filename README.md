@@ -99,6 +99,7 @@ What to keep in mind:
 ### Security Model
 
 - **Mesh handshake**: nodes prove they know the passphrase with a SPAKE2 password-authenticated key exchange. The passphrase, and anything derived from it, never crosses the network, so recording traffic or discovery announcements reveals nothing that can be cracked offline. An attacker gets at most one guess per connection. Each node also proves it holds the private key behind its node id, and a node that has been revoked is refused even if it knows the passphrase.
+- **Pairing**: two nodes can also be paired without sharing a passphrase. Open *Pair a device* (the link icon) on both machines at `http://localhost`, enter one device's address on the other, and confirm only if both screens show the same six words. A device in the middle would make the words differ. Paired nodes then reconnect on their keys alone; incoming pairings are accepted only while the panel is open.
 - **Man-in-the-middle protection**: the handshake is bound to the TLS certificate each node actually connected to. Someone relaying or terminating the connection with their own certificate can't complete it without the passphrase.
 - **Wrong guesses are throttled** at both the browser login and the mesh handshake.
 - **Each browser connection is one device.** A connection can only act as the device it joined as, so one signed-in device can't delete another's files or answer another's downloads. The node, not the browser, decides who uploaded a file and who hosts it.

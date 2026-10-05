@@ -5,7 +5,6 @@ on:
     branches: [main, v3]
   pull_request:
 
-# A newer push to the same branch makes the older run pointless.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -39,8 +38,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Pinned so a new Rust release can't fail CI with lints nobody can see locally.
-      # Bump it together with the local toolchain.
+      # Pinned so a new Rust release can't fail CI; bump it with the local toolchain.
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.97.0"

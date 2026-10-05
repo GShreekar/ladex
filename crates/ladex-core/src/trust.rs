@@ -1,9 +1,4 @@
-// The nodes this node has accepted into its mesh, kept across restarts.
-//
-// A node is trusted once it proves the passphrase (or is paired), and from then
-// on is recognised by its public key alone. Revoking a node keeps its record,
-// so the key stays rejected even if it still knows the passphrase; forgetting
-// it removes the record, so it can join again from scratch.
+//! The nodes this node has accepted into its mesh, kept across restarts; a revoked key stays rejected.
 
 use std::path::Path;
 
@@ -91,8 +86,7 @@ impl TrustStore {
         Ok(nodes)
     }
 
-    /// Records that a node has just proven itself. A revoked node is refused:
-    /// it has to be forgotten first.
+    /// Records that a node has just proven itself; a revoked node is refused until forgotten.
     pub fn trust(&self, public_key: &VerifyingKey, name: &str, via: TrustedVia, now_ms: u64) -> anyhow::Result<TrustedNode> {
         let node_id = node_id_for(public_key);
         let txn = self.db.begin_write()?;
@@ -151,7 +145,6 @@ impl TrustStore {
         Ok(removed)
     }
 
-    // Applies `edit` to a node's record and saves it if `edit` returns true.
     fn change(&self, node_id: &str, edit: impl FnOnce(&mut TrustedNode) -> bool) -> anyhow::Result<bool> {
         let txn = self.db.begin_write()?;
         let changed = {

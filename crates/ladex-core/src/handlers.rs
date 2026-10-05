@@ -6,8 +6,7 @@ use crate::NodeState;
 use warp::http::StatusCode;
 use warp::{Rejection, Reply};
 
-// `Secure` keeps the cookie off plain HTTP; the loopback listener has to go
-// without it because Safari refuses Secure cookies on http://localhost.
+// The loopback listener can't use `Secure`: Safari refuses Secure cookies on http://localhost.
 fn cookie_attributes(secure: bool) -> &'static str {
     if secure { "; Secure" } else { "" }
 }
@@ -33,7 +32,7 @@ fn json_error(message: &str, status: StatusCode) -> Box<dyn Reply> {
 
 pub async fn check_auth_status(auth_cookie: Option<String>, peer: Option<PeerAddr>, state: NodeState) -> Result<impl Reply, Rejection> {
     let is_authenticated = match &state.passphrase {
-        None => true, // No auth required
+        None => true,
         Some(_) => auth_cookie.as_deref().is_some_and(|token| state.sessions.authenticate(token).is_some()),
     };
 
@@ -67,8 +66,7 @@ pub async fn authenticate(
         return Ok(Box::new(warp::reply::json(&AuthResponse { success: true, message: None })));
     };
 
-    // Counted before the passphrase is checked, so parallel guesses can't all
-    // get through ahead of the first failure being recorded.
+    // Counted before the passphrase is checked, so parallel guesses can't slip through before the first failure.
     let ip = peer_ip(peer);
     let ticket = match state.auth_limiter.begin(ip) {
         Ok(ticket) => ticket,
@@ -92,7 +90,7 @@ pub async fn authenticate(
     Ok(Box::new(warp::reply::with_header(reply, "Set-Cookie", session_cookie(&token, is_tls(peer)))))
 }
 
-// Ends only this device's session; the others stay signed in.
+/// Ends only this device's session; the others stay signed in.
 pub async fn logout(auth_cookie: Option<String>, peer: Option<PeerAddr>, state: NodeState) -> Result<impl Reply, Rejection> {
     if let Some(session) = auth_cookie.as_deref().and_then(|token| state.sessions.authenticate(token)) {
         state.sessions.revoke(&session.id);
@@ -153,6 +151,95 @@ pub async fn revoke_session(
     } else {
         Ok(json_error("No such session", StatusCode::NOT_FOUND))
     }
+}
+
+#[derive(serde::Serialize)]
+struct PairingResponse {
+    can_pair: bool,
+    /// What to type on the other device to dial this one.
+    address: Option<String>,
+    #[serde(flatten)]
+    status: Option<crate::pairing::Status>,
+}
+
+pub async fn pairing_status(peer: Option<PeerAddr>, state: NodeState) -> Result<impl Reply, Rejection> {
+    let can_pair = can_manage(peer);
+    let response = PairingResponse {
+        can_pair,
+        address: state.local_ip.filter(|_| can_pair).map(|ip| std::net::SocketAddr::new(ip, state.http_port).to_string()),
+        status: can_pair.then(|| state.pairings.status()),
+    };
+    Ok(warp::reply::json(&response))
+}
+
+pub async fn open_pairing(peer: Option<PeerAddr>, state: NodeState) -> Result<Box<dyn Reply>, Rejection> {
+    if !can_manage(peer) {
+        return Ok(pairing_forbidden());
+    }
+    state.pairings.open();
+    Ok(no_content())
+}
+
+pub async fn close_pairing(peer: Option<PeerAddr>, state: NodeState) -> Result<Box<dyn Reply>, Rejection> {
+    if !can_manage(peer) {
+        return Ok(pairing_forbidden());
+    }
+    state.pairings.close();
+    Ok(no_content())
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct DialRequest {
+    pub address: String,
+}
+
+/// Dials another node to pair with it; the outcome shows up in the pairing status.
+pub async fn dial_pairing(request: DialRequest, peer: Option<PeerAddr>, state: NodeState) -> Result<Box<dyn Reply>, Rejection> {
+    if !can_manage(peer) {
+        return Ok(pairing_forbidden());
+    }
+    let Some(target) = parse_node_address(&request.address, state.http_port) else {
+        return Ok(json_error("Enter the other device's address, like 192.168.1.20:8080", StatusCode::BAD_REQUEST));
+    };
+    tokio::spawn(async move {
+        let result = crate::mesh::pair_with_peer(target.ip(), target.port(), state.clone()).await;
+        let name = result.as_ref().map_or_else(|_| target.to_string(), Clone::clone);
+        state.pairings.record(crate::pairing::Outcome::of(&name, &result));
+    });
+    Ok(Box::new(warp::reply::with_status(warp::reply(), StatusCode::ACCEPTED)))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct PairingAnswer {
+    pub accepted: bool,
+}
+
+pub async fn answer_pairing(id: u64, answer: PairingAnswer, peer: Option<PeerAddr>, state: NodeState) -> Result<Box<dyn Reply>, Rejection> {
+    if !can_manage(peer) {
+        return Ok(pairing_forbidden());
+    }
+    if state.pairings.answer(id, answer.accepted) {
+        Ok(no_content())
+    } else {
+        Ok(json_error("That pairing is no longer waiting", StatusCode::NOT_FOUND))
+    }
+}
+
+// "ip:port", or just "ip" for a node on the same port as this one.
+fn parse_node_address(address: &str, default_port: u16) -> Option<std::net::SocketAddr> {
+    let address = address.trim();
+    address
+        .parse::<std::net::SocketAddr>()
+        .ok()
+        .or_else(|| address.parse::<std::net::IpAddr>().ok().map(|ip| std::net::SocketAddr::new(ip, default_port)))
+}
+
+fn pairing_forbidden() -> Box<dyn Reply> {
+    json_error("Pairing is only available on the machine running LADEX, at http://localhost", StatusCode::FORBIDDEN)
+}
+
+fn no_content() -> Box<dyn Reply> {
+    Box::new(warp::reply::with_status(warp::reply(), StatusCode::NO_CONTENT))
 }
 
 #[cfg(test)]
@@ -227,7 +314,6 @@ mod tests {
         assert_eq!(locked.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(locked.headers().get("retry-after").is_some());
         assert!(state.sessions.list().is_empty());
-        // Another address is unaffected.
         assert_eq!(login(&state, "pw", "192.168.1.21:50000", true).await.status(), StatusCode::OK);
     }
 
@@ -257,16 +343,13 @@ mod tests {
         let (_, device_a) = state.sessions.create("192.168.1.20".parse().unwrap(), None);
         let (_, device_b) = state.sessions.create("192.168.1.21".parse().unwrap(), None);
 
-        // Device A may not end B's session...
         let refused = revoke_session(device_b.id.clone(), Some(device_a.clone()), peer(LAN, true), state.clone()).await.unwrap();
         assert_eq!(refused.into_response().status(), StatusCode::FORBIDDEN);
         assert!(state.sessions.is_active(&device_b.id));
 
-        // ...but may end its own.
         let own = revoke_session(device_a.id.clone(), Some(device_a.clone()), peer(LAN, true), state.clone()).await.unwrap();
         assert_eq!(own.into_response().status(), StatusCode::NO_CONTENT);
 
-        // The host machine (loopback) may end anyone's.
         let host = revoke_session(device_b.id.clone(), Some(device_a), peer("127.0.0.1:40000", false), state.clone()).await.unwrap();
         assert_eq!(host.into_response().status(), StatusCode::NO_CONTENT);
         assert!(!state.sessions.is_active(&device_b.id));
@@ -278,5 +361,53 @@ mod tests {
         let reply = list_sessions(None, peer("127.0.0.1:1", false), state).await.unwrap().into_response();
         let text = body_text(reply).await;
         assert!(text.contains("\"auth_required\":false") && text.contains("\"sessions\":[]"));
+    }
+
+    #[tokio::test]
+    async fn pairing_is_hidden_from_other_devices() {
+        let state = NodeState::for_tests(Some("pw"));
+        let reply = pairing_status(peer(LAN, true), state).await.unwrap().into_response();
+        let body: serde_json::Value = serde_json::from_str(&body_text(reply).await).unwrap();
+        assert_eq!(body["can_pair"], false);
+        assert!(body.get("waiting").is_none());
+    }
+
+    #[tokio::test]
+    async fn only_the_machine_running_ladex_can_open_pairing() {
+        let state = NodeState::for_tests(Some("pw"));
+        let reply = open_pairing(peer(LAN, true), state.clone()).await.unwrap().into_response();
+        assert_eq!(reply.status(), StatusCode::FORBIDDEN);
+        assert!(!state.pairings.is_open());
+    }
+
+    #[tokio::test]
+    async fn the_machine_running_ladex_can_open_and_close_pairing() {
+        let state = NodeState::for_tests(Some("pw"));
+        open_pairing(peer("127.0.0.1:1", false), state.clone()).await.unwrap();
+        assert!(state.pairings.is_open());
+        close_pairing(peer("127.0.0.1:1", false), state.clone()).await.unwrap();
+        assert!(!state.pairings.is_open());
+    }
+
+    #[tokio::test]
+    async fn another_device_cannot_answer_a_pairing() {
+        let state = NodeState::for_tests(Some("pw"));
+        let reply = answer_pairing(0, PairingAnswer { accepted: true }, peer(LAN, true), state).await.unwrap().into_response();
+        assert_eq!(reply.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn dialing_a_malformed_address_is_rejected() {
+        let state = NodeState::for_tests(Some("pw"));
+        let request = DialRequest { address: "not an address".into() };
+        let reply = dial_pairing(request, peer("127.0.0.1:1", false), state).await.unwrap().into_response();
+        assert_eq!(reply.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn a_node_address_without_a_port_uses_this_nodes_port() {
+        assert_eq!(parse_node_address(" 192.168.1.20 ", 8080), Some("192.168.1.20:8080".parse().unwrap()));
+        assert_eq!(parse_node_address("192.168.1.20:9000", 8080), Some("192.168.1.20:9000".parse().unwrap()));
+        assert_eq!(parse_node_address("laptop", 8080), None);
     }
 }

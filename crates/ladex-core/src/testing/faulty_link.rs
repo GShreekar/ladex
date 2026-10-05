@@ -1,6 +1,4 @@
-// A bad network between two in-process nodes. The link relays the mesh
-// WebSocket one message at a time, so each message can be lost, held back or
-// overtaken, the way packets are on a real network. Nodes must run without TLS.
+//! A lossy, delaying, reordering link between two in-process nodes, which must run without TLS.
 
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -18,7 +16,6 @@ use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
 use super::{eventually, fully_connected, spawn_node, NodeConfig, NodeHandle};
 
-// Large enough for a full catalog or a chunk frame.
 const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 
 /// What happens to each message crossing the link, in either direction.
@@ -95,11 +92,9 @@ impl FaultyLink {
     }
 }
 
-// `return_addr` is where the far node should redial whoever connects here: the link's other end.
 async fn accept(listener: TcpListener, target: SocketAddr, return_addr: SocketAddr, shared: Arc<Shared>) {
     loop {
         let Ok((stream, _)) = listener.accept().await else { continue };
-        // Dropping the socket refuses the connection.
         if !*shared.partitioned.borrow() {
             tokio::spawn(relay(stream, target, return_addr, shared.clone()));
         }
@@ -118,7 +113,6 @@ async fn relay(stream: TcpStream, target: SocketAddr, return_addr: SocketAddr, s
     let (dialer_tx, dialer_rx) = dialer.split();
     let (target_tx, target_rx) = target.split();
     let mut partitioned = shared.partitioned.subscribe();
-    // Whichever finishes first ends the connection; dropping both sockets is the cut.
     tokio::select! {
         _ = forward(dialer_rx, target_tx, Some(return_addr), &shared) => {}
         _ = forward(target_rx, dialer_tx, None, &shared) => {}
@@ -163,7 +157,6 @@ async fn forward(
     }
 }
 
-// A Hello names the address to redial its sender at; point that at the link as well.
 fn redirect_hello(message: Message, addr: SocketAddr) -> Message {
     let Message::Text(text) = &message else { return message };
     let Ok(mut hello) = serde_json::from_str::<serde_json::Value>(text) else { return message };

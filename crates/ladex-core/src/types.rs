@@ -6,77 +6,40 @@ use tokio::sync::{mpsc, RwLock};
 
 pub type SessionId = String;
 
-/// Per-peer sender channel — each connected WebSocket gets its own mpsc sender
-/// so the server can route messages to a specific peer instead of broadcasting.
+/// A channel to one connected WebSocket, so the server can address a single peer.
 pub type PeerSender = mpsc::UnboundedSender<ServerMessage>;
 pub type PeerSenders = Arc<RwLock<HashMap<SessionId, PeerSender>>>;
 
-// ---------------------------------------------------------------------------
-// Phase 1 — node identity
-// ---------------------------------------------------------------------------
-
-/// Identifies this node (machine) on the mesh.  Distinct from a browser tab's
-/// `session_id` — every node generates one `node_id` on startup, regardless
-/// of how many browser tabs connect to it locally.
-///
-/// In the current single-server phase (MESH_MODE=false) this is only used for
-/// cookie auth invalidation; the mesh layer (Phase 3) uses it to route messages.
+/// Identifies a node (machine) on the mesh; distinct from a browser tab's `session_id`.
 pub type NodeId = String;
-
-// ---------------------------------------------------------------------------
-// Peer / file / message data
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerInfo {
     pub session_id: SessionId,
     pub connected_at: chrono::DateTime<chrono::Utc>,
     pub user_agent: Option<String>,
-    /// Which node (machine) hosts this browser session.
-    /// Set to the local node_id when registering a local peer.
-    /// Used in Phase 5 (decentralized signaling) to route WebRTC signals
-    /// to the correct node without a central server.
+    /// Which node hosts this browser session.
     #[serde(default)]
     pub hosting_node_id: Option<NodeId>,
-    /// Round-trip latency (ms) from THIS node to the node hosting this peer.
-    /// Populated / updated by the Phase 6 Ping/Pong loop.
-    /// `None` until at least one Pong is received.
-    /// Exposed to browser tabs via PeerSync so clients can pick the fastest host.
+    /// Round-trip time (ms) from this node to the node hosting this peer; None until the first Pong.
     #[serde(default)]
     pub node_rtt_ms: Option<u32>,
 
-    // ── BUG-08 fix: explicit departure tombstone ─────────────────────────
-    // Mirrors FileMetadata's deleted/deleted_at (see below). Departure used
-    // to be signalled by a PeerInfo with `hosting_node_id: None` and
-    // `connected_at` set to `DateTime::MIN_UTC`, on the theory that a
-    // "sentinel" PeerInfo would merge in like any other update — but
-    // `merge_peers`'s LWW rule was `incoming.connected_at >
-    // existing.connected_at`, and MIN_UTC can never be greater than a real
-    // connection time. The departure marker silently lost that comparison
-    // on every other mesh node forever, so those nodes kept treating a
-    // long-gone browser tab as a live, routable peer (ghost peers).
-    /// True when this peer has disconnected. Tombstones propagate across
-    /// the mesh so all nodes stop treating this session as routable.
+    /// True once this peer has disconnected; the tombstone propagates across the mesh.
     #[serde(default)]
     pub left: bool,
-    /// When `left` was set, used as the LWW key for departures instead of
-    /// `connected_at` (always newer than the `connected_at` it's replacing,
-    /// so it actually wins the merge).
+    /// When `left` was set.
     #[serde(default)]
     pub left_at: Option<chrono::DateTime<chrono::Utc>>,
 
-    // ── F5: device names ─────────────────────────────────────────────────
-    /// Hostname of the machine hosting this session (NodeState::node_name).
-    /// Set by the hosting node itself; other nodes just carry it along.
+    /// Hostname of the machine hosting this session.
     #[serde(default)]
     pub hosting_node_name: Option<String>,
-    /// User-editable nickname, set client-side and persisted in
-    /// localStorage. Overrides the User-Agent-derived name in the UI.
+    /// Nickname set by the user in the browser; overrides the User-Agent name.
     #[serde(default)]
     pub nickname: Option<String>,
 
-    /// Orders updates to this peer across nodes (see hlc.rs). Replaces the
-    /// wall-clock `connected_at`/`left_at` as the merge key.
+    /// Orders updates to this peer across nodes (see hlc.rs).
     #[serde(default)]
     pub version: Stamp,
 }
@@ -92,9 +55,7 @@ pub struct AuthResponse {
     pub message: Option<String>,
 }
 
-/// Whether one node has the complete file. Each node only ever changes its
-/// own record, with a stamp from its own clock, so concurrent changes by
-/// different nodes merge instead of overwriting each other.
+/// Whether one node has the complete file; each node only changes its own record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Holder {
     pub since: Stamp,
@@ -107,9 +68,7 @@ pub struct FileMetadata {
     pub name: String,
     pub size: u64,
     pub mime_type: String,
-    /// Device (browser session) that shared it; empty for files found on disk
-    /// after a restart. Only that device, or the machine running the node it
-    /// was shared through, may unshare it.
+    /// Device that shared the file (empty for files found on disk); only it, or the node's own machine, may unshare it.
     pub uploader_id: SessionId,
     /// Node it was first shared through.
     #[serde(default)]
@@ -118,21 +77,15 @@ pub struct FileMetadata {
     #[serde(default)]
     pub holders: HashMap<NodeId, Holder>,
     pub uploaded_at: chrono::DateTime<chrono::Utc>,
-    /// Unix-millisecond wall-clock time of creation, for display only.
-    /// Merging uses `version`.
+    /// Creation time (Unix ms), for display only.
     #[serde(default)]
     pub created_at: u64,
 
-    /// Stamp of the latest change to this entry (create, delete). The entry
-    /// with the greater stamp wins a merge; see hlc.rs. Holders merge
-    /// separately, node by node.
+    /// Stamp of the latest change; the greater stamp wins a merge (see hlc.rs).
     #[serde(default)]
     pub version: Stamp,
 
-    // ── tombstone support ──────────────────────────────────────────────────
-    /// True when this file has been deleted.  Tombstones propagate across the
-    /// mesh so all nodes stop advertising the file and delete their copy.  The
-    /// entry is pruned from memory after a while (see `state::prune_tombstones`).
+    /// True once the file has been unshared; the tombstone propagates across the mesh.
     #[serde(default)]
     pub deleted: bool,
     /// Unix-millisecond wall-clock time of deletion, for display only.
@@ -140,12 +93,10 @@ pub struct FileMetadata {
     pub deleted_at: u64,
 
     /// Identifies the exact contents (size and every chunk hash, see store.rs).
-    /// A node that fetches the file checks what it receives against it.
     #[serde(default)]
     pub manifest_root: Option<String>,
 
-    /// A folder is a small JSON file listing its children (stored like any
-    /// other file), which are themselves catalog entries with `parent` set.
+    /// A folder is a JSON listing of its children, which are catalog entries with `parent` set.
     #[serde(default)]
     pub is_folder: bool,
     #[serde(default)]
@@ -178,14 +129,11 @@ pub struct TextMessage {
     pub sender_id: SessionId,
     pub sender_name: Option<String>,
     pub timestamp: chrono::DateTime<chrono::Utc>,
-    /// Unix-millisecond timestamp for LWW merge (Phase 4).
+    /// Creation time (Unix ms); orders the chat.
     #[serde(default)]
     pub created_at: u64,
 }
 
-// ---------------------------------------------------------------------------
-// Client → Server messages
-// ---------------------------------------------------------------------------
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ClientMessage {
@@ -198,7 +146,7 @@ pub enum ClientMessage {
         nickname: Option<String>,
     },
 
-    /// F5: user changed their nickname after already joining
+    /// The user changed their nickname after joining.
     #[serde(rename = "set_nickname")]
     SetNickname {
         session_id: SessionId,
@@ -216,15 +164,14 @@ pub enum ClientMessage {
         content: String,
     },
 
-    /// F4: unshare a file. Only the original uploader may do this.
+    /// Unshares a file; only its uploader may.
     #[serde(rename = "delete_file")]
     DeleteFile {
         session_id: SessionId,
         file_id: String,
     },
 
-    /// F3: point one peer at a file it may want. Routed to
-    /// `target_session_id`, who gets an IncomingFileOffer consent prompt.
+    /// Points one peer at a file; the recipient gets a consent prompt.
     #[serde(rename = "offer_file_to")]
     OfferFileTo {
         session_id: SessionId,
@@ -232,7 +179,7 @@ pub enum ClientMessage {
         file_id: String,
     },
 
-    /// F3: the offer's recipient declined it — routed back to the sender.
+    /// The offer's recipient declined it.
     #[serde(rename = "decline_file_offer")]
     DeclineFileOffer {
         session_id: SessionId,
@@ -241,9 +188,6 @@ pub enum ClientMessage {
     },
 }
 
-// ---------------------------------------------------------------------------
-// Server → Client messages
-// ---------------------------------------------------------------------------
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ServerMessage {
@@ -273,14 +217,12 @@ pub enum ServerMessage {
         file_id: String,
     },
 
-    /// Phase 6: Incremental peer list update (e.g. RTT change).
-    /// Browser tab merges these into its local peer map for host selection.
+    /// Incremental peer list update (e.g. an RTT change).
     #[serde(rename = "peer_sync")]
     PeerSync {
         peers: Vec<PeerInfo>,
     },
 
-    // ── Misc ─────────────────────────────────────────────────────────────
     #[serde(rename = "error")]
     Error {
         message: String,
@@ -299,23 +241,20 @@ pub enum ServerMessage {
         messages: Vec<TextMessage>,
     },
 
-    /// Phase 10 §10.4: AP isolation diagnostic — no mesh peers found after 10s.
-    /// Browser tab surfaces a non-dismissible warning banner.
+    /// No mesh peers found after 10 s, likely AP isolation; the tab shows a warning.
     #[serde(rename = "no_peers_warning")]
     NoPeersWarning {
         message: String,
     },
 
-    /// F3: someone is offering to send this file directly — show a consent
-    /// prompt. The client resolves file name/size/mime from its own
-    /// already-synced catalog by `file_id`.
+    /// Someone offers to send this file directly; the tab asks for consent.
     #[serde(rename = "incoming_file_offer")]
     IncomingFileOffer {
         file_id: String,
         from_session_id: SessionId,
     },
 
-    /// F3: the peer we offered a file to declined it.
+    /// The peer we offered a file to declined it.
     #[serde(rename = "file_offer_declined")]
     FileOfferDeclined {
         file_id: String,

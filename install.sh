@@ -4,12 +4,10 @@ set -e
 # Installer for the 'ladex' command-line utility.
 # Usage: curl -sSL https://raw.githubusercontent.com/GShreekar/ladex/main/install.sh | sh
 
-# --- Configuration ---
 REPO="GShreekar/ladex"
 APP_NAME="ladex"
 INSTALL_DIR="/usr/local/bin"
 
-# --- Helper Functions ---
 echo_color() {
     printf '\033[%sm%s\033[0m\n' "$1" "$2"
 }
@@ -23,15 +21,12 @@ success() {
     echo_color "32" "$1"
 }
 
-# --- Main Logic ---
 main() {
-    # Check for required commands
     command -v curl >/dev/null || fail "Required command 'curl' is not installed."
     command -v tar >/dev/null || fail "Required command 'tar' is not installed."
 
     printf "Installing %s...\n" "$APP_NAME"
 
-    # Detect OS and Architecture
     os_name=$(uname -s | tr '[:upper:]' '[:lower:]')
     arch=$(uname -m)
     case "$os_name" in
@@ -48,13 +43,11 @@ main() {
     target_suffix="${os_suffix}-${arch_suffix}"
     success "Detected system: ${target_suffix}"
 
-    # Get the latest version tag from GitHub API
     api_url="https://api.github.com/repos/${REPO}/releases/latest"
     latest_version_tag=$(curl -sSL "$api_url" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
     [ -z "$latest_version_tag" ] && fail "Could not fetch the latest version tag from GitHub."
     success "Latest version is ${latest_version_tag}"
 
-    # Construct download URL and download
     archive_name="${APP_NAME}-${latest_version_tag}-${target_suffix}.tar.gz"
     download_url="https://github.com/${REPO}/releases/download/${latest_version_tag}/${archive_name}"
     
@@ -62,7 +55,6 @@ main() {
     tmp_dir=$(mktemp -d)
     curl -fSL "$download_url" -o "${tmp_dir}/${archive_name}" || fail "Failed to download the binary."
 
-    # Install the binary
     SUDO=""
     [ ! -w "$INSTALL_DIR" ] && SUDO="sudo"
     
@@ -72,7 +64,6 @@ main() {
     $SUDO mv "${tmp_dir}/${APP_NAME}" "${INSTALL_DIR}/${APP_NAME}" || fail "Failed to move binary to ${INSTALL_DIR}."
     $SUDO chmod +x "${INSTALL_DIR}/${APP_NAME}" || fail "Failed to set executable permissions."
 
-    # Clean up and verify
     rm -rf "$tmp_dir"
     success "${APP_NAME} was installed successfully to ${INSTALL_DIR}/${APP_NAME}"
     printf "You can now run '%s' from your terminal.\n" "$APP_NAME"

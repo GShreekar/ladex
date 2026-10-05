@@ -3,7 +3,7 @@
 (function () {
     'use strict';
 
-    // Which node this is, and whether we are on the machine running it.
+    /** Which node this is, and whether we are on the machine running it. */
     LADEXApp.prototype._loadNodeInfo = async function() {
         try {
             const status = await (await fetch('/auth-status', { cache: 'no-store' })).json();
@@ -12,10 +12,6 @@
             this.updateFileList(this.serverFiles);
         } catch (_) { /* the page works without it; only the unshare button depends on it */ }
     };
-
-    // =====================================================================
-    //  WEBSOCKET — signaling only
-    // =====================================================================
 
     LADEXApp.prototype.connectWebSocket = function() {
         const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -50,8 +46,7 @@
         this.ws.onerror = (err) => console.error('WS error:', err);
     };
 
-    // Reconnect, unless this device was signed out (or the node restarted and
-    // forgot its sessions): the node would just refuse, so go to the login page.
+    /** Reconnects, unless this device was signed out: then the node would refuse, so go to the login page. */
     LADEXApp.prototype._reconnectOrSignIn = async function() {
         try {
             const status = await (await fetch('/auth-status', { cache: 'no-cache' })).json();
@@ -69,11 +64,8 @@
         }
     };
 
-    // ── Server message dispatcher ────────────────────────────────────────
-
     LADEXApp.prototype.handleServerMessage = function(msg) {
         switch (msg.type) {
-            // ── peer presence ───────────────────────────────────────────
             case 'peer_joined':
                 this._rememberNode(msg.peer);
                 this.peers.set(msg.peer.session_id, msg.peer);
@@ -86,15 +78,12 @@
                 this.updatePeerStatus(msg.total_peers);
                 this.updateDevicesList();
                 break;
-            // Phase 6: incremental peer list update (RTT changes, nicknames, ...)
             case 'peer_sync':
                 if (msg.peers) {
                     for (const peer of msg.peers) {
                         if (peer.hosting_node_id == null) {
-                            // Departure tombstone
                             this.peers.delete(peer.session_id);
                         } else {
-                            // Merge: update fields without overwriting others
                             this._rememberNode(peer);
                             const existing = this.peers.get(peer.session_id) || {};
                             this.peers.set(peer.session_id, { ...existing, ...peer });
@@ -105,15 +94,12 @@
                 this.updateFileList(this.serverFiles);
                 break;
 
-            // ── file catalog ────────────────────────────────────────────
             case 'file_list_update':
                 this.serverFiles = msg.files || [];
                 this.updateFileList(this.serverFiles);
                 break;
 
-            // F4: someone unshared a file (possibly us — deleteFile() records
-            // the name here first so this can confirm with it, instead of
-            // double-toasting alongside an optimistic message there)
+            // deleteFile() records the name first, so this confirms with it instead of double-toasting.
             case 'file_removed': {
                 const pendingName = this._pendingDeletes.get(msg.file_id);
                 if (pendingName !== undefined) {
@@ -125,7 +111,6 @@
                 break;
             }
 
-            // F3: someone is pointing us at a file
             case 'incoming_file_offer':
                 this._showFileOfferDialog(msg);
                 break;
@@ -135,8 +120,6 @@
                 break;
             }
 
-            // ── misc ────────────────────────────────────────────────────
-            // Phase 10: AP isolation diagnostic
             case 'no_peers_warning':
                 this._showApIsolationBanner(msg.message);
                 break;
@@ -164,16 +147,12 @@
         return this.nodeNames.get(nodeId) || `node ${String(nodeId).slice(-6)}`;
     };
 
-    // Names of the nodes that currently have the whole file.
+    /** Names of the nodes that currently have the whole file. */
     LADEXApp.prototype._holderNames = function(file) {
         return Object.entries(file.holders || {})
             .filter(([, holder]) => holder && holder.present)
             .map(([nodeId]) => this._nodeName(nodeId));
     };
-
-    // =====================================================================
-    //  UI
-    // =====================================================================
 
     LADEXApp.prototype.updateConnectionStatus = function(connected) {
         const el = document.getElementById('connection-status');
@@ -188,9 +167,6 @@
         if (ps) ps.textContent = `Connected peers: ${count}`;
         if (pn) pn.textContent = `Peer: ${this.getShortPeerId()}`;
     };
-    // =====================================================================
-    //  Text-message methods (prototype extensions — kept separate for clarity)
-    // =====================================================================
 
     LADEXApp.prototype.sendTextMessage = function() {
         const input = document.getElementById('message-input');

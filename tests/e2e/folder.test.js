@@ -1,5 +1,4 @@
-// End-to-end test against real LADEX processes. Needs a built binary
-// (cargo build; override with LADEX_BIN) and Node 22+. Run: node tests/e2e/folder.test.js
+// End-to-end test against real LADEX processes; needs `cargo build` (or LADEX_BIN) and Node 22+. Run: node tests/e2e/folder.test.js
 const { spawn, execFileSync } = require('node:child_process');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
@@ -61,7 +60,6 @@ let failures = 0; const check = (n, ok, d = '') => { console.log(`${ok ? 'PASS' 
     check('the folder entry has its counts', folder.is_folder && folder.folder_files === 4 && folder.folder_bytes === Object.values(files).reduce((a, b) => a + b.length, 0), JSON.stringify(folder));
     check('node 2 lists the folder', !!(await c2.wait((m) => m.type === 'file_list_update' && m.files.some((f) => f.id === 'folder_x' && f.is_folder))));
 
-    // the listing and the zip, from node 2 (which has nothing yet)
     const listing = await (await fetch(`http://${b2}/api/files/folder_x`, { headers: { Cookie: `auth=${t2}` } })).json();
     check('the listing is served like any file', listing.v === 1 && listing.children.length === 4 && listing.children.some((c) => c.path === 'etc/passwd'), JSON.stringify(listing).slice(0, 200));
 
@@ -90,7 +88,6 @@ print(json.dumps({n: hashlib.sha256(z.read(n)).hexdigest() for n in z.namelist()
     const missing = await fetch(`http://${b1}/api/folders/folder_nope.zip`, { headers: { Cookie: `auth=${t1}` } });
     check('an unknown folder is a 404', missing.status === 404);
 
-    // unsharing the folder removes its files everywhere
     c1.send({ type: 'delete_file', session_id: 'peer_one', file_id: 'folder_x' });
     await sleep(1500);
     const left = fs.readdirSync(path.join(ROOT, 'n1/files')).filter((f) => f.endsWith('.data'));

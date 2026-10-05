@@ -1,17 +1,8 @@
-// Uploading, downloading and the progress panel. Files go to and from the node over plain HTTP (see TECHNICAL.md §0).
+// Uploading, downloading and the progress panel.
 
 (function () {
     'use strict';
 
-
-    // =====================================================================
-    //  FILE UPLOAD — the file goes to this node's disk (and stays there)
-    //
-    //  The request body is a slice of the File, which the browser streams
-    //  from disk, so size doesn't matter. If the connection drops, the node
-    //  keeps what it received and says where to continue (the upload-status
-    //  endpoint), so the upload resumes instead of starting over.
-    // =====================================================================
 
     LADEXApp.prototype.handleFileUpload = async function(files, isFolder) {
         if (!files || files.length === 0) return;
@@ -36,7 +27,7 @@
         }
     };
 
-    // Runs `work` over `items`, at most `limit` at a time.
+    /** Runs `work` over `items`, at most `limit` at a time. */
     LADEXApp.prototype._runLimited = async function(items, limit, work) {
         let next = 0;
         const worker = async () => {
@@ -52,16 +43,14 @@
         return new Promise((resolve) => setTimeout(resolve, ms));
     };
 
-    // How much of this upload the node already has (0 if none).
+    /** How much of this upload the node already has (0 if none). */
     LADEXApp.prototype._uploadStatus = async function(fileId, size) {
         const response = await fetch(`/api/files/${fileId}/upload?size=${size}`, { cache: 'no-store' });
         if (response.status === 401) { window.location.href = '/login'; throw new Error('signed out'); }
         return response.json();
     };
 
-    // One attempt at sending the file from `offset`. Resolves, never rejects:
-    // { ok, status, body } from the node, or { network: true } if the
-    // connection failed, or { aborted: true } if it was cancelled.
+    /** One attempt at sending the file from `offset`; resolves, never rejects. */
     LADEXApp.prototype._putFile = function(group, fileId, file, offset, parent, onProgress) {
         return new Promise((resolve) => {
             const xhr = new XMLHttpRequest();
@@ -88,11 +77,7 @@
         });
     };
 
-    /**
-     * Uploads one file, resuming after interruptions. `group` is the transfer
-     * id whose Cancel button covers it; `report(bytesSoFar)` is called as it
-     * goes. Resolves with the node's catalog entry.
-     */
+    /** Uploads one file, resuming after interruptions; resolves with the node's catalog entry. */
     LADEXApp.prototype.uploadFile = async function(file, { parent = null, group = null, report = null } = {}) {
         const fileId = this.generateFileId();
         const ownCard = group === null;
@@ -132,7 +117,6 @@
                     return result.body.file || { id: fileId };
                 }
                 if (result.status === 401) { window.location.href = '/login'; throw new Error('signed out'); }
-                // The node asked for an earlier offset: loop, which asks it again.
                 const retryable = result.network || (result.status === 409 && typeof result.body.offset === 'number');
                 if (!retryable || attempt >= this.UPLOAD_RETRIES) {
                     throw new Error(result.body.message || (result.network ? 'the connection was lost' : `the node answered ${result.status}`));
@@ -145,11 +129,7 @@
         }
     };
 
-    /**
-     * F6: a folder is uploaded file by file (each one resumable), then
-     * published as one entry listing them. The files are hidden from the
-     * list until then (they carry the folder as their parent).
-     */
+    /** Uploads a folder file by file, then publishes it as one entry listing them. */
     LADEXApp.prototype.handleFolderUpload = async function(files) {
         const folderId = this.generateFileId();
         const folderName = files[0].webkitRelativePath?.split('/')[0] || 'folder';
@@ -161,7 +141,6 @@
         const group = `up:${folderId}`;
         const started = Date.now();
 
-        // Bytes confirmed per file so far, for one progress card over the whole folder.
         const sent = new Array(entries.length).fill(0);
         let lastShown = 0;
         const show = () => {
@@ -209,16 +188,10 @@
         }
     };
 
-    // =====================================================================
-    //  DRAG-AND-DROP
-    // =====================================================================
-
     LADEXApp.prototype.setupDragAndDrop = function() {
         const body = document.body;
         let dragDepth = 0;
-        // F3 also uses drag-and-drop internally (a file row onto a device
-        // chip), which bubbles up to these same body listeners — only react
-        // to drags actually carrying OS files, not that internal one.
+        // File rows dragged onto device chips bubble up here too; only react to drags carrying OS files.
         const isFileDrag = (e) => e.dataTransfer.types.includes('Files');
 
         body.addEventListener('dragenter', (e) => {
@@ -256,13 +229,6 @@
         });
     };
 
-    // =====================================================================
-    //  DOWNLOAD — a plain HTTP GET to this node, so the browser's own
-    //  download manager streams it to disk (any browser, any size). If the
-    //  node doesn't have the file yet it fetches it from the other nodes
-    //  while the download is already running.
-    // =====================================================================
-
     LADEXApp.prototype.downloadFile = async function(fileId) {
         const file = this.serverFiles.find((f) => f.id === fileId);
         if (!file) return;
@@ -272,8 +238,7 @@
         this.pendingDownloads.add(fileId);
         this.updateFileList(this.serverFiles);
         try {
-            // A HEAD request first: it tells us right away if the file can't be
-            // had (and starts the node fetching it), which a download link can't.
+            // A HEAD first tells us right away if the file can't be had, which a download link can't.
             const probe = await fetch(`/api/files/${encodeURIComponent(fileId)}`, { method: 'HEAD', cache: 'no-store' });
             if (probe.status === 401) { window.location.href = '/login'; return; }
             if (!probe.ok) {
@@ -299,7 +264,7 @@
         return `The node could not provide that file (error ${status}).`;
     };
 
-    // Hands a URL to the browser's download manager.
+    /** Hands a URL to the browser's download manager. */
     LADEXApp.prototype._saveViaBrowser = function(url, name) {
         const a = document.createElement('a');
         a.href = url;
@@ -310,11 +275,7 @@
         document.body.removeChild(a);
     };
 
-    /**
-     * F6: a folder. With a folder picker (Chrome, Edge) its files are written
-     * into a real directory, one by one, streamed. Everything else gets one
-     * zip streamed by the node.
-     */
+    /** Downloads a folder into a picked directory where supported, otherwise as one zip from the node. */
     LADEXApp.prototype.downloadFolder = async function(folder) {
         if (this.pendingDownloads.has(folder.id)) return;
         if (!window.showDirectoryPicker) {
@@ -386,11 +347,7 @@
         }
     };
 
-    /**
-     * Resolves (creating as needed) the file handle for a path inside a picked
-     * directory. A received folder never replaces anything already in the
-     * folder the user picked: on a name clash the new file becomes "name (1).ext".
-     */
+    /** The file handle for a path inside a picked directory; a name clash becomes "name (1).ext", never a replacement. */
     LADEXApp.prototype._resolveFolderFileHandle = async function(dirHandle, relativePath) {
         const parts = relativePath.split('/').filter((p) => p && p !== '.' && p !== '..');
         let dir = dirHandle;
@@ -409,24 +366,6 @@
         }
         throw new Error(`too many files named ${leaf}`);
     };
-
-    // =====================================================================
-    //  PROGRESS PANEL  (BUG-12 fix)
-    //
-    //  Used to be one global modal shared by every send/receive — a second
-    //  concurrent transfer would overwrite the first's numbers, and either
-    //  one finishing/failing would call hideProgress() with no id and hide
-    //  it out from under the other. Now it's a docked panel holding one
-    //  card per transferId, so concurrent transfers each get their own
-    //  progress bar, byte counter, and Cancel button that only cancels
-    //  that one transfer.
-    //
-    //  transferId convention: `send:${fileId}:${targetSessionId}` for an
-    //  upload (peer-specific — sending the same file to two peers at once
-    //  is genuinely two transfers), `dl:${fileId}` for a download (NOT
-    //  peer-specific — a retry can pick a different host for the same
-    //  logical download, and the card should follow the download).
-    // =====================================================================
 
     LADEXApp.prototype.showProgress = function(transferId, filename, percentage, speedBytesPerSec, etaSeconds, transferredBytes, totalBytes) {
         const list = document.getElementById('progress-list');
@@ -488,7 +427,7 @@
         if (panel && !this._progressCards.size) panel.classList.remove('visible');
     };
 
-    /** Cancel one transfer by id — used by each card's own Cancel button. */
+    /** Cancels one transfer by id. */
     LADEXApp.prototype.cancelTransfer = function(transferId) {
         this.cancelledTransfers.add(transferId);
         for (const xhr of this._uploads.get(transferId) ?? []) xhr.abort();
@@ -497,7 +436,7 @@
         this.toast('Transfer cancelled', 'info');
     };
 
-    /** Cancel every in-flight transfer — bound to the panel's "Cancel all" button. */
+    /** Cancels every in-flight transfer. */
     LADEXApp.prototype.cancelActiveTransfer = function() {
         const ids = Array.from(this._progressCards.keys());
         for (const id of ids) this.cancelTransfer(id);

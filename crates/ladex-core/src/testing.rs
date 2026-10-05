@@ -1,5 +1,4 @@
-// In-process nodes for integration tests. Each node serves the real /mesh
-// endpoint on 127.0.0.1 with discovery off, and dials only the peers it is given.
+//! In-process nodes for integration tests, serving the real /mesh endpoint on 127.0.0.1.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{Ipv4Addr, SocketAddr};
@@ -20,7 +19,6 @@ use crate::{files_api, mesh, ratelimit, server, state, tls, NodeState};
 mod faulty_link;
 pub use faulty_link::{Faults, FaultyLink, LinkedMesh};
 
-// How long `eventually` waits for the mesh to settle.
 const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
@@ -28,7 +26,7 @@ static NEXT_MESSAGE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Default)]
 pub struct NodeConfig {
-    // The node's name; its id comes from a key generated for it.
+    /// The node's name; its id comes from a key generated for it.
     pub name: String,
     pub passphrase: Option<String>,
     pub peers: Vec<SocketAddr>,
@@ -68,8 +66,7 @@ impl Drop for NodeHandle {
     }
 }
 
-/// Starts a node and dials its configured peers. A failed dial is logged, not
-/// fatal, just as for `--peer` on the command line.
+/// Starts a node and dials its configured peers; a failed dial is logged, not fatal.
 pub async fn spawn_node(config: NodeConfig) -> NodeHandle {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.expect("bind a loopback port");
     let addr = listener.local_addr().expect("read the bound address");

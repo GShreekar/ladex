@@ -4,12 +4,7 @@
     'use strict';
 
 
-    /**
-     * Nickname (if set) > UA-derived name > short session id.
-     * `peer` may be undefined (e.g. a host_id we haven't gotten PeerInfo
-     * for yet) — sessionId is passed separately so the fallback still has
-     * something to work with in that case.
-     */
+    /** Nickname, else the User-Agent name, else a short session id. */
     LADEXApp.prototype._deviceDisplayName = function(sessionId, peer) {
         const isSelf = sessionId === this.sessionId;
         const nickname = isSelf ? this.nickname : peer?.nickname;
@@ -44,12 +39,10 @@
         if (countEl) countEl.textContent = `(${1 + others.length})`;
     };
 
-    /** Turns the "you" chip's name into an inline text input. Avoids
-     *  prompt()/alert() — those block the JS event loop, which could stall
-     *  an in-flight transfer while the dialog is open. */
+    /** Turns the "you" chip's name into an inline input; prompt() would block the event loop mid-transfer. */
     LADEXApp.prototype._editNicknameInline = function(chipEl) {
         const nameEl = chipEl.querySelector('.device-chip-name');
-        if (!nameEl || chipEl.querySelector('.device-chip-input')) return; // already editing
+        if (!nameEl || chipEl.querySelector('.device-chip-input')) return;
 
         const input = document.createElement('input');
         input.type = 'text';
@@ -78,10 +71,6 @@
         input.select();
     };
 
-    // =====================================================================
-    //  TOAST NOTIFICATIONS (replaces alert())
-    // =====================================================================
-
     LADEXApp.prototype._ensureToastContainer = function() {
         if (this._toastContainer) return;
         this._toastContainer = document.createElement('div');
@@ -89,19 +78,7 @@
         document.body.appendChild(this._toastContainer);
     };
 
-    /**
-     * Show a small toast notification.
-     * @param {string} message
-     * @param {'info'|'success'|'error'|'warning'} type
-     * @param {number} durationMs — auto-dismiss after this many ms
-     */
-    /**
-     * @param {string} message
-     * @param {'info'|'success'|'error'|'warning'} type
-     * @param {number} durationMs — auto-dismiss after this many ms
-     * @param {{label: string, onClick: () => void}} [action] — F7: e.g. a
-     *   "Retry" button on an integrity-check-failed toast
-     */
+    /** Shows a toast; `action` adds a button such as Retry. */
     LADEXApp.prototype.toast = function(message, type = 'info', durationMs = 4000, action = null) {
         this._ensureToastContainer();
         const el = document.createElement('div');
@@ -116,40 +93,22 @@
             el.appendChild(btn);
         }
         this._toastContainer.appendChild(el);
-        // Trigger CSS enter animation
         requestAnimationFrame(() => el.classList.add('toast-visible'));
         const dismiss = () => {
             el.classList.remove('toast-visible');
             el.classList.add('toast-exit');
             el.addEventListener('transitionend', () => el.remove());
-            // Fallback if transitionend doesn't fire
             setTimeout(() => el.remove(), 500);
         };
         setTimeout(dismiss, durationMs);
     };
 
-    // =====================================================================
-    //  F4: UNSHARE / DELETE
-    // =====================================================================
-
-    /** Only the uploader can delete — the server enforces this too; this
-     *  is just so the button doesn't even appear for anyone else. The
-     *  confirmation toast fires from the 'file_removed' broadcast echo
-     *  (see handleServerMessage), not here, so we don't double-toast. */
+    /** Unshares a file; the server enforces who may, this only hides the button from others. */
     LADEXApp.prototype.deleteFile = function(fileId) {
         const f = this.serverFiles.find(x => x.id === fileId);
         this._pendingDeletes.set(fileId, f ? f.name : 'File');
         this.sendWS({ type: 'delete_file', session_id: this.sessionId, file_id: fileId });
     };
-
-    // =====================================================================
-    //  F3: SEND-TO-PERSON
-    //  Push a file straight to one device instead of publishing it to the
-    //  catalog for anyone to find — drag a file row onto a device chip, or
-    //  click a chip to pick a file. The target gets a consent prompt
-    //  (handleServerMessage 'incoming_file_offer'); accepting reuses the
-    //  normal download, from this node.
-    // =====================================================================
 
     LADEXApp.prototype.offerFileToPeer = function(fileId, targetSessionId) {
         const file = this.serverFiles.find((f) => f.id === fileId);
@@ -169,7 +128,6 @@
 
     LADEXApp.prototype._showSendFilePicker = function(anchorEl, targetSessionId) {
         document.querySelector('.send-file-popover')?.remove();
-        // What this device has shared (folders included, not the files inside them).
         const options = this.serverFiles
             .filter((f) => f.uploader_id === this.sessionId && !f.parent)
             .map((f) => ({ id: f.id, name: f.name, icon: f.is_folder ? '📁' : '📄' }));
@@ -200,7 +158,7 @@
             popover.remove();
         });
 
-        // Close on outside click — deferred so this same click doesn't fire it
+        // Deferred so this same click doesn't close it.
         setTimeout(() => {
             const closeHandler = (e) => {
                 if (!popover.contains(e.target)) {
@@ -212,9 +170,7 @@
         }, 0);
     };
 
-    /**
-     * F3: someone pointed us at a file. Accepting just downloads it.
-     */
+    /** Someone pointed us at a file; accepting just downloads it. */
     LADEXApp.prototype._showFileOfferDialog = function(msg) {
         const file = this.serverFiles.find((f) => f.id === msg.file_id);
         const senderName = LadexUtil.escapeHtml(this._deviceDisplayName(msg.from_session_id, this.peers.get(msg.from_session_id)));
@@ -254,13 +210,10 @@
         });
     };
 
-    // ── File + message list ──────────────────────────────────────────────
-
     LADEXApp.prototype.updateFileList = function(files) {
         const tbody = document.getElementById('files-list');
         const allItems = [];
 
-        // The files inside a folder are listed by the folder, not on their own.
         if (files && files.length > 0) {
             files.filter(f => !f.parent).forEach(f => allItems.push({ type: 'file', data: f, timestamp: new Date(f.uploaded_at) }));
         }
@@ -272,15 +225,7 @@
             return;
         }
 
-        // BUG-05 fix: file/message ids, sender/host ids and content all
-        // originate from other peers on the LAN (or, before the BUG-06 CSWSH
-        // fix, potentially from an arbitrary website) — none of it is
-        // trustworthy. Everything interpolated below is escaped, and the
-        // two actions that used to be inline onclick="app.foo('${id}')"
-        // handlers (a nested HTML-attribute-inside-JS-string context that's
-        // easy to break out of even with escaping) are now data-action
-        // attributes read by a single delegated listener in
-        // setupEventListeners() instead.
+        // Everything below comes from other devices: escape all of it, and use data-action attributes instead of inline handlers.
         tbody.innerHTML = allItems.map(item => {
             if (item.type === 'file') {
                 const f = item.data;
@@ -326,12 +271,9 @@
         }).join('');
     };
 
-    /**
-     * Phase 10 §10.4: Show a sticky AP isolation diagnostic banner.
-     * Non-dismissible initially; user can close after reading.
-     */
+    /** Shows a sticky banner when no other nodes are found, likely AP isolation. */
     LADEXApp.prototype._showApIsolationBanner = function(message) {
-        if (document.getElementById('ap-isolation-banner')) return; // already shown
+        if (document.getElementById('ap-isolation-banner')) return;
         const banner = document.createElement('div');
         banner.id = 'ap-isolation-banner';
         banner.className = 'system-banner system-banner-error';
@@ -370,7 +312,7 @@
         document.getElementById('messages-modal').style.display = 'none';
     };
 
-    // F1: QR code so a phone can join by scanning instead of typing the URL
+    /** Shows a QR code so a phone can join by scanning instead of typing the URL. */
     LADEXApp.prototype.showAddDeviceModal = function() {
         const url = location.href;
         document.getElementById('qr-code-container').innerHTML = this._renderQrSvg(url);
@@ -382,7 +324,7 @@
         document.getElementById('add-device-modal').style.display = 'none';
     };
 
-    // Renders a QR code as inline SVG using the vendored qrcode.js encoder
+    /** Renders a QR code as inline SVG using the vendored qrcode.js. */
     LADEXApp.prototype._renderQrSvg = function(text, moduleSize = 6) {
         if (typeof qrcode === 'undefined') {
             return '<p style="color:#c0392b;padding:20px;">QR library not loaded.</p>';

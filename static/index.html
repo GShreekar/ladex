@@ -10,7 +10,6 @@
     <meta http-equiv="Pragma" content="no-cache">
     <meta http-equiv="Expires" content="0">
     <script>
-        // Force cache refresh on localhost
         if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
             console.log('Localhost detected - forcing cache refresh');
         }
@@ -27,6 +26,11 @@
                 <button id="add-device-btn" class="icon-btn" title="Add a device">
                     <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
                         <path d="M3,11H11V3H3M3,21H11V13H3M13,21H21V13H13M13,3V11H21V3"/>
+                    </svg>
+                </button>
+                <button id="pairing-btn" class="icon-btn" title="Pair a device" style="display: none;">
+                    <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
+                        <path d="M3.9,12C3.9,10.29 5.29,8.9 7,8.9H11V7H7A5,5 0 0,0 2,12A5,5 0 0,0 7,17H11V15.1H7C5.29,15.1 3.9,13.71 3.9,12M8,13H16V11H8V13M17,7H13V8.9H17C18.71,8.9 20.1,10.29 20.1,12C20.1,13.71 18.71,15.1 17,15.1H13V17H17A5,5 0 0,0 22,12A5,5 0 0,0 17,7Z"/>
                     </svg>
                 </button>
                 <button id="sessions-btn" class="icon-btn" title="Signed-in devices" style="display: none;">
@@ -73,8 +77,6 @@
                 </div>
             </section>
 
-            <!-- F3 / F5: connected devices — drag a file row here (or click
-                 a device) to send it directly; click "you" to set a nickname -->
             <section class="devices-section">
                 <h2>Devices <span id="devices-count" class="devices-count"></span></h2>
                 <div id="devices-list" class="devices-list"></div>
@@ -104,10 +106,6 @@
         </main>
     </div>
 
-    <!-- BUG-12 fix: a docked panel of per-transfer cards (built by
-         showProgress()/hideProgress() in app.js) instead of one shared
-         full-screen modal, so concurrent transfers don't overwrite or
-         hide each other. -->
     <div id="progress-panel" class="progress-panel">
         <div class="progress-panel-header">
             <h3>File Transfers</h3>
@@ -116,7 +114,6 @@
         <div id="progress-list"></div>
     </div>
 
-    <!-- F1: scan to open this page on a phone instead of typing the URL -->
     <div id="add-device-modal" class="modal">
         <div class="modal-content add-device-modal">
             <div class="modal-header">
@@ -129,7 +126,6 @@
         </div>
     </div>
 
-    <!-- S5: devices signed in with the passphrase; each can be signed out separately -->
     <div id="sessions-modal" class="modal">
         <div class="modal-content sessions-modal">
             <div class="modal-header">
@@ -138,6 +134,27 @@
             </div>
             <p id="sessions-hint" class="sessions-hint"></p>
             <div id="sessions-list" class="sessions-list"></div>
+        </div>
+    </div>
+
+    <div id="pairing-modal" class="modal">
+        <div class="modal-content sessions-modal">
+            <div class="modal-header">
+                <h3>Pair a Device</h3>
+                <button id="close-pairing" class="close-btn">&times;</button>
+            </div>
+            <p class="sessions-hint">Open this panel on both devices, then enter the other device's address on one of them. Pair only if both screens show the same six words.</p>
+            <p id="pairing-address" class="sessions-hint"></p>
+            <p class="sessions-hint">
+                <span id="pairing-window"></span>
+                <button id="pairing-reopen" class="btn secondary" style="display: none;">Accept pairings again</button>
+            </p>
+            <form id="pairing-form" class="pairing-form">
+                <input id="pairing-target" class="pairing-input" placeholder="192.168.1.20:8080" autocomplete="off" required>
+                <button type="submit" class="btn primary">Pair</button>
+            </form>
+            <div id="pairing-waiting" class="sessions-list"></div>
+            <div id="pairing-recent" class="sessions-list"></div>
         </div>
     </div>
 
@@ -174,5 +191,6 @@
     <script src="static/js/transfers.js?v=1"></script>
     <script src="static/js/ui.js?v=1"></script>
     <script src="static/sessions.js?v=1"></script>
+    <script src="static/pairing.js?v=1"></script>
 </body>
 </html>

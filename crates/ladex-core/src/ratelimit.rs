@@ -1,16 +1,10 @@
-// Throttles guessing attempts against a secret (browser login, mesh handshake).
-//
-// Every attempt is counted when it starts and refunded only if it succeeds, so
-// a burst of parallel connections can't all slip through before the first
-// failure is recorded. After `free_attempts` unrefunded attempts an IP is
-// locked out for an exponentially growing time.
+//! Throttles guesses at a secret: attempts count until they succeed, and an IP that keeps failing is locked out for exponentially longer.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-// How long an IP's failure count is remembered once it stops trying.
 const FORGET_AFTER: Duration = Duration::from_secs(3600);
 // Bound on tracked IPs so a client rotating addresses can't grow the map forever.
 const MAX_TRACKED_IPS: usize = 4096;
@@ -19,13 +13,11 @@ pub struct Policy {
     pub free_attempts: u32,
     pub base_lockout: Duration,
     pub max_lockout: Duration,
-    // (max failures, window) across all IPs; stops an attacker rotating addresses.
+    /// (max failures, window) across all IPs; stops an attacker rotating addresses.
     pub global_cap: Option<(usize, Duration)>,
 }
 
-// Browser logins are the main target for guessing, so they also get a cap
-// across all addresses; mesh joins don't, because a second mesh with a
-// different passphrase on the same network would trip it for everyone.
+/// Browser logins also get a cap across all addresses; mesh joins don't, since another mesh would trip it for everyone.
 pub fn browser_login_policy() -> Policy {
     Policy {
         free_attempts: 5,
@@ -47,8 +39,7 @@ struct Inner {
     recent: VecDeque<Instant>,
 }
 
-// Proof that `begin` allowed an attempt; handing it back to `succeed` removes
-// exactly that attempt from the global count.
+/// Proof that `begin` allowed an attempt; `succeed` removes exactly that attempt from the global count.
 #[derive(Debug)]
 pub struct Ticket(Instant);
 
@@ -62,8 +53,7 @@ impl AttemptLimiter {
         Self { policy, inner: Mutex::new(Inner::default()) }
     }
 
-    // Registers an attempt. Err(retry_after) means the caller must reject it
-    // without checking the secret.
+    /// Registers an attempt; Err(retry_after) means reject it without checking the secret.
     pub fn begin(&self, ip: IpAddr) -> Result<Ticket, Duration> {
         let now = Instant::now();
         let mut inner = self.inner.lock().unwrap();
@@ -105,10 +95,7 @@ impl AttemptLimiter {
         Ok(Ticket(now))
     }
 
-    // Only for an attempt that proved knowledge of the secret: it clears the
-    // IP's record and un-counts the attempt globally. Rejections that aren't a
-    // wrong guess (e.g. a duplicate connection) must not call this, or a
-    // guesser could use them to reset their own lockout.
+    /// Only for an attempt that proved the secret; any other rejection must not call it, or a guesser could reset their lockout.
     pub fn succeed(&self, ip: IpAddr, ticket: Ticket) {
         let mut inner = self.inner.lock().unwrap();
         inner.by_ip.remove(&ip);
@@ -140,7 +127,6 @@ mod tests {
         for _ in 0..3 {
             assert!(limiter.begin(IP).is_ok());
         }
-        // The 4th attempt is still allowed but starts the lockout.
         assert!(limiter.begin(IP).is_ok());
         let retry = limiter.begin(IP).unwrap_err();
         assert!(retry > Duration::from_secs(9) && retry <= Duration::from_secs(10));
@@ -180,7 +166,6 @@ mod tests {
         let limiter = AttemptLimiter::new(policy(None));
         let mut lockouts = Vec::new();
         for _ in 0..8 {
-            // Force each attempt through by clearing the lock, keeping the count.
             if let Some(entry) = limiter.inner.lock().unwrap().by_ip.get_mut(&IP) {
                 entry.locked_until = None;
             }
@@ -200,7 +185,6 @@ mod tests {
         let limiter = AttemptLimiter::new(Policy { global_cap: None, ..browser_login_policy() });
         let mut total_lockout_secs = 0;
         for _ in 0..1000 {
-            // Wait out the lockout instantly, but add up how long it would have lasted.
             if let Some(entry) = limiter.inner.lock().unwrap().by_ip.get_mut(&IP) {
                 entry.locked_until = None;
             }

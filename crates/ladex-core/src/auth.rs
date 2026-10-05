@@ -1,5 +1,4 @@
-// Passphrase helpers for the browser login, and the TLS certificate
-// fingerprint the mesh handshake binds to (see handshake.rs).
+//! Passphrase helpers for the browser login, and the TLS fingerprint the mesh handshake binds to.
 
 use rand::Rng;
 use ring::digest;
@@ -12,15 +11,14 @@ pub fn tls_fingerprint(cert_der: &[u8]) -> Vec<u8> {
     digest::digest(&digest::SHA256, cert_der).as_ref().to_vec()
 }
 
-// Constant-time comparison for the browser login passphrase and session cookie.
-// Both sides are hashed first so the comparison doesn't leak the length either.
+/// Constant-time comparison of two secrets; both are hashed first so the length doesn't leak either.
 pub fn secrets_match(expected: &str, given: &str) -> bool {
     let expected = digest::digest(&digest::SHA256, expected.as_bytes());
     let given = digest::digest(&digest::SHA256, given.as_bytes());
     expected.as_ref().ct_eq(given.as_ref()).into()
 }
 
-// 12 characters from a 31-symbol alphabet (~59 bits), grouped for readability.
+/// 12 characters from a 31-symbol alphabet (~59 bits), grouped for readability.
 pub fn generate_passphrase() -> String {
     let mut rng = rand::thread_rng();
     let mut passphrase = String::with_capacity(14);

@@ -8,26 +8,16 @@ use clap::Parser;
 use std::time::Duration;
 
 use ladex_core::types::{self, *};
-use ladex_core::{auth, discovery, files_api, handlers, hlc, identity, mdns, mesh, persist, ratelimit, server, sessions, state, store, tls, transfer, trust, websocket, NodeState};
+use ladex_core::{auth, discovery, files_api, handlers, hlc, identity, mdns, mesh, pairing, persist, ratelimit, server, sessions, state, store, tls, transfer, trust, websocket, NodeState};
 use include_dir::{include_dir, Dir};
 
-// Embed the static directory at compile time
 static STATIC_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/../../static");
-
-// ---------------------------------------------------------------------------
-// Phase 1 — CLI arguments
-//
-// Defines the full CLI surface upfront.  Arguments used by later phases
-// (discovery, manual peers) are parsed now so the surface is stable and
-// callers don't need to change when those phases land.
-// ---------------------------------------------------------------------------
 
 #[derive(Parser)]
 #[command(name = "ladex")]
 #[command(about = "LADEX - Local Area Data Exchange", long_about = None)]
 struct Args {
-    /// Passphrase required both to log in from a browser and to join the mesh.
-    /// If omitted, anyone on the network can do either.
+    /// Passphrase for browser logins and for joining the mesh; without one, anyone on the network can do both.
     passphrase: Option<String>,
 
     /// Generate a random passphrase and print it.
@@ -38,37 +28,23 @@ struct Args {
     #[arg(long, default_value = "8080")]
     port: u16,
 
-    /// UDP multicast discovery port (Phase 2 — not yet used, parsed now for
-    /// CLI stability so callers don't break when Phase 2 lands).
+    /// UDP multicast discovery port.
     #[arg(long, default_value = "7878")]
     discovery_port: u16,
 
-    /// Disable UDP multicast discovery.
-    /// Useful when testing two nodes on localhost or on networks that block
-    /// multicast.  Combine with --peer to connect manually.
+    /// Disable UDP multicast discovery (combine with --peer to connect manually).
     #[arg(long)]
     no_discovery: bool,
 
-    /// Manually specify a peer node to connect to, bypassing multicast
-    /// discovery.  Format: "<ip>:<http_port>" e.g. "192.168.1.5:8080".
-    /// Repeatable: --peer 192.168.1.5:8080 --peer 192.168.1.6:8080
-    /// (Phase 3 — consumed by mesh::connect_to_peer)
+    /// Peer node to connect to directly, as <ip>:<http_port>; repeatable.
     #[arg(long = "peer")]
     manual_peers: Vec<String>,
 
-    /// BUG-03 fix: disable TLS and serve plain HTTP/WS, like before.
-    /// Remote (non-localhost) browser tabs lose showSaveFilePicker() and
-    /// crypto.subtle when this is set — large downloads fall back to
-    /// RAM-buffered Blobs and integrity checks can't run. Useful for
-    /// environments that reject self-signed certs, or quick localhost-only
-    /// testing.
+    /// Serve plain HTTP/WS instead of TLS; remote browsers then lose streamed downloads and integrity checks.
     #[arg(long)]
     no_tls: bool,
 
-    /// Port for a plain-HTTP listener on this machine only (127.0.0.1).
-    /// Browsers treat http://localhost as a secure context, so the person
-    /// running LADEX can use it without the self-signed certificate warning.
-    /// Defaults to the main port + 1. Not used with --no-tls.
+    /// Port for a plain-HTTP listener on 127.0.0.1, free of certificate warnings (default: main port + 1; unused with --no-tls).
     #[arg(long)]
     local_port: Option<u16>,
 
@@ -84,20 +60,13 @@ struct Args {
     #[arg(long, default_value = "20")]
     storage_limit_gb: u64,
 
-    /// Keep this node's private key in a file in the data directory instead
-    /// of the OS keychain.
+    /// Keep this node's private key in a file in the data directory instead of the OS keychain.
     #[arg(long)]
     no_keychain: bool,
 }
 
 
-// ---------------------------------------------------------------------------
-// Auth middleware
-// ---------------------------------------------------------------------------
-
-/// Resolves the browser's login session from its cookie. `None` on a node
-/// without a passphrase; otherwise an invalid or missing session is rejected,
-/// as a redirect to the login page, or as a 401 for API calls.
+/// Resolves the browser's login session; `None` without a passphrase, otherwise a missing session is rejected.
 fn with_session(state: NodeState, api: bool) -> impl Filter<Extract = (Option<sessions::SessionHandle>,), Error = warp::Rejection> + Clone {
     warp::cookie::optional("auth")
         .and(warp::any().map(move || state.clone()))
@@ -117,6 +86,10 @@ fn with_auth(state: NodeState) -> impl Filter<Extract = (), Error = warp::Reject
     with_session(state, false).map(|_| ()).untuple_one()
 }
 
+fn with_api_auth(state: NodeState) -> impl Filter<Extract = (), Error = warp::Rejection> + Clone {
+    with_session(state, true).map(|_| ()).untuple_one()
+}
+
 #[derive(Debug)]
 struct Unauthorized;
 impl warp::reject::Reject for Unauthorized {}
@@ -125,29 +98,13 @@ impl warp::reject::Reject for Unauthorized {}
 struct AuthenticationRequired;
 impl warp::reject::Reject for AuthenticationRequired {}
 
-// ---------------------------------------------------------------------------
-// BUG-06 fix: Cross-Site WebSocket Hijacking (CSWSH) protection.
-//
-// WebSocket handshakes are exempt from the Same-Origin Policy and from
-// warp's `cors()` filter (CORS only ever governs fetch/XHR) — a browser
-// will happily let any page open a raw WebSocket to any host:port on the
-// LAN. Without a check here, a malicious website the user merely has open
-// in another tab could connect straight to this server, and — since the
-// product's own "PIN is optional" design makes running with no PIN the
-// common case (`passphrase: None`, where `with_auth` allows
-// everything through) — freely ride the /ws protocol with no login at all,
-// or (with or without a PIN, since /mesh has its own, cookie-independent
-// auth) speak the raw mesh protocol on /mesh.
-// ---------------------------------------------------------------------------
+// WebSocket upgrades bypass the same-origin policy and CORS, so any web page could open one to this node; the Origin checks below stop that.
 
 #[derive(Debug)]
 struct InvalidOrigin;
 impl warp::reject::Reject for InvalidOrigin {}
 
-/// For /ws (browser-tab facing): the Origin header must name exactly this
-/// server's own host:port. Our own frontend always satisfies this — the
-/// browser sets Origin to the page's own origin automatically, and the
-/// page and the WebSocket it opens are served from the same host:port.
+/// For /ws: the Origin header must name this server's own host:port.
 fn require_same_origin() -> impl Filter<Extract = (), Error = warp::Rejection> + Clone {
     warp::header::optional::<String>("origin")
         .and(warp::header::optional::<String>("host"))
@@ -162,13 +119,7 @@ fn require_same_origin() -> impl Filter<Extract = (), Error = warp::Rejection> +
         .untuple_one()
 }
 
-/// For /mesh (node-to-node, not browser-facing): real mesh peers dial each
-/// other with tokio-tungstenite directly (mesh::connect_to_peer /
-/// tls::connect_wss) and never send an Origin header at all. A browser
-/// always sends one on any cross-origin request it initiates, WebSocket
-/// upgrades included — so rejecting any request that has one blocks every
-/// browser-based attempt to join the mesh while never touching genuine
-/// node-to-node traffic.
+/// For /mesh: nodes never send an Origin header and browsers always do, so any request with one is refused.
 fn reject_browser_origin() -> impl Filter<Extract = (), Error = warp::Rejection> + Clone {
     warp::header::optional::<String>("origin")
         .and_then(|origin: Option<String>| async move {
@@ -206,18 +157,12 @@ async fn serve_login_page() -> Result<Box<dyn warp::Reply>, warp::Rejection> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Entry point
-// ---------------------------------------------------------------------------
-
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();
 
-    // ── passphrase ───────────────────────────────────────────────────────
-    // One passphrase gates both the browser login and the mesh handshake.
     let passphrase: Option<String> = if args.secure {
         let generated = auth::generate_passphrase();
         println!("Generated passphrase: {generated}");
@@ -241,9 +186,6 @@ async fn main() {
         ),
     }
 
-    // ── node identity ────────────────────────────────────────────────────
-    // node_id identifies THIS machine on the mesh (not a browser tab). It is
-    // derived from the node's key, which is made on the first run.
     let data_dir = args.data_dir.clone().unwrap_or_else(|| tls::config_dir().join("files"));
     let (identity, key_location) = match identity::load_or_create(&data_dir, !args.no_keychain) {
         Ok(loaded) => loaded,
@@ -264,16 +206,8 @@ async fn main() {
 
     tracing::info!("Node ID: {node_id} (key kept in {key_location})");
 
-    // ── BUG-03 fix: TLS setup ────────────────────────────────────────────
-    // Must happen before `state` is built: connect_to_peer (dialed from the
-    // manual-peer, discovery, and reconnect-backoff call sites below) reads
-    // state.tls_client_config to decide whether to speak wss:// or ws://.
+    // Before `state` is built: dialing reads state.tls_client_config.
     let local_ips = tls::local_ipv4_addresses();
-    // BUG-11 fix: local_ips comes from if-addrs, which reads local interface
-    // configuration directly — no network I/O, no route to anywhere
-    // required, so it works with zero connectivity (the whole point of
-    // LADEX). get_local_ip()'s 8.8.8.8 route-table trick is kept only as a
-    // last-resort fallback for the rare case if-addrs finds nothing.
     let primary_local_ip: Option<IpAddr> = local_ips.first().copied().or_else(get_local_ip);
 
     let mut tls_fingerprint: Vec<u8> = Vec::new();
@@ -282,7 +216,6 @@ async fn main() {
         None
     } else {
         tls::install_crypto_provider();
-        // Every name this node is reachable by, including the mDNS name it advertises.
         let mut names: Vec<String> = vec!["localhost".to_string(), "127.0.0.1".to_string(), "ladex.local".to_string()];
         names.extend(local_ips.iter().map(IpAddr::to_string));
         match tls::prepare_server_identity(&names) {
@@ -304,9 +237,7 @@ async fn main() {
         );
     }
 
-    // Browser logins are the main target for guessing, so they also get a cap
-    // across all addresses; mesh joins don't, because a second mesh with a
-    // different passphrase on the same network would trip it for everyone.
+    // Mesh joins get no global cap: another mesh on the same network would trip it for everyone.
     let auth_limiter = Arc::new(ratelimit::AttemptLimiter::new(ratelimit::browser_login_policy()));
     let mesh_limiter = Arc::new(ratelimit::AttemptLimiter::new(ratelimit::Policy {
         free_attempts: 5,
@@ -332,6 +263,7 @@ async fn main() {
         node_id:              node_id.clone(),
         identity:             Arc::new(identity),
         trust,
+        pairings:             Arc::new(pairing::Pairings::new()),
         mesh_peers:           Arc::new(RwLock::new(HashMap::new())),
         passphrase,
         tls_fingerprint,
@@ -363,9 +295,6 @@ async fn main() {
     }
     let saver = persist::spawn_saver(state.clone(), &data_dir, saved.as_ref());
 
-    // ── Phase 3: connect to manually-specified peers ─────────────────────
-    // These are processed before the HTTP server starts so the mesh is
-    // partially formed by the time the browser tab connects.
     if !args.manual_peers.is_empty() {
         for peer_addr_str in &args.manual_peers {
             match peer_addr_str.parse::<SocketAddr>() {
@@ -373,7 +302,6 @@ async fn main() {
                     let state_clone = state.clone();
                     let addr_clone = addr;
                     tokio::spawn(async move {
-                        // Small delay so our own HTTP server is up first.
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                         if let Err(e) = mesh::connect_to_peer(addr_clone.ip(), addr_clone.port(), state_clone).await {
                             tracing::warn!("Manual peer connect to {addr_clone} failed: {e}");
@@ -391,10 +319,6 @@ async fn main() {
         persist::redial(&state, saved.peers.clone());
     }
 
-    // ── Phase 2: UDP multicast discovery ────────────────────────────────
-    // Start announce + listen loops unless --no-discovery was passed.
-    // Discovery is skipped gracefully (with a warning) if the multicast
-    // socket fails to bind (e.g. on systems without a viable NIC at startup).
     if !args.no_discovery {
         let announce_packet = discovery::build_announce(&state, args.port);
         let discovery_port  = args.discovery_port;
@@ -410,13 +334,11 @@ async fn main() {
                     let svc = std::sync::Arc::new(svc);
                     let svc_listen = svc.clone();
                     let state_listen = state_disc.clone();
-                    // Announce loop
                     tokio::spawn(async move {
                         if let Err(e) = svc.announce_loop(announce_packet).await {
                             tracing::error!("Discovery announce loop error: {e}");
                         }
                     });
-                    // Listen loop
                     if let Err(e) = svc_listen.listen_loop(state_listen).await {
                         tracing::error!("Discovery listen loop error: {e}");
                     }
@@ -427,10 +349,6 @@ async fn main() {
         tracing::info!("Discovery: disabled via --no-discovery");
     }
 
-    // ── Phase 4 / BUG-08 fix: periodic tombstone pruner ─────────────────
-    // Cleans up old tombstoned file entries from the in-memory catalog, and
-    // (BUG-08) old peer-departure tombstones, so neither grows unboundedly.
-    // Also drops expired login sessions.
     {
         let state_prune = state.clone();
         tokio::spawn(async move {
@@ -460,9 +378,6 @@ async fn main() {
         });
     }
 
-    // ── Phase 10 §10.4: AP isolation diagnostic ──────────────────────────
-    // If discovery is enabled but we still have zero mesh peers after 10s,
-    // emit a structured warning so the browser tab can surface it.
     if !args.no_discovery {
         let state_diag = state.clone();
         tokio::spawn(async move {
@@ -475,7 +390,6 @@ async fn main() {
                      is disabled on your router, and UDP port 7878 / TCP port 8080 are not \
                      blocked by a firewall."
                 );
-                // Push a diagnostic ServerMessage to all connected browser tabs
                 crate::websocket::broadcast_all(
                     &state_diag,
                     ServerMessage::NoPeersWarning {
@@ -489,9 +403,6 @@ async fn main() {
         });
     }
 
-    // ── Routes ───────────────────────────────────────────────────────────
-
-    // Login page — not protected
     let app_state_login = state.clone();
     let login_route = warp::path("login")
         .and(warp::get())
@@ -505,7 +416,6 @@ async fn main() {
             }
         });
 
-    // Auth endpoint — not protected
     let app_state_auth = state.clone();
     let auth_route = warp::path("auth")
         .and(warp::post())
@@ -516,7 +426,6 @@ async fn main() {
         .and(warp::any().map(move || app_state_auth.clone()))
         .and_then(handlers::authenticate);
 
-    // Logout — ends only the caller's own session
     let app_state_logout = state.clone();
     let logout_route = warp::path("logout")
         .and(warp::post())
@@ -526,7 +435,6 @@ async fn main() {
         .and(warp::any().map(move || app_state_logout.clone()))
         .and_then(handlers::logout);
 
-    // Per-device sessions: list them, and sign a device out.
     let app_state_sessions = state.clone();
     let sessions_list_route = warp::path!("api" / "sessions")
         .and(warp::get())
@@ -544,7 +452,43 @@ async fn main() {
         .and(warp::any().map(move || app_state_revoke.clone()))
         .and_then(handlers::revoke_session);
 
-    // Auth-status check — not protected
+    let pairing_routes = {
+        let request = || {
+            with_api_auth(state.clone())
+                .and(warp::ext::optional::<server::PeerAddr>())
+                .and(warp::any().map({
+                    let state = state.clone();
+                    move || state.clone()
+                }))
+        };
+        let status = warp::path!("api" / "pairing").and(warp::get()).and(request()).and_then(handlers::pairing_status);
+        let open = warp::path!("api" / "pairing" / "open")
+            .and(warp::post())
+            .and(require_same_origin())
+            .and(request())
+            .and_then(handlers::open_pairing);
+        let close = warp::path!("api" / "pairing" / "close")
+            .and(warp::post())
+            .and(require_same_origin())
+            .and(request())
+            .and_then(handlers::close_pairing);
+        let dial = warp::path!("api" / "pairing" / "dial")
+            .and(warp::post())
+            .and(require_same_origin())
+            .and(warp::body::content_length_limit(1024))
+            .and(warp::body::json())
+            .and(request())
+            .and_then(handlers::dial_pairing);
+        let answer = warp::path!("api" / "pairing" / u64)
+            .and(warp::post())
+            .and(require_same_origin())
+            .and(warp::body::content_length_limit(1024))
+            .and(warp::body::json())
+            .and(request())
+            .and_then(handlers::answer_pairing);
+        status.or(open).or(close).or(dial).or(answer)
+    };
+
     let auth_status_route = warp::path("auth-status")
         .and(warp::get())
         .and(warp::cookie::optional("auth"))
@@ -555,7 +499,6 @@ async fn main() {
         }))
         .and_then(handlers::check_auth_status);
 
-    // Static assets — not protected
     let static_route = warp::path("static")
         .and(warp::path::tail())
         .and_then(|tail: warp::filters::path::Tail| async move {
@@ -574,7 +517,6 @@ async fn main() {
             }
         });
 
-    // Browsers request /favicon.ico directly regardless of the <link rel="icon"> tag
     let favicon_route = warp::path("favicon.ico")
         .and(warp::get())
         .and_then(|| async move {
@@ -588,13 +530,7 @@ async fn main() {
             }
         });
 
-    // Phase 3 — Mesh WebSocket endpoint /mesh (node-to-node, not browser-facing).
-    // Separate from /ws intentionally: mesh peers and browser tabs have
-    // different message protocols and different lifecycle semantics.
     let mesh_state = state.clone();
-    // The peer's address comes from server.rs (warp has no remote-address
-    // filter of its own) and keys the handshake rate limiter. The peer's
-    // dialable ip/http_port still come from its self-reported Hello (BUG-10).
     let mesh_route = warp::path("mesh")
         .and(reject_browser_origin())
         .and(warp::ws())
@@ -602,7 +538,6 @@ async fn main() {
         .and(warp::any().map(move || mesh_state.clone()))
         .and_then(mesh::mesh_ws_handler);
 
-    // Browser-tab WebSocket /ws — protected
     let app_state_ws = state.clone();
     let websocket_route = warp::path("ws")
         .and(with_session(state.clone(), false))
@@ -612,7 +547,6 @@ async fn main() {
         .and(warp::any().map(move || app_state_ws.clone()))
         .and_then(websocket::websocket_handler);
 
-    // Root — protected
     let index = warp::path::end()
         .and(with_auth(state.clone()))
         .and_then(|| async move {
@@ -635,13 +569,13 @@ async fn main() {
         .allow_headers(vec!["content-type"])
         .allow_methods(vec!["GET", "POST", "PUT", "DELETE"]);
 
-    // Important: more specific routes first; unprotected before protected.
-    // /mesh must come before /ws so the path pattern doesn't shadow it.
+    // More specific routes first; /mesh must come before /ws.
     let routes = login_route
         .or(auth_route)
         .or(logout_route)
         .or(sessions_list_route)
         .or(sessions_revoke_route)
+        .or(pairing_routes)
         .or(auth_status_route)
         .or(static_route)
         .or(favicon_route)
@@ -654,19 +588,11 @@ async fn main() {
     let local_ip = primary_local_ip.map(|ip| ip.to_string())
         .unwrap_or_else(|| "YOUR_IP".to_string());
 
-    // ── Phase 10 §10.5: graceful shutdown ────────────────────────────────
-    // Race the server against a SIGTERM/SIGINT signal. On receiving a
-    // signal, broadcast Goodbye to all peers before exiting.
     let state_shutdown = state.clone();
     let tls_enabled = tls_server_config.is_some();
 
-    // F2: advertise ladex.local alongside the IP-based URLs above — a
-    // memorable alternative, not a replacement, since .local resolution
-    // isn't universally supported.
     let mdns_handle = mdns::advertise(&local_ips, args.port, tls_enabled);
 
-    // The host's own browser can skip the certificate warning by using plain
-    // HTTP on loopback: browsers treat http://localhost as a secure context.
     let local_http_port: Option<u16> = if tls_enabled {
         Some(args.local_port.unwrap_or(if args.port == u16::MAX { args.port - 1 } else { args.port + 1 }))
     } else {
@@ -739,12 +665,7 @@ async fn main() {
     }
 }
 
-/// BUG-11 fix: last-resort fallback only — see call site. Note this doesn't
-/// actually require internet access despite the 8.8.8.8 address: UDP
-/// `connect()` just asks the OS to pick a source address via the routing
-/// table, it never sends a packet. It only fails with no route at all
-/// (e.g. no default gateway), which `local_ipv4_addresses()` above doesn't
-/// depend on in the first place.
+/// Last-resort guess at the LAN address from the routing table; sends no packet.
 fn get_local_ip() -> Option<IpAddr> {
     use std::net::UdpSocket;
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
@@ -752,7 +673,6 @@ fn get_local_ip() -> Option<IpAddr> {
     socket.local_addr().ok().map(|addr| addr.ip())
 }
 
-// F1: scan the URL from a phone instead of typing it in
 fn print_qr_code(url: &str) {
     use qrcode::{render::unicode, QrCode};
     match QrCode::new(url) {

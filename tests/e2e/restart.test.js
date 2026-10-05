@@ -1,5 +1,4 @@
-// What a node remembers across a restart. Needs a built binary (cargo build; override with LADEX_BIN)
-// and Node 22+. Run: node tests/e2e/restart.test.js
+// What a node remembers across a restart; needs `cargo build` (or LADEX_BIN) and Node 22+. Run: node tests/e2e/restart.test.js
 const { spawn } = require('node:child_process');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
@@ -79,7 +78,6 @@ const check = (name, ok, detail = '') => { console.log(`${ok ? 'PASS' : 'FAIL'} 
     await sleep(400);
     c.ws.close();
 
-    // ---- graceful stop: SIGINT flushes the saved state at once
     await stop('SIGINT');
     start(); await up();
     check('the same session cookie still works after a restart', (await fetch(`http://${BASE}/auth-status`, { headers: { Cookie: `auth=${token}` } })).ok);
@@ -103,7 +101,6 @@ const check = (name, ok, detail = '') => { console.log(`${ok ? 'PASS' : 'FAIL'} 
     check('the original uploader session can still unshare after a restart', !!del);
     d.ws.close();
 
-    // ---- hard kill: nothing needs a clean shutdown for the files and identity
     await sleep(100);
     const hardJoin = await join(token, 'peer_one');
     check('upload after a restart accepted', (await upload(token, 'peer_one', 'file_hard', gone, 'hard.bin')) === 201);
@@ -118,7 +115,6 @@ const check = (name, ok, detail = '') => { console.log(`${ok ? 'PASS' : 'FAIL'} 
     check('files survive a hard kill', !!hardList);
     e.ws.close();
 
-    // ---- a different passphrase must not honour old logins
     await stop('SIGINT');
     start('another-passphrase-entirely'); await up();
     const old = await fetch(`http://${BASE}/auth-status`, { headers: { Cookie: `auth=${token}` } });

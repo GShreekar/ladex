@@ -1,7 +1,5 @@
-// Real nodes over a bad network: each node runs in its own Linux network namespace,
-// joined to a bridge by a veth pair, with tc netem adding loss, delay and reordering.
-// Needs root, iproute2, the sch_netem kernel module, a built binary (cargo build;
-// override with LADEX_BIN) and Node 22+. Run: sudo "$(which node)" tests/netem/netem.test.js
+// Real nodes over a bad network (network namespaces + tc netem); needs root, iproute2, sch_netem, `cargo build` and Node 22+.
+// Run: sudo "$(which node)" tests/netem/netem.test.js
 const { spawn, execSync } = require('node:child_process');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
@@ -13,10 +11,8 @@ const ROOT = process.env.LADEX_NETEM_DIR || fs.mkdtempSync(path.join(os.tmpdir()
 const PASS = 'correct-horse-battery';
 const PORT = 9400;
 const BRIDGE = 'ladexbr0';
-// The plan's real-network profile: a few percent loss and 50 ms of jitter.
 const LOSSY = 'delay 50ms 20ms distribution normal loss 3% reorder 25% 50%';
 const CUT = 'loss 100%';
-// Longer than the mesh heartbeat timeout (15 s), so the nodes notice the cut.
 const PARTITION_MS = 25000;
 
 const nodes = [1, 2, 3].map((i) => ({
@@ -54,7 +50,6 @@ function tearDownNetwork() {
     shQuiet(`iptables -D FORWARD -i ${BRIDGE} -o ${BRIDGE} -j ACCEPT`);
 }
 
-// Applies to everything the node sends, so a cut node can neither send nor answer.
 const netem = (n, spec) => sh(`tc -n ${n.ns} qdisc replace dev eth0 root netem ${spec}`);
 
 function start(n, peers) {
@@ -107,7 +102,6 @@ async function download(n, id) {
     return r.ok ? Buffer.from(await r.arrayBuffer()) : null;
 }
 
-// What a freshly opened browser tab on this node would show.
 async function snapshot(n) {
     let c;
     try {
@@ -133,7 +127,6 @@ async function waitUntil(n, pred, ms) {
     return false;
 }
 
-// The end of each node's log, so a CI failure shows its cause in the job output.
 function printLogTails() {
     for (const n of nodes) {
         const log = path.join(n.dir, 'node.log');
@@ -158,11 +151,9 @@ const check = (name, ok, detail = '') => { console.log(`${ok ? 'PASS' : 'FAIL'} 
     start(three, [one, two]); await up(three);
     for (const n of nodes) await login(n);
 
-    // ---- a lossy, jittery, reordering network
     const fileA = crypto.randomBytes(3 * 1024 * 1024 + 321);
     const uploader = await join(one, 'uploader');
     const chatter = await join(two, 'chatter');
-    // Uploads are refused until the node has processed the device's join.
     await uploader.wait((m) => m.type === 'file_list_update');
     await chatter.wait((m) => m.type === 'file_list_update');
     check('upload over a lossy network accepted', (await upload(one, 'uploader', 'file_a', fileA)) === 201);
@@ -174,7 +165,6 @@ const check = (name, ok, detail = '') => { console.log(`${ok ? 'PASS' : 'FAIL'} 
     }
     check('node3 downloads a file held by node1 intact', (await download(three, 'file_a'))?.equals(fileA));
 
-    // ---- node3 cut off, while the others carry on
     netem(three, CUT);
     const fileB = crypto.randomBytes(1024 * 1024 + 99);
     check('upload during the partition accepted', (await upload(one, 'uploader', 'file_b', fileB)) === 201);
@@ -184,7 +174,6 @@ const check = (name, ok, detail = '') => { console.log(`${ok ? 'PASS' : 'FAIL'} 
         await waitUntil(two, (s) => s.files.includes('file_b') && !s.files.includes('file_c'), 30000));
     await sleep(PARTITION_MS);
 
-    // ---- healed: node3 must catch up on everything it missed
     netem(three, LOSSY);
     const caughtUp = await waitUntil(three, (s) => s.files.includes('file_b') && !s.files.includes('file_c')
         && s.messages.includes('said during the partition'), 120000);

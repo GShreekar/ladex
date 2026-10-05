@@ -1,16 +1,4 @@
-// Moving file chunks between nodes.
-//
-// A node that is asked for a file it doesn't have starts a `Download`: it
-// fetches the file's manifest (the chunk hashes) from a holder, then requests
-// chunks from every connected node that has them, in parallel. Each chunk is
-// verified against the manifest before it is written, so sources can be mixed
-// freely and a node that sends bad data is dropped for that file. A node
-// starts serving the chunks it has as soon as it has them, not only once the
-// whole file is in, so a download speeds up the more nodes join in.
-//
-// Chunks travel as binary frames over the authenticated mesh connection. The
-// serving side sends through a small bounded queue, so a slow link slows the
-// reader down instead of piling chunks up in memory.
+//! Moves file chunks between nodes, verified against the manifest and fetched from every holder in parallel.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -26,12 +14,8 @@ use crate::types::{FileMetadata, NodeId};
 use crate::validate;
 use crate::NodeState;
 
-// ── Wire format ──────────────────────────────────────────────────────────
-
 const FRAME_CHUNK: u8 = 1;
-// Most chunks one GetChunks may ask for.
 pub const MAX_REQUEST_CHUNKS: usize = 16;
-// Requests a node will be serving to one peer at a time.
 pub const SERVE_SLOTS: usize = 8;
 
 pub fn encode_chunk_frame(file_id: &str, index: u32, data: &[u8]) -> Vec<u8> {
@@ -54,17 +38,12 @@ pub fn decode_chunk_frame(frame: &[u8]) -> Option<(&str, u32, &[u8])> {
     Some((id, index, &frame[6 + id_len..]))
 }
 
-// ── Scheduling ───────────────────────────────────────────────────────────
-
-// Chunks asked for ahead of a reader that is streaming the file.
 const READAHEAD: u32 = 16;
-// Only this many missing chunks are weighed against each other (rarest first),
-// to keep planning cheap for very large files.
+// Only this many missing chunks are weighed against each other, to keep planning cheap for huge files.
 const PLANNING_WINDOW: usize = 4096;
 const ENDGAME_CHUNKS: u32 = 4;
 const MIN_DEPTH: usize = 4;
 const MAX_DEPTH: usize = 32;
-// Aim to keep about this much data in flight per source.
 const TARGET_IN_FLIGHT_SECS: f64 = 0.5;
 
 pub struct Source {
@@ -79,8 +58,6 @@ impl Source {
         self.has.as_ref().is_none_or(|map| map.get(index))
     }
 
-    // How many chunks to keep outstanding with this source: enough to cover
-    // its latency at its measured speed, within sane bounds.
     pub fn depth(&self) -> usize {
         if self.speed_bps <= 0.0 {
             return MIN_DEPTH;
@@ -89,9 +66,7 @@ impl Source {
     }
 }
 
-// The missing chunks worth asking for, most urgent first: those just ahead of
-// each reader streaming the file, then the rest rarest-first (so chunks only
-// few nodes have get copied early), by position among equals.
+// Missing chunks, most urgent first: those just ahead of a streaming reader, then rarest first.
 pub fn priority_order(have: &Bitmap, readers: &[u32], sources: &[Source]) -> Vec<u32> {
     let mut order = Vec::new();
     let mut seen = HashSet::new();
@@ -116,10 +91,7 @@ pub fn priority_order(have: &Bitmap, readers: &[u32], sources: &[Source]) -> Vec
     order
 }
 
-// Decides which chunk to ask which source for. `in_flight` maps each chunk
-// already requested to the sources it was requested from. A chunk is only
-// requested twice in endgame, when the few chunks left should come from
-// whichever source answers first rather than wait on a slow one.
+// A chunk is requested twice only in endgame, so the last few come from whichever source answers first.
 pub fn plan(want: &[u32], in_flight: &HashMap<u32, Vec<usize>>, sources: &[Source], endgame: bool) -> Vec<(usize, u32)> {
     let mut room: Vec<usize> = sources.iter().map(|s| s.depth().saturating_sub(s.in_flight)).collect();
     let mut assigned = vec![0usize; sources.len()];
@@ -145,17 +117,12 @@ pub fn plan(want: &[u32], in_flight: &HashMap<u32, Vec<usize>>, sources: &[Sourc
     requests
 }
 
-// ── Downloads ────────────────────────────────────────────────────────────
-
 pub struct Tuning {
     pub request_timeout: Duration,
-    // How long to wait for a file's manifest before asking again.
     pub manifest_retry: Duration,
     pub tick: Duration,
-    // A download nobody is waiting for stops after this long without progress.
     pub idle_exit: Duration,
     pub map_interval: Duration,
-    // A download being streamed to a client gives up if no chunk arrives for this long.
     pub stall_timeout: Duration,
 }
 
@@ -182,15 +149,12 @@ enum Event {
 pub struct Download {
     pub blob: Arc<Blob>,
     events: mpsc::Sender<Event>,
-    // Where each stream that is reading this file currently is (chunk index).
     readers: Mutex<HashMap<u64, u32>>,
     next_reader: AtomicU64,
-    // What partial holders (nodes still fetching the file themselves) have.
     partial: Mutex<HashMap<NodeId, Bitmap>>,
     cancelled: AtomicBool,
 }
 
-// While held, the download prioritises chunks at the reader's position.
 pub struct Reader {
     download: Arc<Download>,
     id: u64,
@@ -263,8 +227,6 @@ impl std::fmt::Display for FetchError {
     }
 }
 
-// What a node does when asked for a file: serve it from disk if complete,
-// otherwise start (or join) fetching it from the other nodes.
 pub async fn ensure_file(state: &NodeState, id: &str) -> Result<Arc<Blob>, FetchError> {
     if let Some(blob) = state.store.get(id) {
         if blob.is_complete() {
@@ -303,7 +265,7 @@ pub async fn ensure_file(state: &NodeState, id: &str) -> Result<Arc<Blob>, Fetch
     {
         let mut downloads = state.transfers.downloads.lock().unwrap();
         if downloads.contains_key(id) {
-            return Ok(blob); // another request started it meanwhile
+            return Ok(blob);
         }
         downloads.insert(id.to_string(), download.clone());
     }
@@ -316,7 +278,6 @@ async fn someone_online_has(state: &NodeState, entry: &FileMetadata) -> bool {
     entry.holder_nodes().any(|node| peers.contains_key(node))
 }
 
-// Registers a stream reading `blob`, so its chunks are fetched first.
 pub fn open_reader(state: &NodeState, blob: &Blob) -> Option<Reader> {
     let download = state.transfers.get(blob.id())?;
     let id = download.next_reader.fetch_add(1, Ordering::Relaxed);
@@ -331,16 +292,12 @@ pub fn cancel(state: &NodeState, id: &str) {
     }
 }
 
-// Something about who can serve what changed (a node connected or left, a
-// catalog update arrived): let downloads re-plan now instead of at the next tick.
 pub fn sources_changed(state: &NodeState) {
     let downloads: Vec<Arc<Download>> = state.transfers.downloads.lock().unwrap().values().cloned().collect();
     for download in downloads {
         let _ = download.events.try_send(Event::Wake);
     }
 }
-
-// ── Input from the mesh ──────────────────────────────────────────────────
 
 pub fn on_binary_frame(state: &NodeState, from: &NodeId, frame: &[u8]) {
     let Some((file_id, index, data)) = decode_chunk_frame(frame) else { return };
@@ -373,8 +330,6 @@ pub fn on_chunk_map(state: &NodeState, from: &NodeId, file_id: &str, chunks: u32
     }
 }
 
-// ── Serving other nodes ──────────────────────────────────────────────────
-
 pub async fn serve_manifest(state: &NodeState, to: &NodeId, file_id: &str) {
     let Some(blob) = state.store.get(file_id) else { return };
     let Some(hashes) = blob.hashes() else { return };
@@ -388,8 +343,7 @@ pub async fn serve_manifest(state: &NodeState, to: &NodeId, file_id: &str) {
     }
 }
 
-// Sends the requested chunks we have. Each frame goes through the peer's
-// bounded queue, so this waits whenever the link is behind.
+// Each frame goes through the peer's bounded queue, so this waits whenever the link is behind.
 pub async fn serve_chunks(state: &NodeState, to: &NodeId, file_id: &str, indices: Vec<u32>) {
     if !validate::is_valid_id(file_id) || indices.len() > MAX_REQUEST_CHUNKS {
         return;
@@ -417,7 +371,7 @@ pub async fn serve_chunks(state: &NodeState, to: &NodeId, file_id: &str, indices
             match blob.read_chunk_verified(index).await {
                 Ok(bytes) => {
                     if data.send(encode_chunk_frame(&file_id, index, &bytes)).await.is_err() {
-                        return; // the peer went away
+                        return;
                     }
                 }
                 Err(_) => {
@@ -427,8 +381,6 @@ pub async fn serve_chunks(state: &NodeState, to: &NodeId, file_id: &str, indices
         }
     });
 }
-
-// ── The download task ────────────────────────────────────────────────────
 
 struct Peer {
     in_flight: HashMap<u32, Instant>,
@@ -466,7 +418,6 @@ async fn run(state: NodeState, download: Arc<Download>, mut events: mpsc::Receiv
     let mut last_map: (Instant, u32) = (Instant::now(), 0);
 
     loop {
-        // Wait for something to happen, then handle everything that is ready.
         let first = tokio::select! {
             event = events.recv() => event,
             _ = ticker.tick() => None,
@@ -484,7 +435,7 @@ async fn run(state: NodeState, download: Arc<Download>, mut events: mpsc::Receiv
                     let len = data.len();
                     let peer = peers.entry(from.clone()).or_insert_with(Peer::new);
                     if peer.in_flight.remove(&index).is_none() {
-                        continue; // not something we asked this node for
+                        continue;
                     }
                     match blob.write_chunk_verified(index, data).await {
                         Ok(()) => {
@@ -526,7 +477,6 @@ async fn run(state: NodeState, download: Arc<Download>, mut events: mpsc::Receiv
             return finish(&state, &id, &download);
         }
 
-        // The file is in: check it, keep it, and announce that we can serve it.
         if blob.bitmap().is_full() && blob.has_manifest() {
             match blob.seal() {
                 Ok(_) => {
@@ -539,7 +489,6 @@ async fn run(state: NodeState, download: Arc<Download>, mut events: mpsc::Receiv
             return finish(&state, &id, &download);
         }
 
-        // Who we could ask: connected nodes that hold the whole file, and ones still fetching it that have chunks.
         let connected: HashMap<NodeId, mpsc::UnboundedSender<MeshMessage>> =
             state.mesh_peers.read().await.iter().map(|(n, h)| (n.clone(), h.sender.clone())).collect();
         let holders: HashSet<NodeId> = {
@@ -557,7 +506,6 @@ async fn run(state: NodeState, download: Arc<Download>, mut events: mpsc::Receiv
                 }
             }
         } else {
-            // Requests that went unanswered: the chunk goes back to the pool.
             for peer in peers.values_mut() {
                 let before = peer.in_flight.len();
                 peer.in_flight.retain(|_, asked| asked.elapsed() < tuning.request_timeout);
@@ -611,7 +559,6 @@ async fn run(state: NodeState, download: Arc<Download>, mut events: mpsc::Receiv
             }
         }
 
-        // Tell the other nodes what we have so far, so they can fetch from us too.
         let have = blob.bitmap();
         if have.count() != last_map.1 && last_map.0.elapsed() >= tuning.map_interval {
             last_map = (Instant::now(), have.count());
@@ -620,7 +567,6 @@ async fn run(state: NodeState, download: Arc<Download>, mut events: mpsc::Receiv
             }
         }
 
-        // Nobody is waiting for this and nothing has moved for a long time.
         if download.readers.lock().unwrap().is_empty() && last_progress.elapsed() > tuning.idle_exit {
             tracing::info!("Transfer: giving up on {id} for now (no progress)");
             return finish(&state, &id, &download);
@@ -646,8 +592,6 @@ mod tests {
     fn a_download_gives_up_after_sixty_seconds_without_progress() {
         assert_eq!(Tuning::default().stall_timeout, Duration::from_secs(60));
     }
-
-    // ── Scheduling ───────────────────────────────────────────────────────
 
     fn source(node: &str, has: Option<&[u32]>, len: u32, in_flight: usize, speed: f64) -> Source {
         let has = has.map(|chunks| {
@@ -684,7 +628,6 @@ mod tests {
         let sources = [source("a", None, 100, 0, 0.0), source("b", Some(&[50, 51, 52]), 100, 0, 0.0)];
         let order = priority_order(&have(100, &[]), &[40], &sources);
         assert_eq!(&order[..16], (40..56).collect::<Vec<u32>>().as_slice(), "the reader's window first");
-        // Of the rest, chunks only `a` has (1 copy) precede those both have (2 copies); 50..=52 are in the window.
         assert_eq!(order[16], 0);
         assert_eq!(order.len(), 100);
     }
@@ -692,7 +635,6 @@ mod tests {
     #[test]
     fn rare_chunks_beat_common_ones_when_nobody_is_reading() {
         let sources = [source("a", Some(&[0, 1, 2, 3]), 4, 0, 0.0), source("b", Some(&[0, 1, 2]), 4, 0, 0.0), source("c", Some(&[0, 1]), 4, 0, 0.0)];
-        // chunk 3: one copy, chunk 2: two, chunks 0 and 1: three.
         assert_eq!(priority_order(&have(4, &[]), &[], &sources), [3, 2, 0, 1]);
     }
 
@@ -745,7 +687,6 @@ mod tests {
         let normal = plan(&[3], &in_flight, &sources, false);
         assert!(normal.is_empty());
 
-        // In the endgame a second source is asked too, but never the one already asked.
         let endgame = plan(&[3], &in_flight, &sources, true);
         assert_eq!(endgame, [(1, 3)]);
     }
@@ -758,17 +699,12 @@ mod tests {
         assert_eq!((to_a, planned.len() - to_a), (4, 4));
     }
 
-    // ── End to end between in-process nodes ──────────────────────────────
-
     type Tamper = Arc<dyn Fn(&mut Vec<u8>) -> bool + Send + Sync>;
 
     fn data_pattern(len: usize, seed: u8) -> Vec<u8> {
         (0..len).map(|i| ((i * 7) as u8).wrapping_add(seed).wrapping_add((i >> 16) as u8)).collect()
     }
 
-    // One direction of a connection: what `from` sends to `to`. Control
-    // messages go through the real `dispatch`, chunk frames through the real
-    // frame handler. `tamper` may change a frame or drop it (by returning false).
     async fn connect_one_way(from: &NodeState, to: &NodeState, tamper: Option<Tamper>) {
         let (control_tx, mut control_rx) = mpsc::unbounded_channel::<MeshMessage>();
         let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(8);
@@ -805,13 +741,11 @@ mod tests {
         });
     }
 
-    // Connects two nodes as mesh peers without sockets; `tamper_a_to_b` affects chunk frames a sends to b.
     async fn link(a: &NodeState, b: &NodeState, tamper_a_to_b: Option<Tamper>) {
         connect_one_way(a, b, tamper_a_to_b).await;
         connect_one_way(b, a, None).await;
     }
 
-    // Puts a finished file on `node` and lists it in every given node's catalog.
     async fn share(node: &NodeState, others: &[&NodeState], id: &str, content: &[u8]) -> FileMetadata {
         let blob = node.store.create(id, content.len() as u64).unwrap();
         for index in 0..blob.chunk_count() {
@@ -866,7 +800,6 @@ mod tests {
         false
     }
 
-    // A node lists itself as a holder just after the file completes, not at the same instant.
     async fn lists_itself_as_holder(node: &NodeState, id: &str) -> bool {
         for _ in 0..100 {
             if node.files.read().await.get(id).is_some_and(|f| f.is_held_by(&node.node_id)) {
@@ -893,7 +826,6 @@ mod tests {
 
         assert_eq!(read_all(&blob).await, content);
         assert_eq!(blob.manifest_root(), a.store.get("file_x").unwrap().manifest_root());
-        // B now lists itself as a holder, so others can fetch from it.
         assert!(lists_itself_as_holder(&b, "file_x").await);
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(b.transfers.active(), 0);
@@ -913,7 +845,6 @@ mod tests {
         let [a, b] = nodes(["node_a", "node_b"]);
         assert_eq!(ensure_file(&a, "file_nope").await.err(), Some(FetchError::NotFound));
 
-        // Listed, but the only holder isn't connected.
         share(&a, &[&b], "file_x", &data_pattern(1000, 2)).await;
         assert_eq!(ensure_file(&b, "file_x").await.err(), Some(FetchError::NoOneHasIt));
         assert!(b.store.get("file_x").is_none(), "nothing is created for a file that can't be fetched");
@@ -935,7 +866,6 @@ mod tests {
         let content = data_pattern(24 * CHUNK_SIZE as usize, 3);
         share(&a, &[&b, &c], "file_x", &content).await;
         share(&c, &[&a, &b], "file_x", &content).await;
-        // Both hold it: merge the two catalog entries' holders as the mesh would.
         for n in [&a, &b, &c] {
             let mut files = n.files.write().await;
             let entry = files.get_mut("file_x").unwrap();
@@ -948,7 +878,6 @@ mod tests {
         assert_eq!(read_all(&blob).await, content);
         let (n_a, n_c) = (from_a.load(Ordering::Relaxed), from_c.load(Ordering::Relaxed));
         assert!(n_a > 0 && n_c > 0, "both sources should have served chunks (a: {n_a}, c: {n_c})");
-        // Each chunk is fetched once, plus a few duplicates in the endgame.
         assert!((24..=24 + ENDGAME_CHUNKS as usize).contains(&(n_a + n_c)), "frames: {}", n_a + n_c);
     }
 
@@ -961,7 +890,7 @@ mod tests {
             let corrupted = corrupted.clone();
             Arc::new(move |frame| {
                 let last = frame.len() - 1;
-                frame[last] ^= 0xff; // corrupt the payload, keep the header valid
+                frame[last] ^= 0xff;
                 corrupted.fetch_add(1, Ordering::Relaxed);
                 true
             })
@@ -1012,7 +941,6 @@ mod tests {
         link(&a, &b, None).await;
         let content = data_pattern(3 * CHUNK_SIZE as usize, 6);
         share(&a, &[&b], "file_x", &content).await;
-        // The catalog B holds promises a different file than A actually has.
         b.files.write().await.get_mut("file_x").unwrap().manifest_root = Some(manifest_root(content.len() as u64, &[[7; 32]; 3]));
 
         let blob = ensure_file(&b, "file_x").await.unwrap();
@@ -1025,7 +953,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn unsharing_stops_the_download_and_deletes_the_partial_file() {
         let [a, b] = nodes(["node_a", "node_b"]);
-        let slow: Tamper = Arc::new(|_| false); // nothing arrives: the download just waits
+        let slow: Tamper = Arc::new(|_| false);
         link(&a, &b, Some(slow)).await;
         share(&a, &[&b], "file_x", &data_pattern(4 * CHUNK_SIZE as usize, 7)).await;
         let blob = ensure_file(&b, "file_x").await.unwrap();
@@ -1041,9 +969,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_file_spreads_from_node_to_node_when_the_original_holder_is_out_of_reach() {
-        // c can see a, but nothing a sends to c ever arrives; b can reach a.
-        // c can only complete by fetching from b, which becomes a holder (and
-        // announces what it has) as it downloads.
         let [a, b, c] = nodes(["node_a", "node_b", "node_c"]);
         link(&a, &b, None).await;
         link(&a, &c, Some(Arc::new(|_| false))).await;

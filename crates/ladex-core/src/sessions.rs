@@ -1,8 +1,4 @@
-// Login sessions for the browser UI: one per device that entered the passphrase.
-//
-// The cookie holds a random token; only its SHA-256 is kept here, so a memory
-// dump or a log line can't be replayed as a login. Every session has its own
-// id, can be listed and revoked individually, and expires on its own.
+//! Browser login sessions, one per device; only each token's SHA-256 is kept.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -33,7 +29,7 @@ pub struct SessionSummary {
     pub expires_in_secs: u64,
 }
 
-// A session as saved to disk. The expiry is a wall-clock time, since `Instant` means nothing after a restart.
+/// A session as saved to disk, with a wall-clock expiry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SavedSession {
     token_hash: String,
@@ -57,7 +53,6 @@ struct Record {
 pub struct SessionStore {
     lifetime: Duration,
     by_token_hash: Mutex<HashMap<Vec<u8>, Record>>,
-    // Carries the id of every session that ends early, so its live WebSocket can close.
     ended: broadcast::Sender<String>,
 }
 
@@ -85,7 +80,7 @@ impl SessionStore {
         Self { lifetime, by_token_hash: Mutex::new(HashMap::new()), ended: broadcast::channel(64).0 }
     }
 
-    // Returns the cookie token (shown to the browser once, never stored) and the session.
+    /// Returns the cookie token (shown to the browser once, never stored) and the session.
     pub fn create(&self, ip: IpAddr, user_agent: Option<&str>) -> (String, SessionHandle) {
         let token = random_hex(32);
         let now = chrono::Utc::now();
@@ -110,7 +105,7 @@ impl SessionStore {
         (token, handle)
     }
 
-    // The session this cookie token belongs to, if it is still valid.
+    /// The session this cookie token belongs to, if it is still valid.
     pub fn authenticate(&self, token: &str) -> Option<SessionHandle> {
         let hash = token_hash(token);
         let mut sessions = self.by_token_hash.lock().unwrap();
@@ -188,7 +183,7 @@ impl SessionStore {
             .collect()
     }
 
-    // Sessions that expired while the node was off are dropped.
+    /// Restores saved sessions, dropping those that expired while the node was off.
     pub fn import(&self, saved: Vec<SavedSession>) {
         let now = Instant::now();
         let wall_now = chrono::Utc::now();
@@ -210,7 +205,7 @@ impl SessionStore {
     }
 }
 
-// "Chrome on Android" from a User-Agent string; good enough to tell devices apart in a list.
+/// "Chrome on Android" from a User-Agent string, to tell devices apart in a list.
 pub fn device_label(user_agent: &str) -> String {
     let os = [
         ("Android", "Android"),

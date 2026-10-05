@@ -1,5 +1,4 @@
-// End-to-end test against real LADEX processes. Needs a built binary
-// (cargo build; override with LADEX_BIN) and Node 22+. Run: node tests/e2e/client.test.js
+// End-to-end test against real LADEX processes; needs `cargo build` (or LADEX_BIN) and Node 22+. Run: node tests/e2e/client.test.js
 const { spawn } = require('node:child_process');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
@@ -23,7 +22,6 @@ function start(n, extra = []) {
 const login = async (b) => (await fetch(`http://${b}/auth`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ passphrase: PASS }) })).headers.get('set-cookie').match(/auth=([0-9a-f]+)/)[1];
 let failures = 0; const check = (n, ok, d = '') => { console.log(`${ok ? 'PASS' : 'FAIL'}  ${n}${ok ? '' : '  ' + d}`); if (!ok) failures++; };
 
-// ---- a page: the real app.js + receive-policy.js in a VM, talking to `base`
 function loadPage(base, token) {
     const log = { progress: [], toasts: [], clicks: [], navigations: [], sent: [], html: {} };
     const anything = () => new Proxy(function () {}, {
@@ -76,7 +74,6 @@ function loadPage(base, token) {
     };
     context.globalThis = context; context.window.window = window;
     vm.createContext(context);
-    // The same files, in the same order, as the <script> tags in index.html.
     const scripts = ['js/util.js', 'receive-policy.js', 'app.js', 'js/connection.js', 'js/transfers.js', 'js/ui.js'];
     for (const file of scripts) vm.runInContext(fs.readFileSync(path.join(STATIC, file), 'utf8'), context);
     context.LadexPolicy = window.LadexPolicy;
@@ -101,7 +98,6 @@ function joinWs(base, token, session) {
     });
 }
 
-// A directory in memory that behaves like the File System Access API's.
 function memoryDirectory(existing = {}) {
     const files = new Map(Object.entries(existing)); const dirs = new Map();
     const notFound = () => Object.assign(new Error('nf'), { name: 'NotFoundError' });
@@ -124,7 +120,6 @@ function memoryDirectory(existing = {}) {
     const { app } = p1;
     check('a tab keeps one session id and it is a valid id', /^peer_[0-9a-f]{20}$/.test(app.sessionId) && app.generateSessionId() === app.sessionId);
 
-    // ---- upload
     const big = crypto.randomBytes(12 * MiB + 321);
     let entry = await app.uploadFile(new File([big], 'big file.bin', { type: 'application/octet-stream' }));
     check('uploadFile returns the node\'s catalog entry', entry.name === 'big file.bin' && entry.size === big.length && entry.uploader_id === app.sessionId, JSON.stringify(entry));
@@ -132,7 +127,6 @@ function memoryDirectory(existing = {}) {
     const stored = fs.readFileSync(path.join(ROOT, `n1/files/${entry.id}.data`));
     check('the node stores exactly the bytes sent', sha(stored) === sha(big));
 
-    // ---- a connection that drops half way, then resumes
     const data2 = crypto.randomBytes(10 * MiB + 5);
     p1.failNextPutAfter = 4 * MiB + 100; p1.log.progress.length = 0;
     entry = await app.uploadFile(new File([data2], 'resumed.bin'));
@@ -140,7 +134,6 @@ function memoryDirectory(existing = {}) {
     check('an interrupted upload resumes and completes', entry.size === data2.length && sentFull, JSON.stringify(entry));
     check('the resumed file is intact', sha(fs.readFileSync(path.join(ROOT, `n1/files/${entry.id}.data`))) === sha(data2));
 
-    // ---- cancel
     p1.slowMs = 20;
     const slow = new File([crypto.randomBytes(8 * MiB)], 'slow.bin');
     const group = 'up:cancelme';
@@ -151,11 +144,9 @@ function memoryDirectory(existing = {}) {
     check('cancelling an upload stops it', outcome === 'cancelled', `got: ${outcome}`);
     p1.slowMs = 0;
 
-    // ---- a refused upload says why
     const tooBigStatus = await fetch(`http://${b1}/api/files/file_q/upload?size=1`, { headers: { Cookie: `auth=${t1}` } });
     check('upload status works for an unknown file', (await tooBigStatus.json()).offset === 0);
 
-    // ---- folder
     const parts = [['pics/a.png', crypto.randomBytes(2 * MiB)], ['pics/deep/b.txt', Buffer.from('bee')], ['c.bin', crypto.randomBytes(1500)]];
     const folderFiles = parts.map(([rel, buf]) => { const f = new File([buf], rel.split('/').pop()); Object.defineProperty(f, 'webkitRelativePath', { value: `myfolder/${rel}` }); return f; });
     await app.handleFolderUpload(folderFiles);
@@ -164,7 +155,6 @@ function memoryDirectory(existing = {}) {
     check('a folder upload publishes one folder entry', folder && folder.name === 'myfolder' && folder.folder_files === 3, JSON.stringify(folder));
     check('its files carry the folder as parent', w1.files().filter((f) => f.parent === folder.id).length === 3);
 
-    // ---- rendering: folders' files are hidden, holders are named
     const real = vm.runInContext('LADEXApp.prototype.updateFileList', p1.context);
     app.serverFiles = w1.files(); app.nodeId = 'node_x'; app.isHost = false;
     for (const m of w1.received) if (m.type === 'peer_joined') app._rememberNode(m.peer);
@@ -175,7 +165,6 @@ function memoryDirectory(existing = {}) {
     check('the sharing device gets an unshare button', html.includes('data-action="delete-file"'));
     check('holders are shown by device name', /host-badge">[^<]+<\/span>/.test(html));
 
-    // ---- download from the other node: native download via an <a>
     await sleep(500);
     const a2 = p2.app; a2.serverFiles = w2.files();
     await a2.downloadFile(entry.id);
@@ -183,18 +172,15 @@ function memoryDirectory(existing = {}) {
     const probe = await fetch(`http://${b2}/api/files/${entry.id}`, { headers: { Cookie: `auth=${t2}` } });
     check('and that URL really serves the file from node 2', sha(Buffer.from(await probe.arrayBuffer())) === sha(data2));
 
-    // a file nobody online has
     a2.serverFiles = [{ ...w2.files()[0], id: 'file_ghost', is_folder: false, holders: {} }];
     p2.log.toasts.length = 0;
     await a2.downloadFile('file_ghost');
     check('an unknown file is reported, not downloaded', p2.log.toasts.some((t) => /removed/.test(t.message)) && p2.log.clicks.length === 1, JSON.stringify(p2.log.toasts));
 
-    // ---- folder download, without a folder picker: a zip URL
     a2.serverFiles = w2.files(); p2.log.clicks.length = 0;
     await a2.downloadFolder(a2.serverFiles.find((f) => f.is_folder));
     check('without a folder picker a folder is saved as a zip', p2.log.clicks.length === 1 && p2.log.clicks[0].href === `/api/folders/${folder.id}.zip` && p2.log.clicks[0].download === 'myfolder.zip', JSON.stringify(p2.log.clicks));
 
-    // ---- folder download with a folder picker, into a directory that already has a file of the same name
     const dir = memoryDirectory();
     const existing = await dir.getDirectoryHandle('myfolder', { create: true });
     existing.files.set('c.bin', Buffer.from('MINE, do not overwrite'));
@@ -209,7 +195,6 @@ function memoryDirectory(existing = {}) {
         root.files.get('c.bin').toString() === 'MINE, do not overwrite' && root.files.has('c (1).bin') && sha(root.files.get('c (1).bin')) === sha(parts[2][1]),
         JSON.stringify([...root.files.keys()]));
 
-    // ---- unshare through the page
     app.deleteFile(entry.id);
     check('unsharing sends the delete', p1.log.sent.some((m) => m.type === 'delete_file' && m.file_id === entry.id && m.session_id === app.sessionId));
 

@@ -1,4 +1,4 @@
-// A fixed-size set of chunk indices: which chunks of a file a node has.
+/// A fixed-size set of chunk indices: which chunks of a file a node has.
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Bitmap {
@@ -40,7 +40,7 @@ impl Bitmap {
         index < self.len && self.words[(index / 64) as usize] & (1 << (index % 64)) != 0
     }
 
-    // True if the chunk was not already present.
+    /// True if the chunk was not already present.
     pub fn set(&mut self, index: u32) -> bool {
         if index >= self.len || self.get(index) {
             return false;
@@ -50,7 +50,7 @@ impl Bitmap {
         true
     }
 
-    // True if the chunk was present.
+    /// True if the chunk was present.
     pub fn clear(&mut self, index: u32) -> bool {
         if !self.get(index) {
             return false;
@@ -60,7 +60,7 @@ impl Bitmap {
         true
     }
 
-    // How many chunks from the start are all present.
+    /// How many chunks from the start are all present.
     pub fn leading_ones(&self) -> u32 {
         let mut index = 0;
         while index < self.len && self.get(index) {
@@ -77,7 +77,7 @@ impl Bitmap {
         (0..self.len).filter(|i| !self.get(*i))
     }
 
-    // Little-endian bit order inside each byte: chunk 0 is the lowest bit of byte 0.
+    /// Little-endian bit order inside each byte: chunk 0 is the lowest bit of byte 0.
     pub fn to_hex(&self) -> String {
         let bytes: Vec<u8> = (0..(self.len as usize).div_ceil(8))
             .map(|b| (0..8).fold(0u8, |acc, bit| acc | ((self.get((b * 8 + bit) as u32) as u8) << bit)))
@@ -85,7 +85,7 @@ impl Bitmap {
         hex::encode(bytes)
     }
 
-    // None if the text isn't hex or is the wrong length for `len` chunks.
+    /// None if the text isn't hex or is the wrong length for `len` chunks.
     pub fn from_hex(len: u32, text: &str) -> Option<Self> {
         let bytes = hex::decode(text).ok()?;
         if bytes.len() != (len as usize).div_ceil(8) {

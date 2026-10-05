@@ -1,18 +1,4 @@
-// The HTTP side of file sharing, used by browsers:
-//
-//   PUT  /api/files/<id>            upload (streamed to disk, resumable)
-//   GET  /api/files/<id>/upload     how much of an interrupted upload the node already has
-//   GET  /api/files/<id>            download, with Range support
-//   PUT  /api/folders/<id>          publish a folder whose files were uploaded
-//
-// A browser uploads to the node it is connected to, which keeps the file on
-// disk; other nodes fetch it from there (see transfer.rs). A download is a
-// plain HTTP GET, so every browser streams it straight to disk, and when the
-// node doesn't have the file yet it streams it through while fetching it from
-// the other nodes.
-//
-// These routes are handled here rather than by warp, whose filters can't
-// stream a request or response body.
+//! The HTTP side of file sharing: resumable uploads, Range downloads, folder publishing and zip downloads.
 
 use std::sync::Arc;
 
@@ -34,7 +20,6 @@ use crate::types::{FileMetadata, Holder};
 use crate::{state, validate, zip, NodeState};
 
 const MAX_CONCURRENT_UPLOADS: usize = 8;
-// Downloads streaming at once (each holds a few MiB while it runs).
 const MAX_CONCURRENT_DOWNLOADS: usize = 64;
 const MAX_FOLDER_LISTING_BYTES: usize = 16 * 1024 * 1024;
 
@@ -66,7 +51,7 @@ impl Api for FilesApi {
     }
 }
 
-// What a folder's listing file contains (it is stored like any other file).
+/// What a folder's listing file contains (it is stored like any other file).
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FolderListing {
     pub v: u32,
@@ -123,7 +108,6 @@ fn store_error(e: StoreError) -> Response<ServerBody> {
     fail(status, &e.to_string())
 }
 
-// Most of a refused upload's body that is read and thrown away.
 const MAX_DRAIN_BYTES: u64 = 64 * 1024 * 1024;
 
 async fn drain(mut body: Incoming) {
@@ -159,7 +143,6 @@ fn same_origin(headers: &HeaderMap) -> bool {
     matches!((origin, header_str(headers, "host")), (Some(o), Some(h)) if o == h)
 }
 
-// "attachment; filename=..." that is safe for any name, including non-ASCII ones.
 fn content_disposition(name: &str) -> String {
     const ATTR_CHAR: &AsciiSet = &NON_ALPHANUMERIC.remove(b'!').remove(b'#').remove(b'$').remove(b'&').remove(b'+').remove(b'-').remove(b'.').remove(b'^').remove(b'_').remove(b'`').remove(b'|').remove(b'~');
     let ascii: String = name
@@ -169,8 +152,7 @@ fn content_disposition(name: &str) -> String {
     format!("attachment; filename=\"{ascii}\"; filename*=UTF-8''{}", utf8_percent_encode(name, ATTR_CHAR))
 }
 
-// Some(Ok((start, end))) is an inclusive byte range; Some(Err(())) is
-// unsatisfiable; None means serve the whole file (no or unusable header).
+// Some(Ok) is an inclusive byte range, Some(Err) unsatisfiable, None the whole file.
 fn parse_range(value: Option<&str>, size: u64) -> Option<Result<(u64, u64), ()>> {
     let spec = value?.trim().strip_prefix("bytes=")?;
     if spec.contains(',') || size == 0 {
@@ -191,10 +173,7 @@ fn parse_range(value: Option<&str>, size: u64) -> Option<Result<(u64, u64), ()>>
     Some(if range.0 >= size || range.0 > range.1 { Err(()) } else { Ok(range) })
 }
 
-// Sends bytes `start..=end` of a file as body frames, waiting for any chunk
-// still on its way from other nodes (and telling the download to fetch the
-// ones being read first). False if it stopped early: the file stopped arriving,
-// or the client went away. `on_bytes` sees every piece as it is sent.
+// Sends bytes `start..=end`, waiting for chunks still arriving; false if it stopped early.
 async fn send_range(
     state: &NodeState,
     blob: &Arc<Blob>,
@@ -227,7 +206,7 @@ async fn send_range(
         let piece = &bytes[from..to];
         on_bytes(piece);
         if frames.send(Ok(Frame::data(Bytes::copy_from_slice(piece)))).await.is_err() {
-            return false; // the client went away
+            return false;
         }
     }
     true
@@ -251,11 +230,9 @@ fn fetch_error(error: FetchError) -> Response<ServerBody> {
     }
 }
 
-// Children fetched ahead of the one being sent, so the next file is usually already arriving.
 const ZIP_PREFETCH: usize = 3;
 
-// `If-Range` makes a range request conditional on the file being unchanged;
-// if it isn't (or we can't tell), the whole file is sent instead.
+// `If-Range` makes a range request conditional on the file being unchanged.
 fn range_still_valid(if_range: Option<&str>, etag: Option<&str>) -> bool {
     match (if_range, etag) {
         (None, _) => true,
@@ -269,7 +246,6 @@ impl FilesApi {
         let path = req.uri().path().to_string();
         let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
 
-        // Everything needs a login session, unless this node has no passphrase.
         let auth: Option<SessionHandle> = if self.state.passphrase.is_some() {
             match cookie_value(req.headers(), "auth").and_then(|token| self.state.sessions.authenticate(token)) {
                 Some(session) => Some(session),
@@ -294,8 +270,7 @@ impl FilesApi {
         }
     }
 
-    // The device (browser session) an upload is for must have joined over a
-    // WebSocket owned by the same login session as this request.
+    // The upload's device must have joined over a WebSocket owned by this request's login session.
     async fn owned_device(&self, headers: &HeaderMap, auth: &Option<SessionHandle>) -> Result<String, Box<Response<ServerBody>>> {
         let device = header_str(headers, "x-ladex-session").unwrap_or_default().to_string();
         if !validate::is_valid_id(&device) {
@@ -312,9 +287,7 @@ impl FilesApi {
         let (parts, body) = req.into_parts();
         let mut body = Some(body);
         let response = self.upload_inner(&parts.headers, id, auth, &mut body).await;
-        // A refusal that never read the body would otherwise cut the connection
-        // while the client is still sending, and the client would see a broken
-        // connection instead of the reason. Read (and drop) what it sends.
+        // Read and drop a refused body, or the client sees a broken connection instead of the reason.
         if let Some(body) = body {
             drain(body).await;
         }
@@ -359,7 +332,6 @@ impl FilesApi {
             return fail(StatusCode::SERVICE_UNAVAILABLE, "too many uploads in progress; try again shortly");
         };
 
-        // Uploading the same file again once it is complete is not an error.
         if let Some(existing) = state.store.get(id) {
             if existing.is_complete() {
                 let entry = state.files.read().await.get(id).filter(|f| !f.deleted && f.uploader_id == device).cloned();
@@ -393,7 +365,7 @@ impl FilesApi {
         let mut index = (offset / CHUNK_SIZE) as u32;
         while let Some(frame) = body.frame().await {
             let Ok(frame) = frame else {
-                blob.persist().await; // keep what arrived, so the client can resume
+                blob.persist().await;
                 return fail(StatusCode::BAD_REQUEST, "upload interrupted");
             };
             let Ok(mut data) = frame.into_data() else { continue };
@@ -451,7 +423,6 @@ impl FilesApi {
         json(StatusCode::CREATED, &serde_json::json!({ "success": true, "complete": true, "file": entry }))
     }
 
-    // Where an interrupted upload of this file should continue.
     async fn upload_status(&self, req: Request<Incoming>, id: &str) -> Response<ServerBody> {
         let size = req
             .uri()
@@ -470,7 +441,6 @@ impl FilesApi {
             Ok(blob) => blob,
             Err(e) => return fetch_error(e),
         };
-        // The catalog's mime type is never used for serving: see the headers below.
         let (name, etag) = {
             let files = state.files.read().await;
             match files.get(id) {
@@ -480,8 +450,6 @@ impl FilesApi {
         };
         let size = blob.size();
 
-        // The file's identity is its manifest root, so it makes a perfect strong
-        // validator: with it a browser can resume an interrupted download.
         let range_header = header_str(req.headers(), "range").filter(|_| range_still_valid(header_str(req.headers(), "if-range"), etag.as_deref()));
         let (status, start, end) = match parse_range(range_header, size) {
             None => (StatusCode::OK, 0, size.saturating_sub(1)),
@@ -497,8 +465,7 @@ impl FilesApi {
         let mut response = Response::new(empty());
         *response.status_mut() = status;
         let headers = response.headers_mut();
-        // Whatever the file is, it is only ever offered as a download: an HTML
-        // or SVG file shared by someone must not run as part of this page.
+        // Only ever offered as a download: a shared HTML or SVG file must not run as part of this page.
         headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
         headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
         headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("sandbox"));
@@ -518,9 +485,6 @@ impl FilesApi {
             return response;
         }
 
-        // A task reads the chunks in order (waiting for any still on their way
-        // from other nodes) and hands them over a small queue, so a slow client
-        // slows the reading instead of filling memory.
         let Ok(slot) = self.downloads.clone().try_acquire_owned() else {
             return busy();
         };
@@ -535,7 +499,6 @@ impl FilesApi {
         response
     }
 
-    // A folder as one zip, produced as its files arrive.
     async fn download_zip(&self, req: Request<Incoming>, folder_id: &str) -> Response<ServerBody> {
         let state = &self.state;
         let listing_blob = match transfer::ensure_file(state, folder_id).await {
@@ -547,7 +510,6 @@ impl FilesApi {
             _ => return fail(StatusCode::NOT_FOUND, "no such folder"),
         };
 
-        // The listing is a small file; read all of it.
         let mut raw = Vec::with_capacity(listing_blob.size() as usize);
         for index in 0..listing_blob.chunk_count() {
             if !listing_blob.wait_for_chunk(index, state.transfers.stall_timeout()).await {
@@ -577,7 +539,6 @@ impl FilesApi {
                 children.push((path, entry.id.clone(), entry.size));
             }
         }
-        // Start with the first few; failing now is better than half way through the download.
         for (_, id, _) in children.iter().take(ZIP_PREFETCH) {
             if let Err(e) = transfer::ensure_file(state, id).await {
                 return fetch_error(e);
@@ -613,7 +574,6 @@ impl FilesApi {
             let mut writer = zip::ZipWriter::new();
             let send = |bytes: Vec<u8>| frames.send(Ok(Frame::data(Bytes::from(bytes))));
             for (i, (path, id, size)) in children.iter().enumerate() {
-                // Keep the next few files arriving while this one is sent.
                 if let Some((_, ahead, _)) = children.get(i + ZIP_PREFETCH) {
                     let _ = transfer::ensure_file(&state, ahead).await;
                 }
@@ -743,7 +703,6 @@ mod tests {
         assert_eq!(parse_range(Some("bytes=100-"), 100), Some(Err(())));
         assert_eq!(parse_range(Some("bytes=60-50"), 100), Some(Err(())));
         assert_eq!(parse_range(Some("bytes=-0"), 100), Some(Err(())));
-        // Things we don't support or understand are ignored: the whole file is sent.
         assert_eq!(parse_range(Some("bytes=0-1,5-6"), 100), None);
         assert_eq!(parse_range(Some("items=0-1"), 100), None);
         assert_eq!(parse_range(Some("bytes=a-b"), 100), None);
@@ -757,7 +716,6 @@ mod tests {
         assert!(range_still_valid(Some("\"abc\""), Some("\"abc\"")));
         assert!(!range_still_valid(Some("\"old\""), Some("\"abc\"")));
         assert!(!range_still_valid(Some("\"abc\""), None));
-        // A date validator is never matched: we only issue ETags.
         assert!(!range_still_valid(Some("Wed, 21 Oct 2015 07:28:00 GMT"), Some("\"abc\"")));
     }
 
@@ -782,7 +740,6 @@ mod tests {
         headers.insert(header::COOKIE, HeaderValue::from_static("theme=dark; auth=abc123; other=1"));
         assert_eq!(cookie_value(&headers, "auth"), Some("abc123"));
         assert_eq!(cookie_value(&headers, "missing"), None);
-        // A cookie whose name merely ends in "auth" is not ours.
         headers.insert(header::COOKIE, HeaderValue::from_static("xauth=evil; auth=good"));
         assert_eq!(cookie_value(&headers, "auth"), Some("good"));
         headers.insert(header::COOKIE, HeaderValue::from_static("xauth=evil"));

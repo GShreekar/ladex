@@ -1,15 +1,4 @@
-// Hybrid logical clock for ordering catalog and peer updates across nodes.
-//
-// Ordering by raw wall-clock time lets a node with a fast clock win every
-// conflict, and lets a node with a slow clock lose even its own deletions. A
-// hybrid logical clock stamps every local event with `(wall, counter, node)`
-// where `wall` never runs behind anything this node has seen. So an update made
-// after observing another is always ordered after it, whatever the wall clocks
-// say. Concurrent updates are ordered deterministically by `node`.
-//
-// A remote stamp more than `MAX_DRIFT_MS` ahead of our own wall clock is
-// refused instead of adopted; otherwise one bad clock would drag every node's
-// clock forward with it.
+//! Hybrid logical clock: an update made after seeing another is always ordered after it, whatever the wall clocks say.
 
 use std::sync::Mutex;
 
@@ -28,7 +17,7 @@ pub struct Stamp {
 }
 
 impl Stamp {
-    // A default stamp means the sender never set one.
+    /// A default stamp means the sender never set one.
     pub fn is_set(&self) -> bool {
         self.wall > 0
     }
@@ -63,7 +52,6 @@ pub fn wall_clock_ms() -> u64 {
 
 pub struct Clock {
     node: NodeId,
-    // (wall, counter) of the latest stamp issued or observed.
     latest: Mutex<(u64, u32)>,
 }
 
@@ -72,7 +60,7 @@ impl Clock {
         Self { node, latest: Mutex::new((0, 0)) }
     }
 
-    // Never issue a stamp at or before one this node issued before it stopped.
+    /// Never issue a stamp at or before one this node issued before it stopped.
     pub fn resume_from(&self, wall: u64, counter: u32) {
         let wall = wall.min(wall_clock_ms().saturating_add(MAX_DRIFT_MS));
         let mut latest = self.latest.lock().unwrap();
@@ -81,18 +69,17 @@ impl Clock {
         }
     }
 
-    // The latest (wall, counter) issued or observed, to save across a restart.
+    /// The latest (wall, counter) issued or observed, to save across a restart.
     pub fn latest(&self) -> (u64, u32) {
         *self.latest.lock().unwrap()
     }
 
-    // Stamp for an event happening on this node now.
+    /// Stamp for an event happening on this node now.
     pub fn now(&self) -> Stamp {
         self.now_at(wall_clock_ms())
     }
 
-    // Take a stamp from a remote update into account, so everything this node
-    // stamps from now on is ordered after it.
+    /// Takes a remote stamp into account so everything stamped from now on is ordered after it; refuses one too far ahead.
     pub fn observe(&self, remote: &Stamp) -> Result<(), ClockError> {
         self.observe_at(remote, wall_clock_ms())
     }
@@ -170,8 +157,6 @@ mod tests {
         let fast = clock("fast");
         let slow = clock("slow");
         let created = fast.now_at(T + 30 * 60_000);
-        // The slow node's wall clock is 30 minutes behind, but it has seen the
-        // creation, so its deletion must still win.
         slow.observe_at(&created, T).unwrap();
         let deleted = slow.now_at(T);
         assert!(deleted > created);

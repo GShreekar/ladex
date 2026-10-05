@@ -1,4 +1,4 @@
-// Multi-node meshes running in-process over real loopback sockets.
+//! Multi-node meshes running in-process over real loopback sockets.
 
 use ladex_core::testing::{converged, eventually, fully_connected, spawn_mesh, spawn_node, NodeConfig};
 

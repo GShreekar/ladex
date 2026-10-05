@@ -1,9 +1,4 @@
-// What a node remembers across restarts, besides the files themselves (store.rs):
-// its identity, chat history, unshare records, logged-in devices, and the
-// addresses of the nodes it was connected to.
-//
-// Saved as one JSON file in the data directory, written atomically and kept
-// private to the user, since it holds the hashes of login tokens.
+//! What a node remembers across restarts besides its files, saved atomically as one private JSON file.
 
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -75,8 +70,7 @@ pub fn path_in(dir: &Path) -> PathBuf {
     dir.join(FILE_NAME)
 }
 
-/// The saved state, or `None` for a first run. A damaged file is set aside
-/// (not deleted) and the node starts fresh.
+/// The saved state, or None on a first run; a damaged file is set aside and the node starts fresh.
 pub fn load(dir: &Path) -> Option<Saved> {
     let path = path_in(dir);
     let bytes = std::fs::read(&path).ok()?;
@@ -121,7 +115,6 @@ pub fn redial(state: &NodeState, peers: Vec<KnownPeer>) {
     for peer in peers {
         let state = state.clone();
         tokio::spawn(async move {
-            // Let our own server start first.
             tokio::time::sleep(Duration::from_millis(500)).await;
             if let Err(e) = mesh::connect_to_peer(peer.ip, peer.port, state).await {
                 tracing::debug!("Persist: remembered peer {}:{} not reachable: {e}", peer.ip, peer.port);
@@ -164,7 +157,6 @@ impl Saver {
         }
     }
 
-    // Skips the write when nothing but timestamps changed.
     async fn save(&mut self, state: &NodeState) {
         let mut snapshot = self.snapshot(state).await;
         let bytes = serde_json::to_vec(&snapshot).unwrap_or_default();

@@ -1,6 +1,4 @@
-// The page is split across several plain <script> files that add methods to
-// one class. Nothing checks that at build time, so this does: every file is
-// loaded by index.html, and every method the code or the HTML calls exists.
+// Checks that the page's scripts all load, in order, and that every method called on the app exists.
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -11,7 +9,9 @@ const STATIC = path.join(__dirname, '..', '..', 'static');
 const html = fs.readFileSync(path.join(STATIC, 'index.html'), 'utf8');
 
 const scriptsInPage = [...html.matchAll(/<script src="static\/([^"?]+)/g)].map((m) => m[1]);
-const ownScripts = scriptsInPage.filter((file) => file !== 'qrcode.js' && file !== 'sessions.js');
+// sessions.js and pairing.js are standalone panels, not part of the app class.
+const standalone = ['qrcode.js', 'sessions.js', 'pairing.js'];
+const ownScripts = scriptsInPage.filter((file) => !standalone.includes(file));
 
 function loadClass() {
     const noop = () => {};
@@ -45,7 +45,6 @@ test('every method called on the app exists', () => {
 
     const missing = [];
     for (const [file, text] of sources) {
-        // this.method( inside the app's own code, and app.method( from inline handlers and generated HTML
         const code = text.split('\n').filter((line) => !line.trim().startsWith('//')).join('\n');
         const calls = [...code.matchAll(/\b(?:this|app)\.([A-Za-z_]\w*)\(/g)].map((m) => m[1]);
         for (const name of calls) if (!known.has(name)) missing.push(`${file}: ${name}`);

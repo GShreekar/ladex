@@ -1,25 +1,4 @@
-// ============================================================================
-// LADEX — TLS for the browser UI and the node-to-node mesh.
-//
-// Plain HTTP means every device that ISN'T localhost — i.e. every other
-// phone, tablet, or laptop on the LAN, the entire point of LADEX — loads the
-// page as an insecure context. Two things the app depends on are silently
-// disabled there:
-//   - showSaveFilePicker() (File System Access API): without it, every
-//     remote download falls back to buffering the whole file as a Blob in
-//     RAM, defeating the O(1)-memory streaming design for large files.
-//   - crypto.subtle: without it, SHA-256 integrity verification can't run
-//     on either side of a transfer.
-//
-// The connection handling itself lives in server.rs; this file builds the
-// certificate and the rustls configs.
-//
-// The certificate is self-signed (rcgen) and covers every local IPv4
-// address plus localhost, so nodes stay reachable by IP from any browser.
-// It's cached under ~/.ladex so a device that already clicked through the
-// "not secure" warning once won't be asked again on the next run, as long
-// as the machine's IP set hasn't changed.
-// ============================================================================
+//! TLS for the browser UI and the mesh: a cached self-signed certificate covering every local address.
 
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -30,23 +9,13 @@ use tokio_rustls::rustls;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use tokio_rustls::TlsConnector;
 
-/// Installs the process-wide rustls crypto provider (ring). Must run once
-/// before any TLS config is built. Safe to call more than once.
+/// Installs the process-wide rustls crypto provider (ring); safe to call more than once.
 pub fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
-/// Every local, non-loopback IPv4 address this machine currently has.
-/// Used both for the printed "access from network" hint and as SAN entries
-/// on the self-signed certificate — a device dialing any of these IPs must
-/// see a cert that actually covers that IP, or the browser adds a second
-/// warning (cert mismatch) on top of the expected self-signed one.
-// Common virtual/container interface name prefixes — their addresses are
-// only reachable from inside that virtual network, not from other devices
-// on the actual LAN, so advertising them (in the TLS cert, the printed
-// URLs, or mDNS) would just point people at a dead end. Not exhaustive,
-// but covers the tools people are overwhelmingly likely to have running
-// alongside LADEX on a dev machine.
+/// Every local, non-loopback IPv4 address, for the printed URLs and the certificate's names.
+// Virtual and container interfaces aren't reachable from other devices, so their addresses are never advertised.
 const VIRTUAL_IFACE_PREFIXES: &[&str] = &[
     "docker", "br-", "veth", "virbr", "tun", "tap", "podman", "lxcbr", "vmnet", "vboxnet",
 ];
@@ -79,9 +48,7 @@ pub fn config_dir() -> PathBuf {
     PathBuf::from(home).join(".ladex")
 }
 
-// How many addresses the certificate remembers beyond the current ones, so a
-// DHCP lease that flips between a few addresses doesn't mint a new certificate
-// (and a new browser warning) each time.
+// Old addresses are kept so a DHCP lease flipping between a few doesn't mint a new certificate each time.
 const MAX_REMEMBERED_ADDRESSES: usize = 16;
 
 struct Cached {
@@ -98,8 +65,7 @@ fn read_cached(dir: &Path) -> Option<Cached> {
     })
 }
 
-// The private key is created with owner-only permissions from the start,
-// instead of being written world-readable and tightened afterwards.
+// Created owner-only from the start, never world-readable.
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let mut options = std::fs::OpenOptions::new();
@@ -112,8 +78,7 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut file = options.open(path)?;
     #[cfg(unix)]
     {
-        // A file left over from an older version may have been created more
-        // permissively; tighten it before any key bytes are written.
+        // A file from an older version may be too permissive; tighten it before writing key bytes.
         use std::os::unix::fs::PermissionsExt;
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
@@ -131,8 +96,7 @@ pub(crate) fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     builder.create(dir)
 }
 
-/// The names the certificate must cover, plus recently used addresses that are
-/// no longer current. `wanted` always comes first.
+/// The names the certificate must cover, current ones first, plus recently used addresses.
 fn certificate_names(wanted: &[String], previous: &[String]) -> Vec<String> {
     let mut names = wanted.to_vec();
     let remembered = previous
@@ -154,14 +118,7 @@ fn generate(names: &[String]) -> anyhow::Result<(CertificateDer<'static>, Vec<u8
     Ok((cert.der().clone(), key_pair.serialize_der()))
 }
 
-/// Builds the server's TLS configuration from the cached certificate when it
-/// still covers every name in `wanted`, otherwise from a freshly generated one
-/// (cached for next time). Also returns the certificate's SHA-256 fingerprint.
-///
-/// Browsers only ever see a self-signed certificate here, so they warn on
-/// first visit; keeping the certificate stable means a device that has
-/// accepted it once isn't asked again, and the printed fingerprint lets a user
-/// check they accepted the right one.
+/// The server's TLS config from the cached certificate if it still covers `wanted`, else a new one, plus its SHA-256 fingerprint.
 pub fn prepare_server_identity(wanted: &[String]) -> anyhow::Result<(Arc<rustls::ServerConfig>, Vec<u8>)> {
     let dir = config_dir();
     let cached = read_cached(&dir);
@@ -173,7 +130,6 @@ pub fn prepare_server_identity(wanted: &[String]) -> anyhow::Result<(Arc<rustls:
             match build_server_config(cert, key) {
                 Ok(config) => {
                     tracing::info!("TLS: reusing cached certificate ({} names)", c.sans.len());
-                    // Tighten permissions on a key written by an older version.
                     let _ = write_private(&dir.join("key.der"), &c.key);
                     return Ok((config, crate::auth::tls_fingerprint(&c.cert)));
                 }
@@ -226,19 +182,7 @@ fn build_server_config(
     Ok(Arc::new(config))
 }
 
-// ---------------------------------------------------------------------------
-// Client side — mesh nodes dial each other over that same TLS-only port, so
-// connect_wss() needs a rustls client that can complete a handshake against
-// our own self-signed certs. There's no shared CA between nodes (each one
-// mints its own on first run), so the TLS layer itself can't tell a real peer
-// from an impostor and accepts any certificate.
-//
-// That is safe only because the mesh handshake (mesh.rs, auth.rs) binds the
-// certificate to the passphrase: connect_wss() returns the fingerprint of the
-// certificate it actually saw, and the SPAKE2 proofs are computed over it. A
-// man in the middle presenting their own certificate can't produce a valid
-// proof without the passphrase.
-// ---------------------------------------------------------------------------
+// Nodes share no CA, so the client accepts any certificate; the mesh handshake binds its fingerprint, which defeats a man in the middle.
 
 #[derive(Debug)]
 struct NoServerVerification(Arc<rustls::crypto::CryptoProvider>);
@@ -289,12 +233,7 @@ pub fn build_client_config() -> Arc<rustls::ClientConfig> {
     Arc::new(config)
 }
 
-/// Dials `addr:port` over TLS and completes the WebSocket upgrade at `path`.
-/// tokio-tungstenite's own TLS connectors pull in a different rustls major
-/// version than we do here, so we do the TCP + TLS handshake ourselves with
-/// our own rustls, then hand the resulting stream to `client_async` — which
-/// only needs `AsyncRead + AsyncWrite`, not any particular TLS crate.
-/// Also returns the fingerprint of the server certificate the handshake saw.
+/// Dials `addr:port` over TLS with our own rustls and upgrades to a WebSocket at `path`; returns the server certificate's fingerprint.
 pub async fn connect_wss(
     addr: IpAddr,
     port: u16,
@@ -337,7 +276,6 @@ mod tests {
             &names(&["localhost", "192.168.1.9"]),
             &names(&["localhost", "192.168.1.5", "10.0.0.2", "ladex.local"]),
         );
-        // Old hostnames are not carried over (they are already in `wanted` or no longer advertised).
         assert_eq!(all, names(&["localhost", "192.168.1.9", "192.168.1.5", "10.0.0.2"]));
     }
 
@@ -368,7 +306,6 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ladex-test-{}", std::process::id()));
         create_private_dir(&dir).unwrap();
         let path = dir.join("key.der");
-        // A file from an older version, created too permissively.
         std::fs::write(&path, b"old").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
 

@@ -1,4 +1,4 @@
-// Meshes whose nodes talk through a FaultyLink: lossy, slow, reordering or cut.
+//! Meshes whose nodes talk through a lossy, slow, reordering or cut link.
 
 use std::time::Duration;
 
@@ -12,7 +12,6 @@ const SLOW_AND_REORDERING: Faults = Faults {
     reorder: 0.25,
 };
 
-// Three chunks, so several chunk frames are in flight at once.
 fn three_chunk_file() -> Vec<u8> {
     (0..(2 * 1024 * 1024 + 4321)).map(|i| (i % 251) as u8).collect()
 }

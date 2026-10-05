@@ -1,13 +1,4 @@
-// ============================================================================
-// LADEX — Browser-tab WebSocket handler (/ws)
-//
-// Phase 5: All WebRTC signaling messages now route through mesh::route_signal()
-//          which transparently delivers locally or wraps in MeshMessage::SignalRelay.
-// Phase 6: RequestDownloadFrom — client names its chosen host explicitly.
-//          Node honors the choice without override; returns HostUnreachable if
-//          that peer is gone.
-// Phase 5: TransferDeclined — receiver signals rejection; routed back to sender.
-// ============================================================================
+//! The browser-tab WebSocket (/ws): joins, chat, file actions and signaling.
 
 use crate::server::PeerAddr;
 use crate::sessions::SessionHandle;
@@ -21,12 +12,10 @@ use tokio::sync::{broadcast::error::RecvError, mpsc};
 use warp::ws::{Message, WebSocket, Ws};
 use warp::{Rejection, Reply};
 
-// Browser tabs only send small JSON control messages (the biggest are SDP
-// blobs of a few KB), so anything near this size is not a legitimate client.
+// Tabs only send small JSON control messages, so anything near this size isn't a real client.
 const MAX_WS_MESSAGE_BYTES: usize = 256 * 1024;
 
-/// Who currently holds a browser `session_id` on this node, so another
-/// connection can't take it over and act as that device.
+/// Who holds a browser `session_id` on this node, so another connection can't act as that device.
 #[derive(Debug, Clone)]
 pub struct ConnOwner {
     pub conn_id: u64,
@@ -55,13 +44,6 @@ pub async fn websocket_handler(
     Ok(ws.on_upgrade(move |socket| handle_websocket(socket, state, auth, is_host)))
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// F5: the client already truncates nicknames to 40 chars, but a
-/// non-browser client (or a modified one) could send anything — clean and
-/// cap it server-side too.
 fn cap_nickname(nickname: String) -> String {
     validate::clean_label(&nickname, validate::MAX_NICKNAME_CHARS)
 }
@@ -73,7 +55,7 @@ pub async fn broadcast(state: &NodeState, msg: ServerMessage) {
     }
 }
 
-/// Alias for broadcast — used by Phase 10 AP isolation diagnostic.
+/// Sends a message to every local tab.
 pub async fn broadcast_all(state: &NodeState, msg: ServerMessage) {
     broadcast(state, msg).await;
 }
@@ -84,10 +66,6 @@ pub async fn send_to(state: &NodeState, target: &SessionId, msg: ServerMessage) 
         let _ = sender.send(msg);
     }
 }
-
-// ---------------------------------------------------------------------------
-// WebSocket lifecycle
-// ---------------------------------------------------------------------------
 
 pub async fn handle_websocket(ws: WebSocket, state: NodeState, auth: Option<SessionHandle>, is_host: bool) {
     let (mut ws_tx, mut ws_rx) = ws.split();
@@ -107,8 +85,6 @@ pub async fn handle_websocket(ws: WebSocket, state: NodeState, auth: Option<Sess
         }
     });
 
-    // The connection ends with its login session: on revocation, on logout,
-    // or when the session expires.
     let mut ended = state.sessions.subscribe_ended();
     let expiry = async {
         match &auth {
@@ -124,7 +100,7 @@ pub async fn handle_websocket(ws: WebSocket, state: NodeState, auth: Option<Sess
             incoming = ws_rx.next() => {
                 let Some(Ok(msg)) = incoming else { break };
                 if !still_owns_session(&state, &conn).await {
-                    break; // the same login joined again from a newer connection
+                    break;
                 }
                 let Ok(text) = msg.to_str() else { continue };
                 let Ok(client_msg) = serde_json::from_str::<ClientMessage>(text) else { continue };
@@ -152,7 +128,7 @@ pub async fn handle_websocket(ws: WebSocket, state: NodeState, auth: Option<Sess
 
     if signed_out {
         let _ = peer_tx.send(ServerMessage::Error { message: "This device was signed out.".to_string() });
-        tokio::time::sleep(Duration::from_millis(150)).await; // let the notice go out
+        tokio::time::sleep(Duration::from_millis(150)).await;
     }
 
     if let Some(id) = &conn.session_id {
@@ -196,9 +172,7 @@ async fn handle_client_message(
     state: &NodeState,
     conn: &mut Connection,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // A connection acts as exactly one device: the one it joined as. Without
-    // this, any tab could send messages in another tab's name (delete its
-    // files, answer its downloads, ...) just by writing its session id.
+    // A connection acts only as the device it joined as, or any tab could act in another's name.
     if !matches!(msg, ClientMessage::Join { .. }) {
         match &conn.session_id {
             None => return Err("send join first".into()),
@@ -210,7 +184,6 @@ async fn handle_client_message(
     let bound = conn.session_id.clone().unwrap_or_default();
 
     match msg {
-        // ── Join ─────────────────────────────────────────────────────────
         ClientMessage::Join { session_id: id, user_agent, nickname } => {
             if !validate::is_valid_id(&id) {
                 return Err("invalid session id".into());
@@ -219,8 +192,7 @@ async fn handle_client_message(
                 return Err("this connection already joined as another device".into());
             }
             {
-                // The same login (or, on an open node, anyone) may rejoin a
-                // known id, e.g. after a reconnect; a different login may not.
+                // The same login (or anyone, on an open node) may rejoin a known id; a different login may not.
                 let mut owners = state.session_owners.write().await;
                 if let Some(owner) = owners.get(&id) {
                     let same_login = owner.auth_id == conn.auth_id;
@@ -252,11 +224,9 @@ async fn handle_client_message(
                 peers.len()
             };
 
-            // Send merged catalog to new tab (non-deleted only)
             let files = state::live_files(&*state.files.read().await);
             let _ = peer_tx.send(ServerMessage::FileListUpdate { files });
 
-            // Send full chat history
             let messages = state.messages.read().await.clone();
             if !messages.is_empty() {
                 let _ = peer_tx.send(ServerMessage::MessageHistory { messages });
@@ -266,7 +236,6 @@ async fn handle_client_message(
             state::push_peer_to_mesh(&state.mesh_peers, peer).await;
         }
 
-        // ── F5: nickname change after join ─────────────────────────────────
         ClientMessage::SetNickname { session_id: id, nickname } => {
             let updated = {
                 let mut peers = state.local_peers.write().await;
@@ -274,8 +243,7 @@ async fn handle_client_message(
                     Some(peer) => {
                         let nickname = cap_nickname(nickname);
                         peer.nickname = if nickname.is_empty() { None } else { Some(nickname) };
-                        // A new version makes this update win the merge on
-                        // other mesh nodes.
+                        // A new version makes this update win the merge on other nodes.
                         peer.version = state.clock.now();
                         Some(peer.clone())
                     }
@@ -288,12 +256,10 @@ async fn handle_client_message(
             }
         }
 
-        // ── Ping / Pong ───────────────────────────────────────────────────
         ClientMessage::Ping { session_id: _ } => {
             let _ = peer_tx.send(ServerMessage::Pong);
         }
 
-        // ── Text messaging ────────────────────────────────────────────────
         ClientMessage::TextMessage { session_id: sender_id, content } => {
             let content = validate::clean_message(&content).ok_or("message is empty")?;
             let now_ms = chrono::Utc::now().timestamp_millis() as u64;
@@ -309,17 +275,13 @@ async fn handle_client_message(
                 let mut messages = state.messages.write().await;
                 messages.push(message.clone());
                 messages.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
-                state::prune_messages(&mut messages); // BUG-13 fix
+                state::prune_messages(&mut messages);
             }
             broadcast(state, ServerMessage::TextMessage { message: message.clone() }).await;
             state::push_message_to_mesh(&state.mesh_peers, message).await;
         }
 
-        // ── F4: unshare / delete ────────────────────────────────────────
-        // The device that shared a file may unshare it, and so may the machine
-        // running the node it was shared through (which also covers files
-        // found on disk after a restart, whose sharing device is long gone).
-        // A folder takes its files with it.
+        // The sharing device may unshare a file, and so may the node's own machine; a folder takes its files with it.
         ClientMessage::DeleteFile { session_id: _, file_id } => {
             let tombstones: Vec<FileMetadata> = {
                 let mut files = state.files.write().await;
@@ -361,12 +323,6 @@ async fn handle_client_message(
             }
         }
 
-        // ── F3: send-to-person ──────────────────────────────────────────
-        // Push a file directly to one peer instead of publishing it to the
-        // catalog for anyone to find. Reuses the existing signal-routing
-        // path (route_signal already handles same-node vs cross-node
-        // delivery) — the target just gets a consent prompt instead of a
-        // browsable catalog entry.
         ClientMessage::OfferFileTo { session_id: from, target_session_id, file_id } => {
             mesh::route_signal(
                 state, &from, &target_session_id,
@@ -383,10 +339,6 @@ async fn handle_client_message(
     }
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// Peer cleanup on disconnect
-// ---------------------------------------------------------------------------
 
 async fn cleanup_peer(state: &NodeState, session_id: &SessionId) {
     let peers_count = {

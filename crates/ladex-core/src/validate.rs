@@ -1,15 +1,9 @@
-// Validation and sanitizing of everything that arrives from outside this node:
-// browser tabs on /ws and other nodes on /mesh.
-//
-// The file-name rules here are mirrored by static/receive-policy.js, which
-// sanitizes names again on the receiving browser (the node can't be trusted to
-// have done it). Both are tested against tests/filename_cases.json so they
-// can't drift apart.
+//! Validation and sanitizing of everything from browser tabs and other nodes; the name rules mirror static/receive-policy.js.
 
 use crate::hlc::wall_clock_ms;
 use crate::types::*;
 
-// Largest integer a browser can represent exactly; sizes above it can't be shown or tracked.
+/// Largest integer a browser can represent exactly.
 pub const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
 
 const MAX_NAME_BYTES: usize = 255;
@@ -31,8 +25,7 @@ const WINDOWS_RESERVED: [&str; 22] = [
     "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
 ];
 
-// Control characters plus invisible and bidirectional-override characters
-// that let a name like "photo\u{202E}gpj.exe" display as "photoexe.jpg".
+// Control, invisible and bidi-override characters, which can make "photo\u{202E}gpj.exe" display as "photoexe.jpg".
 fn is_stripped(c: char) -> bool {
     matches!(c,
         '\u{0}'..='\u{1F}' | '\u{7F}'..='\u{9F}' | '\u{AD}' | '\u{61C}' | '\u{200B}'..='\u{200F}'
@@ -44,7 +37,7 @@ fn is_forbidden_in_names(c: char) -> bool {
     matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
 }
 
-// Safe as a single file name on Windows, macOS and Linux.
+/// Safe as a single file name on Windows, macOS and Linux.
 pub fn sanitize_file_name(name: &str) -> String {
     let cleaned: String = name
         .chars()
@@ -82,8 +75,7 @@ fn truncate_to_bytes(name: &str) -> String {
     format!("{}{extension}", if kept.is_empty() { "unnamed" } else { kept })
 }
 
-// A path inside a shared folder: "a/b/c.txt". Empty, "." and ".." parts are
-// dropped, so it can never point outside the folder. None if nothing usable is left.
+/// A path inside a shared folder; `.` and `..` parts are dropped so it never leaves the folder.
 pub fn sanitize_relative_path(path: &str) -> Option<String> {
     let segments: Vec<String> = path
         .split(['/', '\\'])
@@ -121,12 +113,12 @@ pub fn sanitize_mime(mime: &str) -> String {
     }
 }
 
-// At most `max` characters (not bytes), with control and invisible characters removed.
+/// At most `max` characters, with control and invisible characters removed.
 pub fn clean_label(s: &str, max: usize) -> String {
     s.chars().filter(|c| !is_stripped(*c)).take(max).collect::<String>().trim().to_string()
 }
 
-// Chat text keeps newlines and tabs; returns None when nothing is left.
+/// Chat text, keeping newlines and tabs; None when nothing is left.
 pub fn clean_message(s: &str) -> Option<String> {
     let cleaned: String = s
         .chars()
@@ -137,9 +129,7 @@ pub fn clean_message(s: &str) -> Option<String> {
     (!cleaned.is_empty()).then_some(cleaned)
 }
 
-// Entries from another node. Names and the like are cleaned rather than
-// rejected so one odd name doesn't hide the file; an entry that can't be
-// fetched (no manifest root) or has a bad id is dropped.
+/// Cleans an entry from another node; drops it if it has a bad id or no manifest root.
 pub fn incoming_file(mut file: FileMetadata) -> Option<FileMetadata> {
     if !is_valid_id(&file.id) || file.size > MAX_SAFE_INTEGER || !file.version.is_set() {
         return None;
@@ -179,7 +169,7 @@ pub fn incoming_peer(mut peer: PeerInfo) -> Option<PeerInfo> {
     Some(peer)
 }
 
-// A timestamp in the future would pin the message to the top of every list.
+/// Cleans a message from another node; a future timestamp would pin it to the top of every list.
 pub fn incoming_message(mut message: TextMessage) -> Option<TextMessage> {
     if !is_valid_id_up_to(&message.id, MAX_MESSAGE_ID_LEN) || !is_valid_id(&message.sender_id) {
         return None;
@@ -221,11 +211,9 @@ mod tests {
         assert_eq!(name.len(), 255);
         assert!(name.ends_with(".mp4"));
 
-        // Multi-byte characters are never split.
         let name = sanitize_file_name(&"é".repeat(300));
         assert!(name.len() <= 255 && name.chars().all(|c| c == 'é'));
 
-        // An absurdly long "extension" is just part of the name.
         let name = sanitize_file_name(&format!("a.{}", "b".repeat(300)));
         assert!(name.len() <= 255);
     }
@@ -325,7 +313,6 @@ mod tests {
             change(&mut f);
             assert!(incoming_file(f).is_none(), "case {i}");
         }
-        // A tombstone doesn't need a manifest root, and an unowned (found on disk) file has no uploader.
         let mut tombstone = incoming();
         tombstone.deleted = true;
         tombstone.manifest_root = None;
