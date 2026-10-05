@@ -33,6 +33,11 @@
                         <path d="M3.9,12C3.9,10.29 5.29,8.9 7,8.9H11V7H7A5,5 0 0,0 2,12A5,5 0 0,0 7,17H11V15.1H7C5.29,15.1 3.9,13.71 3.9,12M8,13H16V11H8V13M17,7H13V8.9H17C18.71,8.9 20.1,10.29 20.1,12C20.1,13.71 18.71,15.1 17,15.1H13V17H17A5,5 0 0,0 22,12A5,5 0 0,0 17,7Z"/>
                     </svg>
                 </button>
+                <button id="trust-btn" class="icon-btn" title="Trusted nodes" style="display: none;">
+                    <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
+                        <path d="M7,14A2,2 0 0,1 5,12A2,2 0 0,1 7,10A2,2 0 0,1 9,12A2,2 0 0,1 7,14M12.65,10C11.83,7.67 9.61,6 7,6A6,6 0 0,0 1,12A6,6 0 0,0 7,18C9.61,18 11.83,16.33 12.65,14H17V18H21V14H23V10H12.65Z"/>
+                    </svg>
+                </button>
                 <button id="sessions-btn" class="icon-btn" title="Signed-in devices" style="display: none;">
                     <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
                         <path d="M12,1L3,5V11C3,16.55 6.84,21.74 12,23C17.16,21.74 21,16.55 21,11V5L12,1M12,11.99H19C18.47,16.11 15.72,19.78 12,20.93V12H5V6.3L12,3.19V11.99Z"/>
@@ -158,6 +163,17 @@
         </div>
     </div>
 
+    <div id="trust-modal" class="modal">
+        <div class="modal-content sessions-modal">
+            <div class="modal-header">
+                <h3>Trusted Nodes</h3>
+                <button id="close-trust" class="close-btn">&times;</button>
+            </div>
+            <p id="trust-hint" class="sessions-hint"></p>
+            <div id="trust-list" class="sessions-list"></div>
+        </div>
+    </div>
+
     <div id="messages-modal" class="modal">
         <div class="modal-content messages-modal">
             <div class="modal-header">
@@ -192,5 +208,6 @@
     <script src="static/js/ui.js?v=1"></script>
     <script src="static/sessions.js?v=1"></script>
     <script src="static/pairing.js?v=1"></script>
+    <script src="static/trust.js?v=1"></script>
 </body>
 </html>

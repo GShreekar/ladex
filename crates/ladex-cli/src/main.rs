@@ -452,15 +452,15 @@ async fn main() {
         .and(warp::any().map(move || app_state_revoke.clone()))
         .and_then(handlers::revoke_session);
 
+    let request = || {
+        with_api_auth(state.clone())
+            .and(warp::ext::optional::<server::PeerAddr>())
+            .and(warp::any().map({
+                let state = state.clone();
+                move || state.clone()
+            }))
+    };
     let pairing_routes = {
-        let request = || {
-            with_api_auth(state.clone())
-                .and(warp::ext::optional::<server::PeerAddr>())
-                .and(warp::any().map({
-                    let state = state.clone();
-                    move || state.clone()
-                }))
-        };
         let status = warp::path!("api" / "pairing").and(warp::get()).and(request()).and_then(handlers::pairing_status);
         let open = warp::path!("api" / "pairing" / "open")
             .and(warp::post())
@@ -487,6 +487,16 @@ async fn main() {
             .and(request())
             .and_then(handlers::answer_pairing);
         status.or(open).or(close).or(dial).or(answer)
+    };
+
+    let trust_routes = {
+        let list = warp::path!("api" / "trust").and(warp::get()).and(request()).and_then(handlers::trusted_nodes);
+        let revoke = warp::path!("api" / "trust" / String / "revoke")
+            .and(warp::post())
+            .and(require_same_origin())
+            .and(request())
+            .and_then(handlers::revoke_node);
+        list.or(revoke)
     };
 
     let auth_status_route = warp::path("auth-status")
@@ -576,6 +586,7 @@ async fn main() {
         .or(sessions_list_route)
         .or(sessions_revoke_route)
         .or(pairing_routes)
+        .or(trust_routes)
         .or(auth_status_route)
         .or(static_route)
         .or(favicon_route)

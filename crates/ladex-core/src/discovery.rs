@@ -177,7 +177,7 @@ impl DiscoveryService {
                 }
             }
 
-            if backoff_active(&auth_backoff, &packet.node_id) {
+            if backoff_active(&auth_backoff, &packet.node_id) || mesh::is_revoked(&state, &packet.node_id) {
                 continue;
             }
 

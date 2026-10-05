@@ -4,6 +4,7 @@
 use crate::types::*;
 use crate::handshake::{self, Reason};
 use crate::server::{peer_ip, PeerAddr};
+use crate::revocation::{self, Revocation, Verdict};
 use crate::{pairing, state, NodeState};
 
 use futures_util::stream::{SplitSink, SplitStream};
@@ -13,11 +14,11 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, Notify, RwLock};
 use warp::ws::{Message, WebSocket, Ws};
 use warp::{Rejection, Reply};
 
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 const HEARTBEAT_INTERVAL:  Duration = Duration::from_secs(5);
 const HEARTBEAT_TIMEOUT:   Duration = Duration::from_secs(15);
@@ -27,9 +28,7 @@ const DATA_QUEUE_FRAMES: usize = 8;
 const MAX_MESH_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 const CLOCK_SKEW_WARN_MS: i64 = 2 * 60 * 1000;
 
-/// The peer could not be authenticated (wrong passphrase, mismatched security
-/// mode, a possible man in the middle, or we are being rate limited). Retrying
-/// immediately will not help.
+/// The peer could not be authenticated, so dialing it again soon would fail the same way.
 #[derive(Debug)]
 pub struct AuthFailure(pub String);
 
@@ -55,6 +54,8 @@ pub struct MeshPeerHandle {
     pub last_seen:  Instant,
     /// Latest measured RTT to this peer (ms); None until the first Pong.
     pub rtt_ms:     Option<u32>,
+    /// Ends the connection, as when the peer is revoked.
+    pub hang_up:    Arc<Notify>,
 }
 
 pub type MeshPeers = Arc<RwLock<HashMap<NodeId, MeshPeerHandle>>>;
@@ -85,6 +86,9 @@ pub enum MeshMessage {
         from_node_id: NodeId,
         payload:      serde_json::Value,
     },
+
+    /// Keys no longer trusted, each signed by the node that revoked it.
+    Revocations { revocations: Vec<Revocation> },
 
     Goodbye { node_id: NodeId },
 }
@@ -278,6 +282,9 @@ async fn peer_departed_cleanup(state: &NodeState, departed_node_id: &NodeId) {
 pub fn spawn_reconnect(addr: IpAddr, http_port: u16, state: NodeState, peer_node_id: NodeId) {
     if addr.is_unspecified() || http_port == 0 {
         tracing::debug!("Reconnect: no dialable address for {peer_node_id} — not attempting");
+        return;
+    }
+    if is_revoked(&state, &peer_node_id) {
         return;
     }
     // The higher id waits a little longer, so two nodes redialing each other don't collide.
@@ -512,6 +519,7 @@ async fn dial(addr: IpAddr, http_port: u16, state: NodeState, pairing: bool) -> 
 
     let (peer_tx, mut peer_rx) = mpsc::unbounded_channel::<MeshMessage>();
     let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(DATA_QUEUE_FRAMES);
+    let hang_up = Arc::new(Notify::new());
     let registered = register_peer(&state, MeshPeerHandle {
         node_id:   peer_node_id.clone(),
         node_name: peer_node_name.clone(),
@@ -522,6 +530,7 @@ async fn dial(addr: IpAddr, http_port: u16, state: NodeState, pairing: bool) -> 
         serve_slots: Arc::new(tokio::sync::Semaphore::new(crate::transfer::SERVE_SLOTS)),
         last_seen: Instant::now(),
         rtt_ms:    None,
+        hang_up:   hang_up.clone(),
     }).await;
     if !registered {
         tracing::warn!("Mesh: duplicate after handshake with {peer_node_id} — dropping");
@@ -556,8 +565,14 @@ async fn dial(addr: IpAddr, http_port: u16, state: NodeState, pairing: bool) -> 
     let state_rd   = state.clone();
     let peer_id_rd = peer_node_id.clone();
     let sender_rd  = peer_tx.clone();
+    let write_abort = write_task.abort_handle();
     let read_task  = tokio::spawn(async move {
-        while let Some(result) = tt_rx.next().await {
+        loop {
+            let result = tokio::select! {
+                result = tt_rx.next() => result,
+                () = hang_up.notified() => break,
+            };
+            let Some(result) = result else { break };
             match result {
                 Ok(msg) if msg.is_text() => {
                     let text = msg.to_text().unwrap_or("");
@@ -572,6 +587,7 @@ async fn dial(addr: IpAddr, http_port: u16, state: NodeState, pairing: bool) -> 
                 _ => {}
             }
         }
+        write_abort.abort();
         if connection_ended(&state_rd, &peer_id_rd, &sender_rd).await {
             spawn_reconnect(addr, http_port, state_rd.clone(), peer_id_rd.clone());
         }
@@ -592,6 +608,7 @@ async fn run_connection(
 ) {
     let (peer_tx, mut peer_rx) = mpsc::unbounded_channel::<MeshMessage>();
     let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(DATA_QUEUE_FRAMES);
+    let hang_up = Arc::new(Notify::new());
     let registered = register_peer(&state, MeshPeerHandle {
         node_id:   peer_node_id.clone(),
         node_name: peer_node_name.clone(),
@@ -602,6 +619,7 @@ async fn run_connection(
         serve_slots: Arc::new(tokio::sync::Semaphore::new(crate::transfer::SERVE_SLOTS)),
         last_seen: Instant::now(),
         rtt_ms:    None,
+        hang_up:   hang_up.clone(),
     }).await;
     if !registered {
         return;
@@ -631,7 +649,12 @@ async fn run_connection(
         }
     });
 
-    while let Some(result) = ws_rx.next().await {
+    loop {
+        let result = tokio::select! {
+            result = ws_rx.next() => result,
+            () = hang_up.notified() => break,
+        };
+        let Some(result) = result else { break };
         match result {
             Ok(msg) if msg.is_text() => {
                 let text = msg.to_str().unwrap_or("");
@@ -654,6 +677,17 @@ async fn run_connection(
 }
 
 async fn post_handshake_sync(peer_tx: &mpsc::UnboundedSender<MeshMessage>, state: &NodeState) {
+    // First, so a node revoked while this peer was away is dropped before anything else arrives from it.
+    match state.trust.revocations() {
+        Ok(revocations) if !revocations.is_empty() => {
+            for revocations in revocations.chunks(revocation::MAX_PER_MESSAGE) {
+                let _ = peer_tx.send(MeshMessage::Revocations { revocations: revocations.to_vec() });
+            }
+        }
+        Ok(_) => {}
+        Err(e) => tracing::error!("Mesh: could not read the revocations to pass on: {e:#}"),
+    }
+
     // Tombstones too: a peer that was away must learn what was unshared meanwhile.
     let files: Vec<FileMetadata> = state.files.read().await.values().cloned().collect();
     let _ = peer_tx.send(MeshMessage::CatalogSync { files });
@@ -759,11 +793,84 @@ pub(crate) async fn dispatch(msg: &MeshMessage, from_node_id: &NodeId, state: &N
             }
         }
 
+        MeshMessage::Revocations { revocations } => receive_revocations(state, from_node_id, revocations).await,
+
         MeshMessage::Goodbye { node_id } => {
             tracing::info!("Mesh: Goodbye from {node_id}");
             remove_mesh_peer(state, node_id).await;
         }
 
+    }
+}
+
+/// Whether this node holds a revocation of that node.
+pub fn is_revoked(state: &NodeState, node_id: &str) -> bool {
+    state.trust.revocation(node_id).is_ok_and(|revocation| revocation.is_some())
+}
+
+/// What came of revoking a node from this one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Revoked {
+    Now,
+    Already,
+    UnknownNode,
+}
+
+/// Revokes a node this one knows, in this node's name, and tells the rest of the mesh.
+pub async fn revoke_node(state: &NodeState, node_id: &str) -> anyhow::Result<Revoked> {
+    if state.trust.revocation(node_id)?.is_some() {
+        return Ok(Revoked::Already);
+    }
+    let Some(node) = state.trust.get(node_id)? else {
+        return Ok(Revoked::UnknownNode);
+    };
+    let revocation = Revocation::issue(&state.identity, &node.public_key, crate::hlc::wall_clock_ms());
+    if !state.trust.revoke(&revocation)? {
+        return Ok(Revoked::Already);
+    }
+    tracing::warn!("Trust: revoked {} ({node_id})", node.name);
+    revocations_applied(state, None, vec![revocation]).await;
+    Ok(Revoked::Now)
+}
+
+async fn receive_revocations(state: &NodeState, from_node_id: &NodeId, revocations: &[Revocation]) {
+    if revocations.len() > revocation::MAX_PER_MESSAGE {
+        tracing::warn!("Mesh: {from_node_id} sent {} revocations at once — ignored", revocations.len());
+        return;
+    }
+    let mut applied = Vec::new();
+    for revocation in revocations {
+        match revocation::receive(&state.trust, &state.identity, from_node_id, revocation) {
+            Ok(Verdict::Applied) => {
+                tracing::warn!("Trust: {} revoked by {} (via {from_node_id})", revocation.node_id(), revocation.issuer_id());
+                applied.push(revocation.clone());
+            }
+            Ok(Verdict::AlreadyKnown) => {}
+            Ok(Verdict::Refused(why)) => {
+                tracing::warn!("Trust: ignored a revocation of {} from {from_node_id}: {why}", revocation.node_id());
+            }
+            Err(e) => tracing::error!("Trust: could not record the revocation of {}: {e:#}", revocation.node_id()),
+        }
+    }
+    revocations_applied(state, Some(from_node_id), applied).await;
+}
+
+// Drops the revoked nodes and passes the news on to every other peer; nodes that already know it stop it there.
+async fn revocations_applied(state: &NodeState, from_node_id: Option<&NodeId>, revocations: Vec<Revocation>) {
+    if revocations.is_empty() {
+        return;
+    }
+    let peers = state.mesh_peers.read().await;
+    for revocation in &revocations {
+        if let Some(handle) = peers.get(&revocation.node_id()) {
+            handle.hang_up.notify_one();
+        }
+    }
+    let message = MeshMessage::Revocations { revocations };
+    for (node_id, handle) in peers.iter() {
+        if Some(node_id) != from_node_id {
+            let _ = handle.sender.send(message.clone());
+        }
     }
 }
 

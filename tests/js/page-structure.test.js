@@ -9,8 +9,8 @@ const STATIC = path.join(__dirname, '..', '..', 'static');
 const html = fs.readFileSync(path.join(STATIC, 'index.html'), 'utf8');
 
 const scriptsInPage = [...html.matchAll(/<script src="static\/([^"?]+)/g)].map((m) => m[1]);
-// sessions.js and pairing.js are standalone panels, not part of the app class.
-const standalone = ['qrcode.js', 'sessions.js', 'pairing.js'];
+// The panels are standalone scripts, not part of the app class.
+const standalone = ['qrcode.js', 'sessions.js', 'pairing.js', 'trust.js'];
 const ownScripts = scriptsInPage.filter((file) => !standalone.includes(file));
 
 function loadClass() {

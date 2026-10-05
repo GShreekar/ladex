@@ -11,6 +11,7 @@ pub mod websocket;
 pub mod handlers;
 pub mod mesh;
 pub mod pairing;
+pub mod revocation;
 pub mod persist;
 pub mod discovery;
 pub mod state;

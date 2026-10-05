@@ -745,6 +745,11 @@ mod tests {
             self.identity.node_id().to_string()
         }
 
+        fn revoke(&self, other: &Node) {
+            let revocation = crate::revocation::Revocation::issue(&self.identity, &other.identity.public_key(), 0);
+            self.trust.revoke(&revocation).unwrap();
+        }
+
         async fn serve(&self, transport: &mut Pipe) -> Result<Peer, Failure> {
             receive_hello(transport, &self.limiter, DIALER_IP).await?.accept(transport, &self.local()).await
         }
@@ -893,7 +898,7 @@ mod tests {
     async fn a_revoked_key_is_rejected_on_reconnect_even_with_the_passphrase() {
         let (dialer, server) = (Node::new("a", Some("pw")), Node::new("b", Some("pw")));
         handshake(&dialer, &server).await.0.unwrap();
-        server.trust.revoke(&dialer.node_id()).unwrap();
+        server.revoke(&dialer);
 
         let (dialed, served) = handshake(&dialer, &server).await;
         assert!(matches!(dialed, Err(Failure::RejectedBy(Reason::Revoked))));
@@ -904,7 +909,7 @@ mod tests {
     async fn a_dialer_refuses_a_revoked_server() {
         let (dialer, server) = (Node::new("a", Some("pw")), Node::new("b", Some("pw")));
         handshake(&dialer, &server).await.0.unwrap();
-        dialer.trust.revoke(&server.node_id()).unwrap();
+        dialer.revoke(&server);
 
         let (dialed, _) = handshake(&dialer, &server).await;
         assert!(matches!(dialed, Err(Failure::Refused(Reason::Revoked))));
@@ -1169,7 +1174,7 @@ mod tests {
     async fn a_paired_node_that_is_revoked_cannot_join() {
         let (dialer, server) = (Node::new("phone", Some("one")), Node::new("laptop", Some("two")));
         pair_successfully(&dialer, &server).await;
-        server.trust.revoke(&dialer.node_id()).unwrap();
+        server.revoke(&dialer);
         let (dialed, _) = handshake(&dialer, &server).await;
         assert!(matches!(dialed, Err(Failure::RejectedBy(Reason::Revoked))));
     }

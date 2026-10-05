@@ -720,6 +720,7 @@ mod tests {
                 serve_slots: Arc::new(tokio::sync::Semaphore::new(SERVE_SLOTS)),
                 last_seen: Instant::now(),
                 rtt_ms: None,
+                hang_up: Default::default(),
             },
         );
         let (receiver, from_id) = (to.clone(), from.node_id.clone());

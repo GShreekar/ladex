@@ -225,6 +225,74 @@ pub async fn answer_pairing(id: u64, answer: PairingAnswer, peer: Option<PeerAdd
     }
 }
 
+#[derive(serde::Serialize)]
+struct TrustResponse {
+    can_manage: bool,
+    /// False for an open node, which trusts nobody and so has no one to revoke.
+    secured: bool,
+    nodes: Vec<TrustedNodeView>,
+}
+
+#[derive(serde::Serialize)]
+struct TrustedNodeView {
+    #[serde(flatten)]
+    node: crate::trust::TrustedNode,
+    connected: bool,
+    /// Who revoked it, when it is revoked.
+    revoked_by: Option<String>,
+}
+
+/// The nodes this one trusts or has revoked, for the person at this machine.
+pub async fn trusted_nodes(peer: Option<PeerAddr>, state: NodeState) -> Result<Box<dyn Reply>, Rejection> {
+    let can_manage = can_manage(peer);
+    let mut response = TrustResponse { can_manage, secured: state.passphrase.is_some(), nodes: Vec::new() };
+    if !can_manage {
+        return Ok(Box::new(warp::reply::json(&response)));
+    }
+    let nodes = match state.trust.list() {
+        Ok(nodes) => nodes,
+        Err(e) => {
+            tracing::error!("Trust: could not list the trusted nodes: {e:#}");
+            return Ok(json_error("Could not read the trust store", StatusCode::INTERNAL_SERVER_ERROR));
+        }
+    };
+    let connected = state.mesh_peers.read().await;
+    for node in nodes {
+        let revoked_by = node.revoked.then(|| revoker_name(&state, &node.node_id));
+        response.nodes.push(TrustedNodeView { connected: connected.contains_key(&node.node_id), revoked_by, node });
+    }
+    Ok(Box::new(warp::reply::json(&response)))
+}
+
+fn revoker_name(state: &NodeState, node_id: &str) -> String {
+    let Ok(Some(revocation)) = state.trust.revocation(node_id) else {
+        return "this device".to_string();
+    };
+    if revocation.issuer == state.identity.public_key() {
+        return "this device".to_string();
+    }
+    let issuer = revocation.issuer_id();
+    match state.trust.get(&issuer) {
+        Ok(Some(node)) => node.name,
+        _ => issuer,
+    }
+}
+
+/// Revokes a node in this node's name; the rest of the mesh drops it too.
+pub async fn revoke_node(node_id: String, peer: Option<PeerAddr>, state: NodeState) -> Result<Box<dyn Reply>, Rejection> {
+    if !can_manage(peer) {
+        return Ok(json_error("Revoking is only available on the machine running LADEX, at http://localhost", StatusCode::FORBIDDEN));
+    }
+    match crate::mesh::revoke_node(&state, &node_id).await {
+        Ok(crate::mesh::Revoked::Now | crate::mesh::Revoked::Already) => Ok(no_content()),
+        Ok(crate::mesh::Revoked::UnknownNode) => Ok(json_error("This device does not know that node", StatusCode::NOT_FOUND)),
+        Err(e) => {
+            tracing::error!("Trust: could not revoke {node_id}: {e:#}");
+            Ok(json_error("Could not record the revocation", StatusCode::INTERNAL_SERVER_ERROR))
+        }
+    }
+}
+
 // "ip:port", or just "ip" for a node on the same port as this one.
 fn parse_node_address(address: &str, default_port: u16) -> Option<std::net::SocketAddr> {
     let address = address.trim();
@@ -361,6 +429,53 @@ mod tests {
         let reply = list_sessions(None, peer("127.0.0.1:1", false), state).await.unwrap().into_response();
         let text = body_text(reply).await;
         assert!(text.contains("\"auth_required\":false") && text.contains("\"sessions\":[]"));
+    }
+
+    fn trust_a_node(state: &NodeState) -> String {
+        let other = crate::identity::Identity::generate();
+        state.trust.trust(&other.public_key(), "laptop", crate::trust::TrustedVia::Passphrase, 100).unwrap();
+        other.node_id().to_string()
+    }
+
+    async fn trust_list(state: &NodeState, addr: &str) -> serde_json::Value {
+        let reply = trusted_nodes(peer(addr, false), state.clone()).await.unwrap().into_response();
+        serde_json::from_str(&body_text(reply).await).unwrap()
+    }
+
+    #[tokio::test]
+    async fn trusted_nodes_are_hidden_from_other_devices() {
+        let state = NodeState::for_tests(Some("pw"));
+        trust_a_node(&state);
+        let body = trust_list(&state, LAN).await;
+        assert_eq!((body["can_manage"].as_bool(), body["nodes"].as_array().map(Vec::len)), (Some(false), Some(0)));
+    }
+
+    #[tokio::test]
+    async fn only_the_machine_running_ladex_can_revoke_a_node() {
+        let state = NodeState::for_tests(Some("pw"));
+        let node_id = trust_a_node(&state);
+        let refused = revoke_node(node_id.clone(), peer(LAN, true), state.clone()).await.unwrap().into_response();
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        assert!(state.trust.revocation(&node_id).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_node_revoked_here_is_listed_as_revoked_by_this_device() {
+        let state = NodeState::for_tests(Some("pw"));
+        let node_id = trust_a_node(&state);
+        let reply = revoke_node(node_id.clone(), peer("127.0.0.1:1", false), state.clone()).await.unwrap().into_response();
+        assert_eq!(reply.status(), StatusCode::NO_CONTENT);
+        let body = trust_list(&state, "127.0.0.1:1").await;
+        let node = &body["nodes"][0];
+        assert_eq!((node["node_id"].as_str(), node["revoked"].as_bool()), (Some(node_id.as_str()), Some(true)));
+        assert_eq!(node["revoked_by"], "this device");
+    }
+
+    #[tokio::test]
+    async fn revoking_a_node_this_one_does_not_know_is_not_found() {
+        let state = NodeState::for_tests(Some("pw"));
+        let reply = revoke_node("nobody".into(), peer("127.0.0.1:1", false), state).await.unwrap().into_response();
+        assert_eq!(reply.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

@@ -1477,6 +1477,16 @@ body.drag-over::after {
     word-break: break-word;
 }
 
+.session-row.revoked .session-name {
+    color: rgba(226, 232, 240, 0.5);
+    text-decoration: line-through;
+}
+
+.btn.secondary.danger {
+    border-color: rgba(255, 119, 198, 0.8);
+    color: #ff77c6;
+}
+
 .pairing-form {
     display: flex;
     gap: 8px;
