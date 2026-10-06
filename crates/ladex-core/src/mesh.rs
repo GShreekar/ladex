@@ -17,6 +17,8 @@ use tokio::sync::{mpsc, Notify, RwLock};
 use warp::ws::{Message, WebSocket, Ws};
 use warp::{Rejection, Reply};
 
+pub mod endpoint;
+
 pub const PROTOCOL_VERSION: u32 = 6;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);

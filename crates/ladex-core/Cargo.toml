@@ -44,6 +44,8 @@ ed25519-dalek.workspace = true
 keyring.workspace = true
 data-encoding.workspace = true
 redb.workspace = true
+quinn.workspace = true
+rustls.workspace = true
 
 [dev-dependencies]
 # Turns on the testing module for this crate's own integration tests in tests/.

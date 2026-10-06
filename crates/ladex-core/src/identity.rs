@@ -47,6 +47,11 @@ impl Identity {
     pub fn sign(&self, message: &[u8]) -> Signature {
         self.key.sign(message)
     }
+
+    /// The private key's 32-byte seed, for handing to TLS; never stored or sent anywhere else.
+    pub(crate) fn secret_bytes(&self) -> [u8; 32] {
+        self.key.to_bytes()
+    }
 }
 
 /// `base32(SHA-256(public key))`, first 20 characters (100 bits), lowercase.

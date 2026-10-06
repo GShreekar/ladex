@@ -49,4 +49,7 @@ ed25519-dalek = "2"
 keyring = "4"
 data-encoding = "2"
 redb = "4"
+# platform-verifier is off: mesh peers are checked against node keys, never OS certificate roots.
+quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
 ladex-core = { path = "crates/ladex-core" }
