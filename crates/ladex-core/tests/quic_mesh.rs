@@ -68,6 +68,31 @@ async fn catalog_and_chat_reach_a_peer_over_quic() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_device_joining_one_node_is_seen_by_its_peer_over_quic() {
+    let nodes = spawn_joined_pair("pw").await;
+    let (a, b) = (&nodes[0], &nodes[1]);
+    a.connect_device("device_on_a").await;
+    assert!(eventually(async || b.devices().await.contains("device_on_a")).await);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn heartbeats_over_quic_measure_the_round_trip() {
+    let nodes = spawn_joined_pair("pw").await;
+    let a = &nodes[0];
+    let b_node_id = nodes[1].node_id();
+    let measured = eventually(async || a.state.mesh_peers.read().await[b_node_id].rtt_ms.is_some()).await;
+    assert!(measured, "no pong ever came back");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_goodbye_over_quic_drops_the_departing_node() {
+    let nodes = spawn_joined_pair("pw").await;
+    let (a, b) = (&nodes[0], &nodes[1]);
+    b.say_goodbye().await;
+    assert!(eventually(async || a.mesh_peers().await.is_empty()).await, "the node that said goodbye is still listed");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_file_of_several_chunks_downloads_over_quic() {
     let nodes = spawn_joined_pair("pw").await;
     let (a, b) = (&nodes[0], &nodes[1]);

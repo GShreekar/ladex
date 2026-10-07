@@ -2,7 +2,8 @@
 //!
 //! Stream 0 starts with an [`Opening`] from the dialer. A dialer that trusts the listener asks to resume; the listener agrees
 //! only if it trusts the dialer too, and otherwise both fall back to the full handshake on the same stream. TLS has already
-//! proven each side's key, so resuming needs no passphrase. After that, stream 0 carries [`MeshMessage`]s and chunk frames.
+//! proven each side's key, so resuming needs no passphrase. After that, stream 0 carries postcard-encoded [`MeshMessage`]s
+//! and chunk frames, each a length-prefixed frame that starts with a kind byte.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -268,18 +269,190 @@ async fn write_frames(mut sender: FrameSender, mut messages: mpsc::UnboundedRece
 }
 
 fn message_frame(message: &MeshMessage) -> Vec<u8> {
-    let mut frame = vec![KIND_MESSAGE];
-    serde_json::to_writer(&mut frame, message).expect("mesh messages always serialize");
-    frame
+    let frame = vec![KIND_MESSAGE];
+    postcard::to_extend(message, frame).expect("mesh messages always serialize")
+}
+
+fn decode_message(bytes: &[u8]) -> Result<MeshMessage, postcard::Error> {
+    let (message, rest) = postcard::take_from_bytes(bytes)?;
+    // Leftover bytes mean the peer encoded something else, so the message read from the front can't be trusted.
+    if !rest.is_empty() {
+        return Err(postcard::Error::DeserializeBadEncoding);
+    }
+    Ok(message)
 }
 
 async fn handle_frame(state: &NodeState, peer_node_id: &NodeId, frame: &[u8]) {
     match frame.split_first() {
-        Some((&KIND_MESSAGE, json)) => match serde_json::from_slice::<MeshMessage>(json) {
+        Some((&KIND_MESSAGE, bytes)) => match decode_message(bytes) {
             Ok(message) => dispatch(&message, peer_node_id, state).await,
             Err(e) => tracing::warn!("Mesh: unreadable message from {peer_node_id}: {e}"),
         },
         Some((&KIND_CHUNKS, chunks)) => crate::transfer::on_binary_frame(state, peer_node_id, chunks),
         _ => tracing::warn!("Mesh: unknown frame from {peer_node_id} — ignored"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hlc::Stamp;
+    use crate::identity::Identity;
+    use crate::revocation::Revocation;
+    use crate::types::{FileMetadata, Holder, PeerInfo, ServerMessage, TextMessage};
+
+    fn stamp() -> Stamp {
+        Stamp { wall: 1_700_000_000_000, counter: 3, node: "node_a".into() }
+    }
+
+    fn file() -> FileMetadata {
+        FileMetadata {
+            id: "file_1".into(),
+            name: "notes.txt".into(),
+            size: 42,
+            mime_type: "text/plain".into(),
+            uploader_id: "device_1".into(),
+            uploader_node: "node_a".into(),
+            holders: [("node_a".to_string(), Holder { since: stamp(), present: true })].into(),
+            uploaded_at: chrono::Utc::now(),
+            created_at: 1,
+            version: stamp(),
+            deleted: false,
+            deleted_at: 0,
+            manifest_root: Some("ab".repeat(32)),
+            is_folder: false,
+            parent: Some("folder_1".into()),
+            folder_bytes: 0,
+            folder_files: 0,
+        }
+    }
+
+    fn text(id: &str) -> TextMessage {
+        TextMessage {
+            id: id.into(),
+            content: "hello".into(),
+            sender_id: "device_1".into(),
+            sender_name: Some("Ada".into()),
+            timestamp: chrono::Utc::now(),
+            created_at: 7,
+        }
+    }
+
+    fn device() -> PeerInfo {
+        PeerInfo {
+            session_id: "device_1".into(),
+            connected_at: chrono::Utc::now(),
+            user_agent: Some("Firefox".into()),
+            hosting_node_id: Some("node_a".into()),
+            node_rtt_ms: Some(12),
+            left: true,
+            left_at: Some(chrono::Utc::now()),
+            hosting_node_name: Some("laptop".into()),
+            nickname: None,
+            version: stamp(),
+        }
+    }
+
+    fn encode(message: &MeshMessage) -> Vec<u8> {
+        message_frame(message)[1..].to_vec()
+    }
+
+    /// Decodes the message and checks it encodes back to the same bytes, so no field was lost or changed.
+    fn assert_survives_postcard(message: MeshMessage) -> MeshMessage {
+        let bytes = encode(&message);
+        let decoded = decode_message(&bytes).unwrap_or_else(|e| panic!("{message:?} did not decode: {e}"));
+        assert_eq!(encode(&decoded), bytes);
+        decoded
+    }
+
+    #[test]
+    fn a_message_frame_starts_with_the_message_kind() {
+        assert_eq!(message_frame(&MeshMessage::Ping { ts: 1 })[0], KIND_MESSAGE);
+    }
+
+    #[test]
+    fn a_catalog_sync_survives_postcard() {
+        assert_survives_postcard(MeshMessage::CatalogSync { files: vec![file()] });
+    }
+
+    #[test]
+    fn presence_survives_postcard() {
+        assert_survives_postcard(MeshMessage::PeerSync { peers: vec![device()] });
+    }
+
+    #[test]
+    fn a_chat_history_survives_postcard() {
+        assert_survives_postcard(MeshMessage::ChatSync { messages: vec![text("m1"), text("m2")] });
+    }
+
+    #[test]
+    fn a_chat_message_survives_postcard() {
+        assert_survives_postcard(MeshMessage::ChatMessage { message: text("m1") });
+    }
+
+    #[test]
+    fn heartbeats_survive_postcard() {
+        assert_survives_postcard(MeshMessage::Ping { ts: u64::MAX });
+        assert_survives_postcard(MeshMessage::Pong { ts: 0 });
+    }
+
+    #[test]
+    fn a_goodbye_survives_postcard() {
+        assert_survives_postcard(MeshMessage::Goodbye { node_id: "node_a".into() });
+    }
+
+    #[test]
+    fn transfer_requests_survive_postcard() {
+        assert_survives_postcard(MeshMessage::GetManifest { file_id: "file_1".into() });
+        assert_survives_postcard(MeshMessage::Manifest { file_id: "file_1".into(), size: 3, hashes: "cd".repeat(32) });
+        assert_survives_postcard(MeshMessage::GetChunks { file_id: "file_1".into(), indices: vec![0, 5, 300] });
+        assert_survives_postcard(MeshMessage::ChunkMap { file_id: "file_1".into(), chunks: 9, bitmap: "ff01".into() });
+        assert_survives_postcard(MeshMessage::ChunkError { file_id: "file_1".into(), index: 2, reason: "gone".into() });
+    }
+
+    #[test]
+    fn a_revocation_still_verifies_after_postcard() {
+        let revocation = Revocation::issue(&Identity::generate(), &Identity::generate().public_key(), 5);
+        let MeshMessage::Revocations { revocations } = assert_survives_postcard(MeshMessage::Revocations { revocations: vec![revocation] })
+        else {
+            panic!("decoded as another message");
+        };
+        assert!(revocations[0].is_signed());
+    }
+
+    #[test]
+    fn a_relayed_signal_still_reads_as_a_server_message_after_postcard() {
+        let offer = ServerMessage::IncomingFileOffer { file_id: "file_1".into(), from_session_id: "device_1".into() };
+        let relay = MeshMessage::SignalRelay {
+            to_node_id: "node_b".into(),
+            from_node_id: "node_a".into(),
+            to_session_id: "device_2".into(),
+            signal: serde_json::to_string(&offer).unwrap(),
+        };
+        let MeshMessage::SignalRelay { signal, .. } = assert_survives_postcard(relay) else { panic!("decoded as another message") };
+        assert!(matches!(serde_json::from_str(&signal).unwrap(), ServerMessage::IncomingFileOffer { .. }));
+    }
+
+    #[test]
+    fn trailing_bytes_after_a_message_are_refused() {
+        let mut bytes = encode(&MeshMessage::Ping { ts: 1 });
+        bytes.push(0);
+        assert!(decode_message(&bytes).is_err());
+    }
+
+    #[test]
+    fn an_unknown_message_variant_is_refused() {
+        assert!(decode_message(&[200]).is_err());
+    }
+
+    #[test]
+    fn a_truncated_message_is_refused() {
+        let bytes = encode(&MeshMessage::ChatMessage { message: text("m1") });
+        assert!(decode_message(&bytes[..bytes.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn a_json_message_from_an_older_node_is_refused() {
+        assert!(decode_message(br#"{"type":"ping","ts":1}"#).is_err());
     }
 }

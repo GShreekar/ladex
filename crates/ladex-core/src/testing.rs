@@ -14,7 +14,7 @@ use warp::Filter;
 use crate::identity::Identity;
 use crate::mesh::endpoint::MeshEndpoint;
 use crate::store::CHUNK_SIZE;
-use crate::types::{FileMetadata, Holder, NodeId, TextMessage};
+use crate::types::{FileMetadata, Holder, NodeId, PeerInfo, TextMessage};
 use crate::{files_api, mesh, ratelimit, server, state, tls, NodeState};
 
 mod faulty_link;
@@ -280,6 +280,30 @@ impl NodeHandle {
         state::apply_chat_message(&self.state, message.clone()).await;
         state::push_message_to_mesh(&self.state.mesh_peers, message.clone()).await;
         message
+    }
+
+    /// Connects a browser device to this node and tells the mesh it is here.
+    pub async fn connect_device(&self, session_id: &str) -> PeerInfo {
+        let device = PeerInfo {
+            session_id: session_id.to_string(),
+            connected_at: chrono::Utc::now(),
+            user_agent: Some("test browser".to_string()),
+            hosting_node_id: Some(self.state.node_id.clone()),
+            node_rtt_ms: None,
+            left: false,
+            left_at: None,
+            hosting_node_name: Some(self.state.node_name.clone()),
+            nickname: None,
+            version: self.state.clock.now(),
+        };
+        self.state.local_peers.write().await.insert(device.session_id.clone(), device.clone());
+        state::push_peer_to_mesh(&self.state.mesh_peers, device.clone()).await;
+        device
+    }
+
+    /// Devices this node knows of, wherever they are hosted.
+    pub async fn devices(&self) -> BTreeSet<String> {
+        self.state.local_peers.read().await.keys().cloned().collect()
     }
 
     /// Leaves the mesh the way a node does on Ctrl-C.

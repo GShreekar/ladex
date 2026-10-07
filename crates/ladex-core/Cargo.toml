@@ -13,6 +13,7 @@ test-support = ["dep:tempfile"]
 warp.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+postcard.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 anyhow.workspace = true
