@@ -111,9 +111,13 @@ impl MeshEndpoint {
         self.endpoint.accept().await.map(Accepting)
     }
 
-    /// Closes every connection and waits until the peers have been told.
-    pub async fn close(&self) {
+    /// Closes every connection at once; peers are told, but nothing waits for them to hear it.
+    pub fn close(&self) {
         self.endpoint.close(0u32.into(), b"node shutting down");
+    }
+
+    /// Waits until every closed connection has told its peer.
+    pub async fn wait_idle(&self) {
         self.endpoint.wait_idle().await;
     }
 }
@@ -412,7 +416,7 @@ mod tests {
     #[tokio::test]
     async fn accept_ends_once_the_endpoint_is_closed() {
         let a = node();
-        a.endpoint.close().await;
+        a.endpoint.close();
         assert!(a.endpoint.accept().await.is_none());
     }
 

@@ -63,6 +63,12 @@ pub struct NodeState {
     /// Connected mesh peers, by node id.
     pub mesh_peers: mesh::MeshPeers,
 
+    /// The QUIC endpoint other nodes connect to; None for unit tests that need no network.
+    pub mesh_endpoint: Option<Arc<mesh::endpoint::MeshEndpoint>>,
+
+    /// The UDP port of `mesh_endpoint`, announced by discovery.
+    pub quic_port: u16,
+
     /// Required for browser logins and proven (never sent) in the mesh handshake; None = open node.
     pub passphrase: Option<String>,
 
@@ -136,6 +142,8 @@ impl NodeState {
             trust: Arc::new(trust::TrustStore::open(&data_dir).unwrap()),
             pairings: Arc::new(pairing::Pairings::new()),
             mesh_peers: Arc::new(RwLock::new(HashMap::new())),
+            mesh_endpoint: None,
+            quic_port: 0,
             passphrase: passphrase.map(String::from),
             tls_fingerprint: Vec::new(),
             auth_limiter: Arc::new(ratelimit::AttemptLimiter::new(policy())),

@@ -18,8 +18,11 @@ use warp::ws::{Message, WebSocket, Ws};
 use warp::{Rejection, Reply};
 
 pub mod endpoint;
+mod frames;
+pub mod quic;
 
-pub const PROTOCOL_VERSION: u32 = 6;
+// 7: nodes find each other's QUIC endpoints through discovery and talk over QUIC.
+pub const PROTOCOL_VERSION: u32 = 7;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -242,6 +245,48 @@ pub async fn remove_mesh_peer(state: &NodeState, peer_node_id: &NodeId) {
     }
 }
 
+/// What a connection's writer drains, and how its reader learns the peer was revoked.
+struct Session {
+    sender: mpsc::UnboundedSender<MeshMessage>,
+    messages: mpsc::UnboundedReceiver<MeshMessage>,
+    data: mpsc::Receiver<Vec<u8>>,
+    hang_up: Arc<Notify>,
+}
+
+/// Where an authenticated peer can be reached: its browser-facing address, and how to redial it if it drops.
+struct PeerAddress {
+    addr: SocketAddr,
+    http_port: u16,
+    redial: Option<SocketAddr>,
+}
+
+/// Registers a newly authenticated peer, sends it this node's state and starts its heartbeat; None if it is already connected.
+async fn start_session(state: &NodeState, peer_node_id: &NodeId, peer_node_name: &str, address: PeerAddress) -> Option<Session> {
+    let (sender, messages) = mpsc::unbounded_channel::<MeshMessage>();
+    let (data_tx, data) = mpsc::channel::<Vec<u8>>(DATA_QUEUE_FRAMES);
+    let hang_up = Arc::new(Notify::new());
+    let handle = MeshPeerHandle {
+        node_id: peer_node_id.clone(),
+        node_name: peer_node_name.to_string(),
+        addr: address.addr,
+        http_port: address.http_port,
+        sender: sender.clone(),
+        data: data_tx,
+        serve_slots: Arc::new(tokio::sync::Semaphore::new(crate::transfer::SERVE_SLOTS)),
+        last_seen: Instant::now(),
+        rtt_ms: None,
+        hang_up: hang_up.clone(),
+    };
+    if !register_peer(state, handle).await {
+        return None;
+    }
+    tracing::info!("Mesh: registered peer {peer_node_id} ({peer_node_name})");
+    crate::transfer::sources_changed(state);
+    post_handshake_sync(&sender, state).await;
+    spawn_heartbeat(state.clone(), peer_node_id.clone(), sender.clone(), address.redial);
+    Some(Session { sender, messages, data, hang_up })
+}
+
 /// Registers a connection unless the peer is already connected, so only one of two racing dials wins.
 async fn register_peer(state: &NodeState, handle: MeshPeerHandle) -> bool {
     let mut peers = state.mesh_peers.write().await;
@@ -365,14 +410,8 @@ pub async fn broadcast_goodbye(state: &NodeState) {
     tokio::time::sleep(Duration::from_millis(200)).await;
 }
 
-/// Pings one peer periodically, and drops and redials it when Pongs stop.
-pub fn spawn_heartbeat(
-    state: NodeState,
-    peer_node_id: NodeId,
-    sender: mpsc::UnboundedSender<MeshMessage>,
-    peer_addr: IpAddr,
-    http_port: u16,
-) {
+/// Pings one peer periodically, and drops it when Pongs stop; `redial` is where to redial a WebSocket peer.
+fn spawn_heartbeat(state: NodeState, peer_node_id: NodeId, sender: mpsc::UnboundedSender<MeshMessage>, redial: Option<SocketAddr>) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -398,7 +437,9 @@ pub fn spawn_heartbeat(
             if timed_out {
                 tracing::warn!("Heartbeat: peer {peer_node_id} timed out — removing");
                 connection_ended(&state, &peer_node_id, &sender).await;
-                spawn_reconnect(peer_addr, http_port, state.clone(), peer_node_id.clone());
+                if let Some(addr) = redial {
+                    spawn_reconnect(addr.ip(), addr.port(), state.clone(), peer_node_id.clone());
+                }
                 return;
             }
         }
@@ -414,7 +455,7 @@ pub async fn mesh_ws_handler(ws: Ws, peer: Option<PeerAddr>, state: NodeState) -
 async fn handle_inbound(ws: WebSocket, remote_ip: IpAddr, state: NodeState) {
     let (mut ws_tx, mut ws_rx) = ws.split();
     let mut transport = InboundTransport { tx: &mut ws_tx, rx: &mut ws_rx };
-    let peer = match authenticate_inbound(&mut transport, remote_ip, &state).await {
+    let peer = match authenticate_inbound(&mut transport, remote_ip, &state, &state.tls_fingerprint).await {
         Ok(peer) => peer,
         Err(e) => {
             tracing::warn!("Mesh inbound: {remote_ip}: {e}");
@@ -442,14 +483,15 @@ async fn handle_inbound(ws: WebSocket, remote_ip: IpAddr, state: NodeState) {
     run_connection(ws_tx, ws_rx, peer.node_id, peer.name, addr, intro.http_port, state).await;
 }
 
-async fn authenticate_inbound(
-    transport: &mut InboundTransport<'_>,
+async fn authenticate_inbound<T: handshake::Transport>(
+    transport: &mut T,
     remote_ip: IpAddr,
     state: &NodeState,
+    channel_binding: &[u8],
 ) -> Result<handshake::Peer, handshake::Failure> {
     let incoming = handshake::receive_hello(transport, &state.mesh_limiter, remote_ip).await?;
     let our_intro = Intro::ours(state);
-    let local = handshake_local(state, &our_intro, &state.tls_fingerprint);
+    let local = handshake_local(state, &our_intro, channel_binding);
 
     // No duplicate check here: a node already connected by passphrase may pair to pin its key.
     if incoming.is_pairing() {
@@ -556,37 +598,14 @@ async fn dial(addr: IpAddr, http_port: u16, state: NodeState, pairing: bool) -> 
     let (peer_node_id, peer_node_name) = (peer.node_id, peer.name);
     let connected_name = peer_node_name.clone();
 
-    let remote_addr: SocketAddr = format!("{addr}:{http_port}").parse().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
-
-    let (peer_tx, mut peer_rx) = mpsc::unbounded_channel::<MeshMessage>();
-    let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(DATA_QUEUE_FRAMES);
-    let hang_up = Arc::new(Notify::new());
-    let registered = register_peer(
-        &state,
-        MeshPeerHandle {
-            node_id: peer_node_id.clone(),
-            node_name: peer_node_name.clone(),
-            addr: remote_addr,
-            http_port,
-            sender: peer_tx.clone(),
-            data: data_tx,
-            serve_slots: Arc::new(tokio::sync::Semaphore::new(crate::transfer::SERVE_SLOTS)),
-            last_seen: Instant::now(),
-            rtt_ms: None,
-            hang_up: hang_up.clone(),
-        },
-    )
-    .await;
-    if !registered {
+    let remote_addr = SocketAddr::new(addr, http_port);
+    let address = PeerAddress { addr: remote_addr, http_port, redial: Some(remote_addr) };
+    let Some(Session { sender: peer_tx, messages: mut peer_rx, data: mut data_rx, hang_up }) =
+        start_session(&state, &peer_node_id, &peer_node_name, address).await
+    else {
         tracing::warn!("Mesh: duplicate after handshake with {peer_node_id} — dropping");
         return Ok(connected_name);
-    }
-    tracing::info!("Mesh: registered peer {peer_node_id} ({peer_node_name})");
-    crate::transfer::sources_changed(&state);
-
-    post_handshake_sync(&peer_tx, &state).await;
-
-    spawn_heartbeat(state.clone(), peer_node_id.clone(), peer_tx.clone(), addr, http_port);
+    };
 
     let write_task = tokio::spawn(async move {
         use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -656,34 +675,12 @@ async fn run_connection(
     http_port: u16,
     state: NodeState,
 ) {
-    let (peer_tx, mut peer_rx) = mpsc::unbounded_channel::<MeshMessage>();
-    let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(DATA_QUEUE_FRAMES);
-    let hang_up = Arc::new(Notify::new());
-    let registered = register_peer(
-        &state,
-        MeshPeerHandle {
-            node_id: peer_node_id.clone(),
-            node_name: peer_node_name.clone(),
-            addr,
-            http_port,
-            sender: peer_tx.clone(),
-            data: data_tx,
-            serve_slots: Arc::new(tokio::sync::Semaphore::new(crate::transfer::SERVE_SLOTS)),
-            last_seen: Instant::now(),
-            rtt_ms: None,
-            hang_up: hang_up.clone(),
-        },
-    )
-    .await;
-    if !registered {
+    let address = PeerAddress { addr, http_port, redial: Some(SocketAddr::new(addr.ip(), http_port)) };
+    let Some(Session { sender: peer_tx, messages: mut peer_rx, data: mut data_rx, hang_up }) =
+        start_session(&state, &peer_node_id, &peer_node_name, address).await
+    else {
         return;
-    }
-    tracing::info!("Mesh: registered inbound peer {peer_node_id} ({peer_node_name})");
-    crate::transfer::sources_changed(&state);
-
-    post_handshake_sync(&peer_tx, &state).await;
-
-    spawn_heartbeat(state.clone(), peer_node_id.clone(), peer_tx.clone(), addr.ip(), http_port);
+    };
 
     let write_task = tokio::spawn(async move {
         loop {

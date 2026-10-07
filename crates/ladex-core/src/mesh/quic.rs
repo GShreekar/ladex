@@ -1,0 +1,285 @@
+//! Mesh connections over QUIC: open stream 0, run the handshake unless both nodes already trust each other, then the control loop.
+//!
+//! Stream 0 starts with an [`Opening`] from the dialer. A dialer that trusts the listener asks to resume; the listener agrees
+//! only if it trusts the dialer too, and otherwise both fall back to the full handshake on the same stream. TLS has already
+//! proven each side's key, so resuming needs no passphrase. After that, stream 0 carries [`MeshMessage`]s and chunk frames.
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::Context;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
+
+use super::endpoint::{Accepting, MeshEndpoint, PeerConnection};
+use super::frames::{FrameSender, FramedStream};
+use super::{
+    authenticate_inbound, connection_ended, dispatch, handshake_local, note_clock_skew, start_session, AuthFailure, Intro, MeshMessage,
+    PeerAddress, Session, MAX_MESH_MESSAGE_BYTES, PROTOCOL_VERSION,
+};
+use crate::handshake::{self, Failure, Reason};
+use crate::trust::Standing;
+use crate::types::NodeId;
+use crate::{validate, NodeState};
+
+// Nothing before the handshake is large, so an unauthenticated peer can't make this node buffer much.
+const OPENING_MAX_FRAME: usize = 64 * 1024;
+const OPENING_TIMEOUT: Duration = Duration::from_secs(10);
+// A refused dialer gets this long to read why before the connection is dropped.
+const REFUSAL_LINGER: Duration = Duration::from_secs(2);
+
+const KIND_MESSAGE: u8 = 0;
+const KIND_CHUNKS: u8 = 1;
+
+/// The dialer's first frame on stream 0.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum Opening {
+    /// The dialer already trusts the listener and asks to skip the handshake.
+    Resume { protocol: u32, name: String, intro: String },
+    /// A handshake hello follows.
+    Handshake,
+}
+
+/// The listener's answer to [`Opening::Resume`].
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ResumeReply {
+    Resumed {
+        name: String,
+        intro: String,
+    },
+    /// The listener doesn't trust the dialer, so the dialer must send a handshake hello next.
+    HandshakeRequired,
+    Refused {
+        reason: Reason,
+    },
+}
+
+/// Dials the node `expected` at `addr`, authenticates it and starts the control loop.
+pub async fn connect(state: &NodeState, addr: SocketAddr, expected: &NodeId) -> anyhow::Result<()> {
+    let endpoint = state.mesh_endpoint.as_ref().context("this node has no QUIC endpoint")?;
+    let connection = endpoint.connect(addr, expected).await?;
+    let (send, recv) = connection.connection.open_bi().await?;
+    let mut stream = FramedStream::new(send, recv, OPENING_MAX_FRAME);
+    let peer = open_outbound(state, &connection, &mut stream).await.map_err(|e| failure_error(addr, e))?;
+    tracing::info!("Mesh: {addr} authenticated over QUIC (peer: {})", peer.node_id);
+    begin(state, connection, peer, stream).await;
+    Ok(())
+}
+
+/// Accepts mesh connections until the endpoint closes, each on its own task.
+pub async fn accept_loop(state: NodeState, endpoint: Arc<MeshEndpoint>) {
+    while let Some(accepting) = endpoint.accept().await {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let remote = accepting.remote_address();
+            if let Err(e) = serve_inbound(&state, accepting).await {
+                tracing::warn!("Mesh inbound (QUIC) from {remote}: {e:#}");
+            }
+        });
+    }
+}
+
+async fn serve_inbound(state: &NodeState, accepting: Accepting) -> anyhow::Result<()> {
+    let connection = accepting.establish().await?;
+    let (send, recv) =
+        tokio::time::timeout(OPENING_TIMEOUT, connection.connection.accept_bi()).await.context("the peer opened no stream in time")??;
+    let mut stream = FramedStream::new(send, recv, OPENING_MAX_FRAME);
+    let peer = match open_inbound(state, &connection, &mut stream).await {
+        Ok(peer) => peer,
+        Err(failure) => {
+            linger(&connection, &mut stream).await;
+            return Err(failure.into());
+        }
+    };
+    tracing::info!("Mesh: inbound QUIC peer {} ({}) authenticated", peer.node_id, peer.name);
+    begin(state, connection, peer, stream).await;
+    Ok(())
+}
+
+async fn open_outbound(state: &NodeState, connection: &PeerConnection, stream: &mut FramedStream) -> Result<handshake::Peer, Failure> {
+    let binding = channel_binding(connection)?;
+    let our_intro = Intro::ours(state);
+    let local = handshake_local(state, &our_intro, &binding);
+    match state.trust.standing(&connection.public_key).map_err(Failure::TrustStore)? {
+        Standing::Revoked => return Err(Failure::Refused(Reason::Revoked)),
+        Standing::Unknown => {
+            send_json(stream, &Opening::Handshake).await?;
+            return same_key(handshake::connect(stream, &local).await?, connection);
+        }
+        Standing::Trusted(_) => {}
+    }
+    let resume = Opening::Resume { protocol: PROTOCOL_VERSION, name: state.node_name.clone(), intro: our_intro.clone() };
+    send_json(stream, &resume).await?;
+    match recv_json(stream).await? {
+        ResumeReply::Resumed { name, intro } => resumed(state, connection, name, intro),
+        ResumeReply::HandshakeRequired => same_key(handshake::connect(stream, &local).await?, connection),
+        ResumeReply::Refused { reason } => Err(Failure::RejectedBy(reason)),
+    }
+}
+
+async fn open_inbound(state: &NodeState, connection: &PeerConnection, stream: &mut FramedStream) -> Result<handshake::Peer, Failure> {
+    let opening = tokio::time::timeout(OPENING_TIMEOUT, recv_json(stream)).await.map_err(|_| Failure::TimedOut)??;
+    if let Opening::Resume { protocol, name, intro } = opening {
+        match resume_decision(state, connection, protocol).await? {
+            Some(reason) => {
+                send_json(stream, &ResumeReply::Refused { reason: reason.clone() }).await?;
+                return Err(Failure::Refused(reason));
+            }
+            None if is_trusted(state, connection)? => {
+                let reply = ResumeReply::Resumed { name: state.node_name.clone(), intro: Intro::ours(state) };
+                send_json(stream, &reply).await?;
+                return resumed(state, connection, name, intro);
+            }
+            None => send_json(stream, &ResumeReply::HandshakeRequired).await?,
+        }
+    }
+    let binding = channel_binding(connection)?;
+    let remote_ip = connection.connection.remote_address().ip();
+    same_key(authenticate_inbound(stream, remote_ip, state, &binding).await?, connection)
+}
+
+/// Why a resuming dialer must be turned away outright, if it must.
+async fn resume_decision(state: &NodeState, connection: &PeerConnection, protocol: u32) -> Result<Option<Reason>, Failure> {
+    if protocol != PROTOCOL_VERSION {
+        return Ok(Some(Reason::ProtocolMismatch { expected: PROTOCOL_VERSION }));
+    }
+    if matches!(state.trust.standing(&connection.public_key).map_err(Failure::TrustStore)?, Standing::Revoked) {
+        return Ok(Some(Reason::Revoked));
+    }
+    if state.mesh_peers.read().await.contains_key(&connection.node_id) {
+        return Ok(Some(Reason::Duplicate));
+    }
+    Ok(None)
+}
+
+fn is_trusted(state: &NodeState, connection: &PeerConnection) -> Result<bool, Failure> {
+    Ok(matches!(state.trust.standing(&connection.public_key).map_err(Failure::TrustStore)?, Standing::Trusted(_)))
+}
+
+/// A peer that skipped the handshake: TLS proved its key, and the trust store vouches for it.
+fn resumed(state: &NodeState, connection: &PeerConnection, name: String, intro: String) -> Result<handshake::Peer, Failure> {
+    if intro.len() > handshake::MAX_INTRO_BYTES {
+        return Err(Failure::Malformed("intro too long"));
+    }
+    let name = validate::clean_label(&name, validate::MAX_NODE_NAME_CHARS);
+    state.trust.mark_seen(&connection.node_id, &name, crate::hlc::wall_clock_ms()).map_err(Failure::TrustStore)?;
+    Ok(handshake::Peer { node_id: connection.node_id.clone(), public_key: connection.public_key, name, intro })
+}
+
+/// The handshake must prove the same key TLS did, or one node could borrow another's identity for half the exchange.
+fn same_key(peer: handshake::Peer, connection: &PeerConnection) -> Result<handshake::Peer, Failure> {
+    if peer.public_key != connection.public_key {
+        return Err(Failure::ProofFailed);
+    }
+    Ok(peer)
+}
+
+fn channel_binding(connection: &PeerConnection) -> Result<Vec<u8>, Failure> {
+    connection.channel_binding().map_err(|e| Failure::Transport(std::io::Error::other(e.to_string())))
+}
+
+async fn send_json<T: Serialize>(stream: &mut FramedStream, value: &T) -> Result<(), Failure> {
+    let bytes = serde_json::to_vec(value).expect("opening frames always serialize");
+    stream.sender.send(&bytes).await.map_err(Failure::Transport)
+}
+
+async fn recv_json<T: DeserializeOwned>(stream: &mut FramedStream) -> Result<T, Failure> {
+    let bytes = stream.receiver.recv().await.map_err(Failure::Transport)?.ok_or(Failure::Closed)?;
+    serde_json::from_slice(&bytes).map_err(|_| Failure::Malformed("unreadable opening frame"))
+}
+
+/// Gives the dialer a moment to read a refusal; it closes the connection itself once it has.
+async fn linger(connection: &PeerConnection, stream: &mut FramedStream) {
+    stream.sender.finish();
+    let _ = tokio::time::timeout(REFUSAL_LINGER, connection.connection.closed()).await;
+}
+
+fn failure_error(addr: SocketAddr, failure: Failure) -> anyhow::Error {
+    let message = format!("Peer {addr}: {failure}");
+    if failure.is_authentication() {
+        anyhow::Error::new(AuthFailure(message))
+    } else {
+        anyhow::anyhow!(message)
+    }
+}
+
+/// Registers the peer and starts its control loop; a peer already connected another way is hung up on.
+async fn begin(state: &NodeState, connection: PeerConnection, peer: handshake::Peer, mut stream: FramedStream) {
+    let intro = Intro::theirs(&peer);
+    note_clock_skew(state, &peer.name, intro.now_ms).await;
+    // The browser-facing address is kept for the UI and restarts; a lost QUIC peer is redialed by discovery instead.
+    let ip = intro.ip.parse().unwrap_or_else(|_| connection.connection.remote_address().ip());
+    let address = PeerAddress { addr: SocketAddr::new(ip, intro.http_port), http_port: intro.http_port, redial: None };
+    let Some(session) = start_session(state, &peer.node_id, &peer.name, address).await else {
+        tracing::warn!("Mesh: duplicate QUIC connection with {} — dropping", peer.node_id);
+        connection.connection.close(0u32.into(), b"already connected");
+        return;
+    };
+    stream.allow_frames_up_to(MAX_MESH_MESSAGE_BYTES + 1);
+    tokio::spawn(control_loop(state.clone(), connection, peer.node_id, stream, session));
+}
+
+async fn control_loop(state: NodeState, connection: PeerConnection, peer_node_id: NodeId, stream: FramedStream, session: Session) {
+    let FramedStream { sender, mut receiver } = stream;
+    let Session { sender: peer_tx, messages, data, hang_up } = session;
+    let writer = tokio::spawn(write_frames(sender, messages, data));
+    loop {
+        let frame = tokio::select! {
+            frame = receiver.recv() => frame,
+            () = hang_up.notified() => break,
+        };
+        match frame {
+            Ok(Some(frame)) => handle_frame(&state, &peer_node_id, &frame).await,
+            Ok(None) => break,
+            Err(e) => {
+                tracing::warn!("Mesh: QUIC connection to {peer_node_id} ended: {e}");
+                break;
+            }
+        }
+    }
+    writer.abort();
+    connection.connection.close(0u32.into(), b"connection ended");
+    connection_ended(&state, &peer_node_id, &peer_tx).await;
+}
+
+async fn write_frames(mut sender: FrameSender, mut messages: mpsc::UnboundedReceiver<MeshMessage>, mut data: mpsc::Receiver<Vec<u8>>) {
+    loop {
+        // Control messages (heartbeats, catalog) always go before chunk data.
+        let frame = tokio::select! {
+            biased;
+            message = messages.recv() => match message {
+                Some(message) => message_frame(&message),
+                None => break,
+            },
+            chunks = data.recv() => match chunks {
+                Some(chunks) => [&[KIND_CHUNKS][..], &chunks].concat(),
+                None => break,
+            },
+        };
+        if sender.send(&frame).await.is_err() {
+            break;
+        }
+    }
+    sender.finish();
+}
+
+fn message_frame(message: &MeshMessage) -> Vec<u8> {
+    let mut frame = vec![KIND_MESSAGE];
+    serde_json::to_writer(&mut frame, message).expect("mesh messages always serialize");
+    frame
+}
+
+async fn handle_frame(state: &NodeState, peer_node_id: &NodeId, frame: &[u8]) {
+    match frame.split_first() {
+        Some((&KIND_MESSAGE, json)) => match serde_json::from_slice::<MeshMessage>(json) {
+            Ok(message) => dispatch(&message, peer_node_id, state).await,
+            Err(e) => tracing::warn!("Mesh: unreadable message from {peer_node_id}: {e}"),
+        },
+        Some((&KIND_CHUNKS, chunks)) => crate::transfer::on_binary_frame(state, peer_node_id, chunks),
+        _ => tracing::warn!("Mesh: unknown frame from {peer_node_id} — ignored"),
+    }
+}

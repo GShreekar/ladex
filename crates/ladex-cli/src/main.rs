@@ -35,6 +35,10 @@ struct Args {
     #[arg(long, default_value = "7878")]
     discovery_port: u16,
 
+    /// UDP port other nodes connect to over QUIC (default: the same number as --port).
+    #[arg(long)]
+    quic_port: Option<u16>,
+
     /// Disable UDP multicast discovery (combine with --peer to connect manually).
     #[arg(long)]
     no_discovery: bool,
@@ -208,6 +212,15 @@ async fn main() {
 
     tracing::info!("Node ID: {node_id} (key kept in {key_location})");
 
+    let quic_port = args.quic_port.unwrap_or(args.port);
+    let mesh_endpoint = match mesh::endpoint::MeshEndpoint::bind(&identity, SocketAddr::from(([0, 0, 0, 0], quic_port))) {
+        Ok(endpoint) => Arc::new(endpoint),
+        Err(e) => {
+            eprintln!("Error: {e:#}. Pick another UDP port with --quic-port.");
+            std::process::exit(1);
+        }
+    };
+
     // Before `state` is built: dialing reads state.tls_client_config.
     let local_ips = tls::local_ipv4_addresses();
     let primary_local_ip: Option<IpAddr> = local_ips.first().copied().or_else(get_local_ip);
@@ -267,6 +280,8 @@ async fn main() {
         trust,
         pairings: Arc::new(pairing::Pairings::new()),
         mesh_peers: Arc::new(RwLock::new(HashMap::new())),
+        mesh_endpoint: Some(mesh_endpoint.clone()),
+        quic_port,
         passphrase,
         tls_fingerprint,
         auth_limiter,
@@ -296,6 +311,7 @@ async fn main() {
         }
     }
     let saver = persist::spawn_saver(state.clone(), &data_dir, saved.as_ref());
+    tokio::spawn(mesh::quic::accept_loop(state.clone(), mesh_endpoint.clone()));
 
     if !args.manual_peers.is_empty() {
         for peer_addr_str in &args.manual_peers {
@@ -322,7 +338,7 @@ async fn main() {
     }
 
     if !args.no_discovery {
-        let announce_packet = discovery::build_announce(&state, args.port);
+        let announce_packet = discovery::build_announce(&state);
         let discovery_port = args.discovery_port;
         let state_disc = state.clone();
 
@@ -389,16 +405,16 @@ async fn main() {
                 tracing::warn!(
                     "AP-ISOLATION-DIAGNOSTIC: No mesh peers discovered after 10 seconds. \
                      Ensure all devices are on the same Wi-Fi network, AP/client isolation \
-                     is disabled on your router, and UDP port 7878 / TCP port 8080 are not \
-                     blocked by a firewall."
+                     is disabled on your router, and the discovery and QUIC UDP ports and the \
+                     HTTP TCP port are not blocked by a firewall."
                 );
                 crate::websocket::broadcast_all(
                     &state_diag,
                     ServerMessage::NoPeersWarning {
                         message: "No other LADEX nodes found on this network after 10 seconds. \
                                   If you expect other devices, check: (1) all devices on same \
-                                  Wi-Fi, (2) AP/client isolation disabled on router, (3) UDP \
-                                  port 7878 and TCP port 8080 not blocked."
+                                  Wi-Fi, (2) AP/client isolation disabled on router, (3) the \
+                                  UDP and TCP ports LADEX uses are not blocked by a firewall."
                             .to_string(),
                     },
                 )
@@ -643,6 +659,8 @@ async fn main() {
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("Shutdown: SIGINT received — sending Goodbye to mesh peers");
             mesh::broadcast_goodbye(&state_shutdown).await;
+            mesh_endpoint.close();
+            let _ = tokio::time::timeout(Duration::from_secs(1), mesh_endpoint.wait_idle()).await;
             saver.flush().await;
             if let Some(handle) = mdns_handle {
                 mdns::shutdown(handle).await;

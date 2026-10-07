@@ -12,6 +12,7 @@ use tokio_rustls::TlsAcceptor;
 use warp::Filter;
 
 use crate::identity::Identity;
+use crate::mesh::endpoint::MeshEndpoint;
 use crate::store::CHUNK_SIZE;
 use crate::types::{FileMetadata, Holder, NodeId, TextMessage};
 use crate::{files_api, mesh, ratelimit, server, state, tls, NodeState};
@@ -59,11 +60,16 @@ pub struct NodeHandle {
     pub state: NodeState,
     pub addr: SocketAddr,
     server: JoinHandle<()>,
+    quic: JoinHandle<()>,
 }
 
 impl Drop for NodeHandle {
     fn drop(&mut self) {
         self.server.abort();
+        self.quic.abort();
+        if let Some(endpoint) = &self.state.mesh_endpoint {
+            endpoint.close();
+        }
     }
 }
 
@@ -73,8 +79,11 @@ pub async fn spawn_node(config: NodeConfig) -> NodeHandle {
     let addr = listener.local_addr().expect("read the bound address");
 
     let identity = Identity::generate();
+    let endpoint = Arc::new(MeshEndpoint::bind(&identity, (Ipv4Addr::LOCALHOST, 0).into()).expect("bind a QUIC endpoint"));
     let mut state = NodeState::for_tests_node(identity.node_id(), config.passphrase.as_deref());
     state.identity = Arc::new(identity);
+    state.quic_port = endpoint.local_addr().expect("read the QUIC port").port();
+    state.mesh_endpoint = Some(endpoint.clone());
     state.node_name = config.name.clone();
     state.http_port = addr.port();
     state.local_ip = Some(addr.ip());
@@ -108,7 +117,9 @@ pub async fn spawn_node(config: NodeConfig) -> NodeHandle {
         let _ = server::serve(listener, acceptor, None, service, api).await;
     });
 
-    let node = NodeHandle { state, addr, server };
+    let quic = tokio::spawn(mesh::quic::accept_loop(state.clone(), endpoint));
+
+    let node = NodeHandle { state, addr, server, quic };
     for peer in &config.peers {
         if let Err(e) = node.connect(*peer).await {
             tracing::warn!("Test node {}: could not join {peer}: {e}", config.name);
@@ -176,6 +187,16 @@ impl NodeHandle {
 
     pub async fn connect(&self, peer: SocketAddr) -> anyhow::Result<()> {
         mesh::connect_to_peer(peer.ip(), peer.port(), self.state.clone()).await
+    }
+
+    /// Where other nodes reach this one over QUIC.
+    pub fn quic_addr(&self) -> SocketAddr {
+        SocketAddr::from((Ipv4Addr::LOCALHOST, self.state.quic_port))
+    }
+
+    /// Joins `peer` over QUIC, as discovery would after hearing its announce.
+    pub async fn connect_quic(&self, peer: &NodeHandle) -> anyhow::Result<()> {
+        mesh::quic::connect(&self.state, peer.quic_addr(), &peer.state.node_id).await
     }
 
     pub async fn mesh_peers(&self) -> BTreeSet<NodeId> {
