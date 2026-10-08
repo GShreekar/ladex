@@ -1,4 +1,4 @@
-//! Pairing two real nodes over the /mesh WebSocket.
+//! Pairing two real nodes over QUIC.
 
 use ladex_core::mesh;
 use ladex_core::pairing::WaitingCode;
@@ -16,6 +16,11 @@ async fn waiting_code(node: &NodeHandle) -> WaitingCode {
     code.unwrap()
 }
 
+fn pair(dialer: &NodeHandle, target: &NodeHandle) -> tokio::task::JoinHandle<anyhow::Result<String>> {
+    let (state, addr) = (dialer.state.clone(), target.addr);
+    tokio::spawn(async move { mesh::quic::pair(&state, addr).await })
+}
+
 fn pinned_by_pairing(node: &NodeHandle, other: &NodeHandle) -> bool {
     match node.state.trust.standing(&other.state.identity.public_key()).unwrap() {
         Standing::Trusted(record) => record.trusted_via == TrustedVia::Pairing,
@@ -25,11 +30,11 @@ fn pinned_by_pairing(node: &NodeHandle, other: &NodeHandle) -> bool {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn nodes_with_different_passphrases_pair_when_both_people_confirm() {
-    let phone = spawn_node(NodeConfig::named("phone").passphrase("one").tls()).await;
-    let laptop = spawn_node(NodeConfig::named("laptop").passphrase("two").tls()).await;
+    let phone = spawn_node(NodeConfig::named("phone").passphrase("one")).await;
+    let laptop = spawn_node(NodeConfig::named("laptop").passphrase("two")).await;
     laptop.state.pairings.open();
 
-    let dialing = tokio::spawn(mesh::pair_with_peer(laptop.addr.ip(), laptop.addr.port(), phone.state.clone()));
+    let dialing = pair(&phone, &laptop);
     let (on_phone, on_laptop) = (waiting_code(&phone).await, waiting_code(&laptop).await);
     assert_eq!(on_phone.request.words, on_laptop.request.words);
     assert_eq!(on_phone.request.name, "laptop");
@@ -50,7 +55,7 @@ async fn a_declined_pairing_pins_nobody() {
     let laptop = spawn_node(NodeConfig::named("laptop").passphrase("pw")).await;
     laptop.state.pairings.open();
 
-    let dialing = tokio::spawn(mesh::pair_with_peer(laptop.addr.ip(), laptop.addr.port(), phone.state.clone()));
+    let dialing = pair(&phone, &laptop);
     let (on_phone, on_laptop) = (waiting_code(&phone).await, waiting_code(&laptop).await);
     phone.state.pairings.answer(on_phone.id, true);
     laptop.state.pairings.answer(on_laptop.id, false);
@@ -66,7 +71,7 @@ async fn a_node_that_has_not_opened_pairing_refuses_it() {
     let phone = spawn_node(NodeConfig::named("phone").passphrase("pw")).await;
     let laptop = spawn_node(NodeConfig::named("laptop").passphrase("pw")).await;
 
-    let failure = mesh::pair_with_peer(laptop.addr.ip(), laptop.addr.port(), phone.state.clone()).await.unwrap_err();
+    let failure = mesh::quic::pair(&phone.state, laptop.addr).await.unwrap_err();
     assert!(failure.to_string().contains("not accepting pairings"), "{failure}");
     assert!(laptop.state.pairings.status().waiting.is_empty());
 }

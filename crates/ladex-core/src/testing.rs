@@ -1,4 +1,4 @@
-//! In-process nodes for integration tests, serving the real /mesh endpoint on 127.0.0.1.
+//! In-process nodes for integration tests, each with a real QUIC endpoint on 127.0.0.1.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{Ipv4Addr, SocketAddr};
@@ -6,22 +6,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
-use tokio_rustls::TlsAcceptor;
-use warp::Filter;
 
 use crate::identity::Identity;
 use crate::mesh::endpoint::MeshEndpoint;
 use crate::store::CHUNK_SIZE;
 use crate::types::{FileMetadata, Holder, NodeId, PeerInfo, TextMessage};
-use crate::{files_api, mesh, ratelimit, server, state, tls, NodeState};
+use crate::{mesh, ratelimit, state, NodeState};
 
 mod faulty_link;
 mod udp_relay;
 pub(crate) use faulty_link::detour;
-pub use faulty_link::{Faults, FaultyLink, LinkedMesh};
-pub use udp_relay::UdpRelay;
+pub use faulty_link::{FaultyLink, LinkedMesh};
+pub use udp_relay::{Faults, UdpRelay};
 
 const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -34,7 +31,6 @@ pub struct NodeConfig {
     pub name: String,
     pub passphrase: Option<String>,
     pub peers: Vec<SocketAddr>,
-    pub tls: bool,
 }
 
 impl NodeConfig {
@@ -51,24 +47,18 @@ impl NodeConfig {
         self.peers.push(addr);
         self
     }
-
-    pub fn tls(mut self) -> Self {
-        self.tls = true;
-        self
-    }
 }
 
 pub struct NodeHandle {
     pub state: NodeState,
+    /// Where other nodes reach this one over QUIC.
     pub addr: SocketAddr,
-    server: JoinHandle<()>,
-    quic: JoinHandle<()>,
+    accepting: JoinHandle<()>,
 }
 
 impl Drop for NodeHandle {
     fn drop(&mut self) {
-        self.server.abort();
-        self.quic.abort();
+        self.accepting.abort();
         if let Some(endpoint) = &self.state.mesh_endpoint {
             endpoint.close();
         }
@@ -77,17 +67,14 @@ impl Drop for NodeHandle {
 
 /// Starts a node and dials its configured peers; a failed dial is logged, not fatal.
 pub async fn spawn_node(config: NodeConfig) -> NodeHandle {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.expect("bind a loopback port");
-    let addr = listener.local_addr().expect("read the bound address");
-
     let identity = Identity::generate();
     let endpoint = Arc::new(MeshEndpoint::bind(&identity, (Ipv4Addr::LOCALHOST, 0).into()).expect("bind a QUIC endpoint"));
+    let addr = endpoint.local_addr().expect("read the QUIC address");
     let mut state = NodeState::for_tests_node(identity.node_id(), config.passphrase.as_deref());
     state.identity = Arc::new(identity);
-    state.quic_port = endpoint.local_addr().expect("read the QUIC port").port();
+    state.quic_port = addr.port();
     state.mesh_endpoint = Some(endpoint.clone());
     state.node_name = config.name.clone();
-    state.http_port = addr.port();
     state.local_ip = Some(addr.ip());
     // Every test node dials from 127.0.0.1, so that one address must not look like a guesser.
     state.mesh_limiter = Arc::new(ratelimit::AttemptLimiter::new(ratelimit::Policy {
@@ -97,31 +84,8 @@ pub async fn spawn_node(config: NodeConfig) -> NodeHandle {
         global_cap: None,
     }));
 
-    let acceptor = if config.tls {
-        tls::install_crypto_provider();
-        let (server_config, fingerprint) = tls::ephemeral_server_identity(&["127.0.0.1".to_string()]).expect("generate a certificate");
-        state.tls_fingerprint = fingerprint;
-        state.tls_client_config = Some(tls::build_client_config());
-        Some(TlsAcceptor::from(server_config))
-    } else {
-        None
-    };
-
-    let mesh_state = state.clone();
-    let routes = warp::path("mesh")
-        .and(warp::ws())
-        .and(warp::ext::optional::<server::PeerAddr>())
-        .and(warp::any().map(move || mesh_state.clone()))
-        .and_then(mesh::mesh_ws_handler);
-    let service = warp::service(routes);
-    let api = files_api::FilesApi::new(state.clone());
-    let server = tokio::spawn(async move {
-        let _ = server::serve(listener, acceptor, None, service, api).await;
-    });
-
-    let quic = tokio::spawn(mesh::quic::accept_loop(state.clone(), endpoint));
-
-    let node = NodeHandle { state, addr, server, quic };
+    let accepting = tokio::spawn(mesh::quic::accept_loop(state.clone(), endpoint));
+    let node = NodeHandle { state, addr, accepting };
     for peer in &config.peers {
         if let Err(e) = node.connect(*peer).await {
             tracing::warn!("Test node {}: could not join {peer}: {e}", config.name);
@@ -192,18 +156,14 @@ impl NodeHandle {
         &self.state.node_id
     }
 
+    /// Joins whichever node is at `peer`, as `--peer` does.
     pub async fn connect(&self, peer: SocketAddr) -> anyhow::Result<()> {
-        mesh::connect_to_peer(peer.ip(), peer.port(), self.state.clone()).await
+        mesh::quic::join(&self.state, peer).await
     }
 
-    /// Where other nodes reach this one over QUIC.
-    pub fn quic_addr(&self) -> SocketAddr {
-        SocketAddr::from((Ipv4Addr::LOCALHOST, self.state.quic_port))
-    }
-
-    /// Joins `peer` over QUIC, as discovery would after hearing its announce.
+    /// Joins `peer` by its node id, as discovery would after hearing its announce.
     pub async fn connect_quic(&self, peer: &NodeHandle) -> anyhow::Result<()> {
-        mesh::quic::connect(&self.state, peer.quic_addr(), &peer.state.node_id).await
+        mesh::quic::connect(&self.state, peer.addr, &peer.state.node_id).await
     }
 
     pub async fn mesh_peers(&self) -> BTreeSet<NodeId> {

@@ -43,7 +43,7 @@ struct Args {
     #[arg(long)]
     no_discovery: bool,
 
-    /// Peer node to connect to directly, as <ip>:<http_port>; repeatable.
+    /// Peer node to connect to directly, as <ip>:<quic_port>; repeatable.
     #[arg(long = "peer")]
     manual_peers: Vec<String>,
 
@@ -104,7 +104,7 @@ impl warp::reject::Reject for Unauthorized {}
 struct AuthenticationRequired;
 impl warp::reject::Reject for AuthenticationRequired {}
 
-// WebSocket upgrades bypass the same-origin policy and CORS, so any web page could open one to this node; the Origin checks below stop that.
+// WebSocket upgrades bypass the same-origin policy and CORS, so any web page could open one to this node; the Origin check below stops that.
 
 #[derive(Debug)]
 struct InvalidOrigin;
@@ -119,19 +119,6 @@ fn require_same_origin() -> impl Filter<Extract = (), Error = warp::Rejection> +
             match (origin_host, host.as_deref()) {
                 (Some(o), Some(h)) if o == h => Ok(()),
                 _ => Err(warp::reject::custom(InvalidOrigin)),
-            }
-        })
-        .untuple_one()
-}
-
-/// For /mesh: nodes never send an Origin header and browsers always do, so any request with one is refused.
-fn reject_browser_origin() -> impl Filter<Extract = (), Error = warp::Rejection> + Clone {
-    warp::header::optional::<String>("origin")
-        .and_then(|origin: Option<String>| async move {
-            if origin.is_none() {
-                Ok(())
-            } else {
-                Err(warp::reject::custom(InvalidOrigin))
             }
         })
         .untuple_one()
@@ -221,7 +208,6 @@ async fn main() {
         }
     };
 
-    // Before `state` is built: dialing reads state.tls_client_config.
     let local_ips = tls::local_ipv4_addresses();
     let primary_local_ip: Option<IpAddr> = local_ips.first().copied().or_else(get_local_ip);
 
@@ -244,11 +230,10 @@ async fn main() {
             }
         }
     };
-    let tls_client_config = tls_server_config.as_ref().map(|_| tls::build_client_config());
     if tls_server_config.is_none() && passphrase.is_some() {
         eprintln!(
-            "Warning: TLS is off, so traffic is unencrypted and the mesh handshake cannot detect a \
-             man in the middle. The passphrase itself is still never sent."
+            "Warning: TLS is off, so browser traffic is unencrypted. Nodes still talk to each other over \
+             encrypted QUIC, and the passphrase itself is never sent."
         );
     }
 
@@ -297,7 +282,6 @@ async fn main() {
         session_owners: Arc::new(RwLock::new(HashMap::new())),
         connection_counter: Arc::new(AtomicU64::new(1)),
         clock_alert_at: Arc::new(Mutex::new(None)),
-        tls_client_config,
         http_port: args.port,
         local_ip: primary_local_ip,
         node_name: types::hostname(),
@@ -322,7 +306,7 @@ async fn main() {
                     let addr_clone = addr;
                     tokio::spawn(async move {
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                        if let Err(e) = mesh::connect_to_peer(addr_clone.ip(), addr_clone.port(), state_clone).await {
+                        if let Err(e) = mesh::quic::join(&state_clone, addr_clone).await {
                             tracing::warn!("Manual peer connect to {addr_clone} failed: {e}");
                         }
                     });
@@ -545,14 +529,6 @@ async fn main() {
         }
     });
 
-    let mesh_state = state.clone();
-    let mesh_route = warp::path("mesh")
-        .and(reject_browser_origin())
-        .and(warp::ws())
-        .and(warp::ext::optional::<server::PeerAddr>())
-        .and(warp::any().map(move || mesh_state.clone()))
-        .and_then(mesh::mesh_ws_handler);
-
     let app_state_ws = state.clone();
     let websocket_route = warp::path("ws")
         .and(with_session(state.clone(), false))
@@ -575,7 +551,7 @@ async fn main() {
 
     let cors = warp::cors().allow_any_origin().allow_headers(vec!["content-type"]).allow_methods(vec!["GET", "POST", "PUT", "DELETE"]);
 
-    // More specific routes first; /mesh must come before /ws.
+    // More specific routes first.
     let routes = login_route
         .or(auth_route)
         .or(logout_route)
@@ -586,7 +562,6 @@ async fn main() {
         .or(auth_status_route)
         .or(static_route)
         .or(favicon_route)
-        .or(mesh_route)
         .or(websocket_route)
         .or(index)
         .with(cors)

@@ -715,7 +715,6 @@ mod tests {
                 node_id: to.node_id.clone(),
                 node_name: to.node_name.clone(),
                 addr: "127.0.0.1:1".parse().unwrap(),
-                http_port: 1,
                 sender: control_tx,
                 data: data_tx,
                 serve_slots: Arc::new(tokio::sync::Semaphore::new(SERVE_SLOTS)),

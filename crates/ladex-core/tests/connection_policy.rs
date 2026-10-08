@@ -6,10 +6,10 @@ use ladex_core::mesh;
 use ladex_core::testing::{eventually, eventually_within, fully_connected, spawn_node, NodeConfig, NodeHandle, UdpRelay};
 use ladex_core::types::NodeId;
 
-// Past the 15 s QUIC idle timeout, with room for a busy test machine.
+// Past the QUIC idle timeout, with room for a busy test machine.
 const IDLE_TIMEOUT_WAIT: Duration = Duration::from_secs(25);
 // Still inside the idle timeout, so a silent peer must not have been dropped yet.
-const SHORT_SILENCE: Duration = Duration::from_secs(10);
+const SHORT_SILENCE: Duration = Duration::from_secs(5);
 const SETTLE: Duration = Duration::from_millis(1500);
 
 async fn spawn_pair() -> Vec<NodeHandle> {
@@ -45,7 +45,7 @@ async fn apart(a: &NodeHandle, b: &NodeHandle) -> bool {
 async fn a_discovered_peer_is_dialed_by_the_lower_node() {
     let nodes = spawn_pair().await;
     let (lower, higher) = by_node_id(&nodes);
-    mesh::dialer::dial(&lower.state, &higher.state.node_id, higher.quic_addr());
+    mesh::dialer::dial(&lower.state, &higher.state.node_id, higher.addr);
     assert!(eventually(async || connected_by(&nodes, lower).await).await);
 }
 
@@ -53,7 +53,7 @@ async fn a_discovered_peer_is_dialed_by_the_lower_node() {
 async fn the_higher_node_never_dials() {
     let nodes = spawn_pair().await;
     let (lower, higher) = by_node_id(&nodes);
-    mesh::dialer::dial(&higher.state, &lower.state.node_id, lower.quic_addr());
+    mesh::dialer::dial(&higher.state, &lower.state.node_id, lower.addr);
     tokio::time::sleep(SETTLE).await;
     assert!(apart(lower, higher).await);
     assert!(higher.state.dial_targets.lock().unwrap().is_empty());
@@ -63,7 +63,7 @@ async fn the_higher_node_never_dials() {
 async fn the_dial_loop_ends_once_connected() {
     let nodes = spawn_pair().await;
     let (lower, higher) = by_node_id(&nodes);
-    mesh::dialer::dial(&lower.state, &higher.state.node_id, higher.quic_addr());
+    mesh::dialer::dial(&lower.state, &higher.state.node_id, higher.addr);
     assert!(eventually(async || fully_connected(&nodes).await && lower.state.dial_targets.lock().unwrap().is_empty()).await);
 }
 
@@ -119,7 +119,7 @@ async fn a_peer_that_hangs_up_is_not_redialed() {
 async fn a_silent_peer_is_kept_until_the_idle_timeout_passes() {
     let nodes = spawn_pair().await;
     let (lower, higher) = by_node_id(&nodes);
-    let relay = UdpRelay::start(higher.quic_addr()).await;
+    let relay = UdpRelay::start(higher.addr).await;
     mesh::quic::connect(&lower.state, relay.addr(), &higher.state.node_id).await.unwrap();
     assert!(eventually(async || fully_connected(&nodes).await).await);
 
@@ -133,7 +133,7 @@ async fn a_silent_peer_is_kept_until_the_idle_timeout_passes() {
 async fn a_connection_lost_to_silence_is_redialed_by_the_lower_node_when_the_link_returns() {
     let nodes = spawn_pair().await;
     let (lower, higher) = by_node_id(&nodes);
-    let relay = UdpRelay::start(higher.quic_addr()).await;
+    let relay = UdpRelay::start(higher.addr).await;
     mesh::quic::connect(&lower.state, relay.addr(), &higher.state.node_id).await.unwrap();
     assert!(eventually(async || fully_connected(&nodes).await).await);
 
@@ -141,4 +141,22 @@ async fn a_connection_lost_to_silence_is_redialed_by_the_lower_node_when_the_lin
     assert!(eventually_within(IDLE_TIMEOUT_WAIT, async || apart(lower, higher).await).await, "never dropped");
     relay.resume();
     assert!(eventually_within(IDLE_TIMEOUT_WAIT, async || connected_by(&nodes, lower).await).await, "never redialed");
+}
+
+// The idle timeout plus a keep-alive interval is 13 s, so a killed node is gone by then.
+const KILL_DETECTION: Duration = Duration::from_secs(15);
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_killed_node_is_detected_within_fifteen_seconds() {
+    let nodes = spawn_pair().await;
+    let (lower, higher) = by_node_id(&nodes);
+    let relay = UdpRelay::start(higher.addr).await;
+    mesh::quic::connect(&lower.state, relay.addr(), &higher.state.node_id).await.unwrap();
+    assert!(eventually(async || fully_connected(&nodes).await).await);
+
+    // A killed process says nothing, which the relay's silence reproduces for both ends.
+    let killed_at = std::time::Instant::now();
+    relay.go_silent();
+    assert!(eventually_within(KILL_DETECTION, async || apart(lower, higher).await).await, "not detected within 15 s");
+    println!("detected after {:?}", killed_at.elapsed());
 }

@@ -1,5 +1,7 @@
 //! Mesh connections over QUIC: open stream 0, run the handshake unless both nodes already trust each other, then the control loop.
 //!
+//! A node is dialed either by id, as discovery does, or by address alone, as `--peer`, saved peers and pairing do.
+//!
 //! Stream 0 starts with an [`Opening`] from the dialer. A dialer that trusts the listener asks to resume; the listener agrees
 //! only if it trusts the dialer too, and otherwise both fall back to the full handshake on the same stream. TLS has already
 //! proven each side's key, so resuming needs no passphrase. After that, stream 0 carries postcard-encoded [`MeshMessage`]s
@@ -17,8 +19,8 @@ use tokio::sync::mpsc;
 use super::endpoint::{Accepting, MeshEndpoint, PeerConnection, HUNG_UP};
 use super::frames::{FrameSender, FramedStream};
 use super::{
-    authenticate_inbound, connection_ended, dialer, dispatch, handshake_local, keeps_open_connection, note_clock_skew, start_session,
-    AuthFailure, Intro, Liveness, MeshMessage, PeerAddress, Session, MAX_MESH_MESSAGE_BYTES, PROTOCOL_VERSION,
+    authenticate_inbound, complete_pairing, connection_ended, dialer, dispatch, handshake_local, keeps_open_connection, note_clock_skew,
+    start_session, AuthFailure, Intro, MeshMessage, Session, MAX_MESH_MESSAGE_BYTES, PROTOCOL_VERSION,
 };
 use crate::handshake::{self, Failure, Reason};
 use crate::trust::Standing;
@@ -62,16 +64,55 @@ enum ResumeReply {
     },
 }
 
+/// Who a dial is meant to reach.
+enum Target<'a> {
+    /// The node with this id.
+    Node(&'a NodeId),
+    /// Whichever node is at the address.
+    Address,
+}
+
+/// What to do on stream 0 once connected.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Purpose {
+    Join,
+    Pair,
+}
+
 /// Dials the node `expected` at `addr`, authenticates it and starts the control loop.
 pub async fn connect(state: &NodeState, addr: SocketAddr, expected: &NodeId) -> anyhow::Result<()> {
+    dial(state, addr, Target::Node(expected), Purpose::Join).await.map(drop)
+}
+
+/// Dials whichever node is at `addr`, authenticates it and starts the control loop.
+pub async fn join(state: &NodeState, addr: SocketAddr) -> anyhow::Result<()> {
+    dial(state, addr, Target::Address, Purpose::Join).await.map(drop)
+}
+
+/// Pairs with the node at `addr` once both people confirm the code; returns its name.
+pub async fn pair(state: &NodeState, addr: SocketAddr) -> anyhow::Result<String> {
+    dial(state, addr, Target::Address, Purpose::Pair).await
+}
+
+async fn dial(state: &NodeState, addr: SocketAddr, target: Target<'_>, purpose: Purpose) -> anyhow::Result<String> {
     let endpoint = state.mesh_endpoint.as_ref().context("this node has no QUIC endpoint")?;
-    let connection = endpoint.connect(addr, expected).await?;
+    // In tests a FaultyLink may stand between two nodes, and every dial between them must go through it.
+    #[cfg(any(test, feature = "test-support"))]
+    let addr = crate::testing::detour(&state.node_id, addr);
+    let connection = match target {
+        Target::Node(expected) => endpoint.connect(addr, expected).await?,
+        Target::Address => endpoint.connect_to_address(addr).await?,
+    };
+    if connection.node_id == state.node_id {
+        anyhow::bail!("{addr} is this node itself");
+    }
     let (send, recv) = connection.connection.open_bi().await?;
     let mut stream = FramedStream::new(send, recv, OPENING_MAX_FRAME);
-    let peer = open_outbound(state, &connection, &mut stream).await.map_err(|e| failure_error(addr, e))?;
+    let peer = open_outbound(state, &connection, &mut stream, purpose).await.map_err(|e| failure_error(addr, e))?;
     tracing::info!("Mesh: {addr} authenticated over QUIC (peer: {})", peer.node_id);
+    let name = peer.name.clone();
     begin(state, connection, peer, stream, state.node_id.clone()).await;
-    Ok(())
+    Ok(name)
 }
 
 /// Accepts mesh connections until the endpoint closes, each on its own task.
@@ -105,17 +146,27 @@ async fn serve_inbound(state: &NodeState, accepting: Accepting) -> anyhow::Resul
     Ok(())
 }
 
-async fn open_outbound(state: &NodeState, connection: &PeerConnection, stream: &mut FramedStream) -> Result<handshake::Peer, Failure> {
+async fn open_outbound(
+    state: &NodeState,
+    connection: &PeerConnection,
+    stream: &mut FramedStream,
+    purpose: Purpose,
+) -> Result<handshake::Peer, Failure> {
     let binding = channel_binding(connection)?;
     let our_intro = Intro::ours(state);
     let local = handshake_local(state, &our_intro, &binding);
-    match state.trust.standing(&connection.public_key).map_err(Failure::TrustStore)? {
-        Standing::Revoked => return Err(Failure::Refused(Reason::Revoked)),
-        Standing::Unknown => {
-            send_json(stream, &Opening::Handshake).await?;
-            return same_key(handshake::connect(stream, &local).await?, connection);
-        }
-        Standing::Trusted(_) => {}
+    let standing = state.trust.standing(&connection.public_key).map_err(Failure::TrustStore)?;
+    if matches!(standing, Standing::Revoked) {
+        return Err(Failure::Refused(Reason::Revoked));
+    }
+    if purpose == Purpose::Pair {
+        send_json(stream, &Opening::Handshake).await?;
+        let pending = handshake::start_pairing(stream, &local).await?;
+        return same_key(complete_pairing(state, stream, pending, &local, true).await?, connection);
+    }
+    if matches!(standing, Standing::Unknown) {
+        send_json(stream, &Opening::Handshake).await?;
+        return same_key(handshake::connect(stream, &local).await?, connection);
     }
     let resume = Opening::Resume { protocol: PROTOCOL_VERSION, name: state.node_name.clone(), intro: our_intro.clone() };
     send_json(stream, &resume).await?;
@@ -216,11 +267,10 @@ fn failure_error(addr: SocketAddr, failure: Failure) -> anyhow::Error {
 async fn begin(state: &NodeState, connection: PeerConnection, peer: handshake::Peer, mut stream: FramedStream, dialer: NodeId) {
     let intro = Intro::theirs(&peer);
     note_clock_skew(state, &peer.name, intro.now_ms).await;
-    // The browser-facing address is kept for the UI and restarts; a lost QUIC peer is redialed by discovery instead.
-    let ip = intro.ip.parse().unwrap_or_else(|_| connection.connection.remote_address().ip());
-    let address =
-        PeerAddress { addr: SocketAddr::new(ip, intro.http_port), http_port: intro.http_port, dialer, liveness: Liveness::QuicIdleTimeout };
-    let Some(session) = start_session(state, &peer.node_id, &peer.name, address).await else {
+    let remote = connection.connection.remote_address();
+    let ip = intro.ip.parse().unwrap_or_else(|_| remote.ip());
+    let port = if intro.quic_port == 0 { remote.port() } else { intro.quic_port };
+    let Some(session) = start_session(state, &peer.node_id, &peer.name, SocketAddr::new(ip, port), dialer).await else {
         tracing::warn!("Mesh: duplicate QUIC connection with {} — dropping", peer.node_id);
         connection.connection.close(HUNG_UP, b"already connected");
         return;

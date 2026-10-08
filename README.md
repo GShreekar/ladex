@@ -91,7 +91,7 @@ LADEX is built for networks you partly trust, such as home, a classroom or an of
 
 What to keep in mind:
 
-- Without a passphrase (open mode) or with `--no-tls`, anyone on the network can read or change what you share.
+- Without a passphrase (open mode), anyone on the network can read or change what you share; with `--no-tls`, so can anyone who can watch the traffic between a browser and its node.
 - The passphrase protects joining. Everyone who has it can see and download everything shared on the mesh.
 - The TLS certificate is self-signed, so the first visit from each browser shows a warning.
 - LADEX has not had an independent security audit.
@@ -101,13 +101,13 @@ What to keep in mind:
 - **Mesh handshake**: nodes prove they know the passphrase with a SPAKE2 password-authenticated key exchange. The passphrase, and anything derived from it, never crosses the network, so recording traffic or discovery announcements reveals nothing that can be cracked offline. An attacker gets at most one guess per connection. Each node also proves it holds the private key behind its node id, and a node that has been revoked is refused even if it knows the passphrase.
 - **Pairing**: two nodes can also be paired without sharing a passphrase. Open *Pair a device* (the link icon) on both machines at `http://localhost`, enter one device's address on the other, and confirm only if both screens show the same six words. A device in the middle would make the words differ. Paired nodes then reconnect on their keys alone; incoming pairings are accepted only while the panel is open.
 - **Revoking a node**: *Trusted nodes* (the key icon, at `http://localhost`) lists the nodes this one trusts. *Revoke* disconnects a lost or stolen device and sends a revocation, signed with this node's key, to the whole mesh; every node then refuses that key, and nodes that join later learn of it when they connect. A node trusted only by passphrase cannot revoke one that was paired.
-- **Man-in-the-middle protection**: the handshake is bound to the TLS certificate each node actually connected to. Someone relaying or terminating the connection with their own certificate can't complete it without the passphrase.
+- **Man-in-the-middle protection**: nodes talk over QUIC and prove their keys in the TLS handshake, and the mesh handshake is bound to that very session. A node reached through discovery must hold the key behind the id it announced, and someone relaying or terminating the connection with their own key can't complete the handshake without the passphrase.
 - **Wrong guesses are throttled** at both the browser login and the mesh handshake.
 - **Each browser connection is one device.** A connection can only act as the device it joined as, so one signed-in device can't delete another's files or answer another's downloads. The node, not the browser, decides who uploaded a file and who hosts it.
 - **Nothing from another device is trusted.** File names, sizes and types are cleaned on the node and again on the receiving browser (no path tricks, no look-alike extensions via invisible characters, no Windows device names). A sender can't write more data than it announced, a received folder never overwrites existing files in the folder you chose (clashes become `name (1).ext`), and a resumed download can only continue from bytes you really have.
 - **Clocks can be wrong.** Shared files and devices are ordered with logical clocks, so a device with a wrong clock can't win conflicts or bring back something that was unshared. Updates stamped more than an hour ahead of a device's clock are ignored, and LADEX warns when a peer's clock is more than two minutes off.
 - **Open mode** (no passphrase) has none of these protections. Use it only on networks you trust.
-- **`--no-tls`** turns off encryption and the man-in-the-middle protection; the passphrase itself is still never sent.
+- **`--no-tls`** turns off encryption between browsers and nodes. Nodes always talk to each other over mutually authenticated QUIC, and the passphrase itself is never sent.
 
 ### Basic Operations
 

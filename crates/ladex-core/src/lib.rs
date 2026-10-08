@@ -75,7 +75,7 @@ pub struct NodeState {
     /// Required for browser logins and proven (never sent) in the mesh handshake; None = open node.
     pub passphrase: Option<String>,
 
-    /// Fingerprint of this node's TLS certificate, bound into the mesh handshake; empty without TLS.
+    /// Fingerprint of the TLS certificate the browser UI is served with; empty without TLS.
     pub tls_fingerprint: Vec<u8>,
 
     /// Throttles wrong guesses at the browser login.
@@ -100,9 +100,6 @@ pub struct NodeState {
 
     /// When the user was last shown a clock warning (they are rate limited).
     pub clock_alert_at: Arc<Mutex<Option<std::time::Instant>>>,
-
-    /// Client config for dialing peers over wss://; None with --no-tls.
-    pub tls_client_config: Option<Arc<tokio_rustls::rustls::ClientConfig>>,
 
     /// This node's public listening port, told to peers so they can redial it.
     pub http_port: u16,
@@ -166,7 +163,6 @@ impl NodeState {
             session_owners: Arc::new(RwLock::new(HashMap::new())),
             connection_counter: Arc::new(AtomicU64::new(1)),
             clock_alert_at: Arc::new(Mutex::new(None)),
-            tls_client_config: None,
             http_port: 0,
             local_ip: None,
             node_name: "test".to_string(),

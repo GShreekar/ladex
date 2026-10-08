@@ -30,7 +30,7 @@ fn with_passphrase(node: &NodeHandle, passphrase: &str) -> NodeState {
 }
 
 async fn dial(state: &NodeState, to: &NodeHandle) -> anyhow::Result<()> {
-    mesh::quic::connect(state, to.quic_addr(), &to.state.node_id).await
+    mesh::quic::connect(state, to.addr, &to.state.node_id).await
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -152,4 +152,12 @@ async fn a_node_that_shuts_down_is_dropped_by_its_peer() {
     drop(nodes.pop());
     let a = &nodes[0];
     assert!(eventually(async || a.mesh_peers().await.is_empty()).await, "the node that shut down is still listed");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_told_to_join_its_own_address_refuses() {
+    let node = spawn_node(NodeConfig::named("alone")).await;
+    let failure = node.connect(node.addr).await.unwrap_err();
+    assert!(failure.to_string().contains("itself"), "{failure}");
+    assert!(node.mesh_peers().await.is_empty());
 }

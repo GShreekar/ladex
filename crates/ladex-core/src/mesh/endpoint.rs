@@ -24,9 +24,10 @@ use crate::types::NodeId;
 
 pub const ALPN: &[u8] = b"ladex-mesh";
 
-/// A peer stays connected through brief silences, and a vanished one is noticed within this.
-const IDLE_TIMEOUT: Duration = Duration::from_secs(15);
-const KEEP_ALIVE: Duration = Duration::from_secs(5);
+/// A peer stays connected through brief silences. A vanished one is noticed within the idle timeout plus one keep-alive interval,
+/// since sending a keep-alive restarts the idle timer; that is 13 s, inside the 15 s the mesh promises.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+const KEEP_ALIVE: Duration = Duration::from_secs(3);
 
 /// Close code for a connection a node ended on purpose, so the other node doesn't redial it.
 pub const HUNG_UP: quinn::VarInt = quinn::VarInt::from_u32(1);
@@ -99,14 +100,23 @@ impl MeshEndpoint {
 
     /// Dials `addr` and succeeds only if the node there holds the key behind `expected`.
     pub async fn connect(&self, addr: SocketAddr, expected: &NodeId) -> anyhow::Result<PeerConnection> {
-        let client_config = client_config(&self.provider, &self.our_key, expected.clone())?;
-        let connection = self.endpoint.connect_with(client_config, addr, SERVER_NAME)?.await?;
-        let peer = peer_connection(connection)?;
+        let peer = self.dial(addr, Some(expected.clone())).await?;
         // The verifier already checked this; a mismatch here would mean the TLS layer was bypassed.
         if &peer.node_id != expected {
             bail!("dialed node {expected} but connected to {}", peer.node_id);
         }
         Ok(peer)
+    }
+
+    /// Dials `addr` without knowing who is there; the node proves the key it holds, and the mesh handshake decides whether to trust it.
+    pub async fn connect_to_address(&self, addr: SocketAddr) -> anyhow::Result<PeerConnection> {
+        self.dial(addr, None).await
+    }
+
+    async fn dial(&self, addr: SocketAddr, expected: Option<NodeId>) -> anyhow::Result<PeerConnection> {
+        let client_config = client_config(&self.provider, &self.our_key, expected)?;
+        let connection = self.endpoint.connect_with(client_config, addr, SERVER_NAME)?.await?;
+        peer_connection(connection)
     }
 
     /// The next connection attempt, or None once the endpoint is closed.
@@ -134,7 +144,7 @@ fn certified_key(identity: &Identity, provider: &CryptoProvider) -> anyhow::Resu
 
 fn transport_config() -> Arc<quinn::TransportConfig> {
     let mut transport = quinn::TransportConfig::default();
-    transport.max_idle_timeout(Some(IDLE_TIMEOUT.try_into().expect("15 s fits a QUIC idle timeout")));
+    transport.max_idle_timeout(Some(IDLE_TIMEOUT.try_into().expect("10 s fits a QUIC idle timeout")));
     transport.keep_alive_interval(Some(KEEP_ALIVE));
     Arc::new(transport)
 }
@@ -151,7 +161,11 @@ fn server_config(provider: &Arc<CryptoProvider>, our_key: &Arc<CertifiedKey>) ->
     Ok(config)
 }
 
-fn client_config(provider: &Arc<CryptoProvider>, our_key: &Arc<CertifiedKey>, expected: NodeId) -> anyhow::Result<quinn::ClientConfig> {
+fn client_config(
+    provider: &Arc<CryptoProvider>,
+    our_key: &Arc<CertifiedKey>,
+    expected: Option<NodeId>,
+) -> anyhow::Result<quinn::ClientConfig> {
     let verifier = ExpectedNode { node_id: expected, algorithms: provider.signature_verification_algorithms };
     let mut tls = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&rustls::version::TLS13])?
@@ -198,10 +212,10 @@ fn bad_key() -> rustls::Error {
     rustls::Error::InvalidCertificate(CertificateError::BadEncoding)
 }
 
-/// The dialer's check: the server must hold the key of the node it meant to reach.
+/// The dialer's check: the server must hold the key of the node it meant to reach, or any Ed25519 key when it dialed an address.
 #[derive(Debug)]
 struct ExpectedNode {
-    node_id: NodeId,
+    node_id: Option<NodeId>,
     algorithms: WebPkiSupportedAlgorithms,
 }
 
@@ -215,7 +229,7 @@ impl ServerCertVerifier for ExpectedNode {
         _now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
         let public_key = decode_public_key(presented).ok_or_else(bad_key)?;
-        if node_id_for(&public_key) != self.node_id {
+        if self.node_id.as_ref().is_some_and(|expected| &node_id_for(&public_key) != expected) {
             return Err(rustls::Error::InvalidCertificate(CertificateError::ApplicationVerificationFailure));
         }
         Ok(ServerCertVerified::assertion())
@@ -373,7 +387,7 @@ mod tests {
     async fn a_dialer_without_a_key_cannot_complete_the_tls_handshake() {
         let b = node();
         let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let verifier = ExpectedNode { node_id: node_id(&b), algorithms: provider.signature_verification_algorithms };
+        let verifier = ExpectedNode { node_id: Some(node_id(&b)), algorithms: provider.signature_verification_algorithms };
         let mut tls = rustls::ClientConfig::builder_with_provider(provider)
             .with_protocol_versions(&[&rustls::version::TLS13])
             .unwrap()
@@ -387,6 +401,15 @@ mod tests {
         let accepting = async { b.endpoint.accept().await.unwrap().establish().await };
         let (dialed, accepted) = tokio::join!(dialing, accepting);
         assert!(dialed.is_err() && accepted.is_err());
+    }
+
+    #[tokio::test]
+    async fn dialing_an_address_learns_whichever_node_answers() {
+        let (a, b) = (node(), node());
+        let addr = b.endpoint.local_addr().unwrap();
+        let accepting = async { b.endpoint.accept().await.unwrap().establish().await };
+        let (dialed, _) = tokio::join!(a.endpoint.connect_to_address(addr), accepting);
+        assert_eq!(dialed.unwrap().node_id, node_id(&b));
     }
 
     #[tokio::test]

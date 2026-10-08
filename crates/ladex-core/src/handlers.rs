@@ -154,7 +154,7 @@ pub async fn pairing_status(peer: Option<PeerAddr>, state: NodeState) -> Result<
     let can_pair = can_manage(peer);
     let response = PairingResponse {
         can_pair,
-        address: state.local_ip.filter(|_| can_pair).map(|ip| std::net::SocketAddr::new(ip, state.http_port).to_string()),
+        address: state.local_ip.filter(|_| can_pair).map(|ip| std::net::SocketAddr::new(ip, state.quic_port).to_string()),
         status: can_pair.then(|| state.pairings.status()),
     };
     Ok(warp::reply::json(&response))
@@ -186,11 +186,11 @@ pub async fn dial_pairing(request: DialRequest, peer: Option<PeerAddr>, state: N
     if !can_manage(peer) {
         return Ok(pairing_forbidden());
     }
-    let Some(target) = parse_node_address(&request.address, state.http_port) else {
+    let Some(target) = parse_node_address(&request.address, state.quic_port) else {
         return Ok(json_error("Enter the other device's address, like 192.168.1.20:8080", StatusCode::BAD_REQUEST));
     };
     tokio::spawn(async move {
-        let result = crate::mesh::pair_with_peer(target.ip(), target.port(), state.clone()).await;
+        let result = crate::mesh::quic::pair(&state, target).await;
         let name = result.as_ref().map_or_else(|_| target.to_string(), Clone::clone);
         state.pairings.record(crate::pairing::Outcome::of(&name, &result));
     });

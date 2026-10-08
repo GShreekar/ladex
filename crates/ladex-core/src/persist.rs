@@ -1,6 +1,6 @@
 //! What a node remembers across restarts besides its files, saved atomically as one private JSON file.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -23,6 +23,7 @@ const PBKDF2_ROUNDS: u32 = 100_000;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KnownPeer {
     pub ip: IpAddr,
+    /// The peer's QUIC port.
     pub port: u16,
     pub last_seen_ms: u64,
 }
@@ -116,7 +117,7 @@ pub fn redial(state: &NodeState, peers: Vec<KnownPeer>) {
         let state = state.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(500)).await;
-            if let Err(e) = mesh::connect_to_peer(peer.ip, peer.port, state).await {
+            if let Err(e) = mesh::quic::join(&state, SocketAddr::new(peer.ip, peer.port)).await {
                 tracing::debug!("Persist: remembered peer {}:{} not reachable: {e}", peer.ip, peer.port);
             }
         });
@@ -134,7 +135,7 @@ impl Saver {
     async fn snapshot(&mut self, state: &NodeState) -> Saved {
         let now = hlc::wall_clock_ms();
         let live: Vec<KnownPeer> =
-            state.mesh_peers.read().await.values().map(|p| KnownPeer { ip: p.addr.ip(), port: p.http_port, last_seen_ms: now }).collect();
+            state.mesh_peers.read().await.values().map(|p| KnownPeer { ip: p.addr.ip(), port: p.addr.port(), last_seen_ms: now }).collect();
         self.peers.retain(|old| {
             now.saturating_sub(old.last_seen_ms) < PEER_MEMORY_MS && !live.iter().any(|p| p.ip == old.ip && p.port == old.port)
         });

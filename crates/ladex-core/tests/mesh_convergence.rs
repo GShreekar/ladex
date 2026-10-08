@@ -5,9 +5,9 @@ use ladex_core::testing::{converged, eventually, fully_connected, spawn_mesh, sp
 const PASSPHRASE: &str = "correct horse battery";
 
 #[tokio::test(flavor = "multi_thread")]
-async fn two_nodes_with_the_same_passphrase_join_over_tls() {
-    let a = spawn_node(NodeConfig::named("node_a").passphrase(PASSPHRASE).tls()).await;
-    let b = spawn_node(NodeConfig::named("node_b").passphrase(PASSPHRASE).tls().peer(a.addr)).await;
+async fn two_nodes_with_the_same_passphrase_join() {
+    let a = spawn_node(NodeConfig::named("node_a").passphrase(PASSPHRASE)).await;
+    let b = spawn_node(NodeConfig::named("node_b").passphrase(PASSPHRASE).peer(a.addr)).await;
     let nodes = [a, b];
     assert!(eventually(async || fully_connected(&nodes).await).await);
 }

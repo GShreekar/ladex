@@ -284,7 +284,7 @@
                 <ul>
                     <li>All devices are on the <strong>same Wi-Fi network</strong></li>
                     <li><strong>AP/client isolation</strong> is disabled on your router (common on guest networks and mobile hotspots)</li>
-                    <li>No firewall is blocking <strong>UDP port 7878</strong> or <strong>TCP port 8080</strong></li>
+                    <li>No firewall is blocking <strong>UDP port 7878</strong> or <strong>TCP and UDP port 8080</strong></li>
                 </ul>
             </div>
             <button class="banner-dismiss" onclick="this.parentElement.remove()">✕</button>

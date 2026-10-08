@@ -1,13 +1,11 @@
-//! TLS for the browser UI and the mesh: a cached self-signed certificate covering every local address.
+//! TLS for the browser UI: a cached self-signed certificate covering every local address.
 
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use tokio::net::TcpStream;
 use tokio_rustls::rustls;
-use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
-use tokio_rustls::TlsConnector;
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 /// Installs the process-wide rustls crypto provider (ring); safe to call more than once.
 pub fn install_crypto_provider() {
@@ -154,15 +152,6 @@ pub fn prepare_server_identity(wanted: &[String]) -> anyhow::Result<(Arc<rustls:
     Ok((config, fingerprint))
 }
 
-/// A fresh certificate that is never written to disk, for in-process test nodes.
-#[cfg(any(test, feature = "test-support"))]
-pub fn ephemeral_server_identity(names: &[String]) -> anyhow::Result<(Arc<rustls::ServerConfig>, Vec<u8>)> {
-    let (cert, key) = generate(names)?;
-    let fingerprint = crate::auth::tls_fingerprint(cert.as_ref());
-    let config = build_server_config(cert, PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key)))?;
-    Ok((config, fingerprint))
-}
-
 /// "AB:CD:EF:…" — the form browsers show in their certificate details.
 pub fn format_fingerprint(fingerprint: &[u8]) -> String {
     fingerprint.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(":")
@@ -171,86 +160,6 @@ pub fn format_fingerprint(fingerprint: &[u8]) -> String {
 fn build_server_config(cert: CertificateDer<'static>, key: PrivateKeyDer<'static>) -> anyhow::Result<Arc<rustls::ServerConfig>> {
     let config = rustls::ServerConfig::builder().with_no_client_auth().with_single_cert(vec![cert], key)?;
     Ok(Arc::new(config))
-}
-
-// Nodes share no CA, so the client accepts any certificate; the mesh handshake binds its fingerprint, which defeats a man in the middle.
-
-#[derive(Debug)]
-struct NoServerVerification(Arc<rustls::crypto::CryptoProvider>);
-
-impl rustls::client::danger::ServerCertVerifier for NoServerVerification {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.0.signature_verification_algorithms)
-            .map(|_| rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.0.signature_verification_algorithms)
-            .map(|_| rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
-    }
-}
-
-pub fn build_client_config() -> Arc<rustls::ClientConfig> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let config = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoServerVerification(provider)))
-        .with_no_client_auth();
-    Arc::new(config)
-}
-
-/// Dials `addr:port` over TLS with our own rustls and upgrades to a WebSocket at `path`; returns the server certificate's fingerprint.
-pub async fn connect_wss(
-    addr: IpAddr,
-    port: u16,
-    path: &str,
-    client_config: Arc<rustls::ClientConfig>,
-    ws_config: tokio_tungstenite::tungstenite::protocol::WebSocketConfig,
-) -> anyhow::Result<(
-    tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
-    tokio_tungstenite::tungstenite::handshake::client::Response,
-    Vec<u8>,
-)> {
-    let tcp = TcpStream::connect((addr, port)).await?;
-    let _ = tcp.set_nodelay(true);
-    let connector = TlsConnector::from(client_config);
-    let server_name = ServerName::IpAddress(addr.into());
-    let tls_stream = connector.connect(server_name, tcp).await?;
-    let server_fingerprint = tls_stream
-        .get_ref()
-        .1
-        .peer_certificates()
-        .and_then(|certs| certs.first())
-        .map(|cert| crate::auth::tls_fingerprint(cert.as_ref()))
-        .ok_or_else(|| anyhow::anyhow!("server presented no certificate"))?;
-    let url = format!("wss://{addr}:{port}{path}");
-    let (ws_stream, response) = tokio_tungstenite::client_async_with_config(&url, tls_stream, Some(ws_config)).await?;
-    Ok((ws_stream, response, server_fingerprint))
 }
 
 #[cfg(test)]

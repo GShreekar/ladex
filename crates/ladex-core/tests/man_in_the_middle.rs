@@ -1,63 +1,80 @@
-//! A relay that terminates TLS on both sides with its own certificate is caught by the handshake's channel binding.
+//! A relay that terminates QUIC on both sides, with a key of its own, is caught by the handshake's channel binding.
 
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 
-use ladex_core::mesh::AuthFailure;
-use ladex_core::testing::{eventually, spawn_node, NodeConfig, NodeHandle};
-use ladex_core::tls;
-use tokio::net::{TcpListener, TcpStream};
-use tokio_rustls::rustls::pki_types::ServerName;
-use tokio_rustls::{TlsAcceptor, TlsConnector};
+use ladex_core::identity::Identity;
+use ladex_core::mesh::endpoint::MeshEndpoint;
+use ladex_core::mesh::{self, AuthFailure};
+use ladex_core::testing::{eventually, spawn_node, NodeConfig, NodeHandle, UdpRelay};
 
-/// Relays every connection to `target`; when `terminate_tls`, it decrypts and re-encrypts in between.
-async fn spawn_relay(target: SocketAddr, terminate_tls: bool) -> SocketAddr {
-    tls::install_crypto_provider();
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (attacker_config, _) = tls::ephemeral_server_identity(&["127.0.0.1".to_string()]).unwrap();
-    let acceptor = TlsAcceptor::from(attacker_config);
-    let connector = TlsConnector::from(tls::build_client_config());
+/// Accepts connections with its own key and bridges each one's first stream to a new connection to `target`.
+fn spawn_attacker(target: SocketAddr) -> SocketAddr {
+    let endpoint = Arc::new(MeshEndpoint::bind(&Identity::generate(), (Ipv4Addr::LOCALHOST, 0).into()).unwrap());
+    let addr = endpoint.local_addr().unwrap();
     tokio::spawn(async move {
-        while let Ok((dialer, _)) = listener.accept().await {
-            let (acceptor, connector) = (acceptor.clone(), connector.clone());
+        while let Some(accepting) = endpoint.accept().await {
+            let endpoint = endpoint.clone();
             tokio::spawn(async move {
-                let Ok(server) = TcpStream::connect(target).await else { return };
-                if !terminate_tls {
-                    let (mut dialer, mut server) = (dialer, server);
-                    let _ = tokio::io::copy_bidirectional(&mut dialer, &mut server).await;
-                    return;
-                }
-                let Ok(mut dialer) = acceptor.accept(dialer).await else { return };
-                let Ok(mut server) = connector.connect(ServerName::IpAddress(target.ip().into()), server).await else { return };
-                let _ = tokio::io::copy_bidirectional(&mut dialer, &mut server).await;
+                let _ = bridge(&endpoint, accepting, target).await;
             });
         }
     });
     addr
 }
 
+async fn bridge(endpoint: &MeshEndpoint, accepting: ladex_core::mesh::endpoint::Accepting, target: SocketAddr) -> anyhow::Result<()> {
+    let from_dialer = accepting.establish().await?;
+    let to_server = endpoint.connect_to_address(target).await?;
+    let (mut to_dialer, mut dialer_says) = from_dialer.connection.accept_bi().await?;
+    let (mut to_target, mut target_says) = to_server.connection.open_bi().await?;
+    let _ = tokio::join!(tokio::io::copy(&mut dialer_says, &mut to_target), tokio::io::copy(&mut target_says, &mut to_dialer));
+    Ok(())
+}
+
 async fn two_nodes() -> (NodeHandle, NodeHandle) {
-    let dialer = spawn_node(NodeConfig::named("dialer").passphrase("pw").tls()).await;
-    let server = spawn_node(NodeConfig::named("server").passphrase("pw").tls()).await;
+    let dialer = spawn_node(NodeConfig::named("dialer").passphrase("pw")).await;
+    let server = spawn_node(NodeConfig::named("server").passphrase("pw")).await;
     (dialer, server)
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_relay_that_only_forwards_bytes_lets_the_nodes_connect() {
+async fn a_relay_that_only_forwards_datagrams_lets_the_nodes_connect() {
     let (dialer, server) = two_nodes().await;
-    let relay = spawn_relay(server.addr, false).await;
-    dialer.connect(relay).await.unwrap();
+    let relay = UdpRelay::start(server.addr).await;
+    dialer.connect(relay.addr()).await.unwrap();
     assert!(eventually(async || server.mesh_peers().await.contains(dialer.node_id())).await);
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_relay_that_terminates_tls_twice_fails_confirmation() {
+async fn a_relay_that_terminates_quic_twice_fails_confirmation() {
     let (dialer, server) = two_nodes().await;
-    let relay = spawn_relay(server.addr, true).await;
+    let attacker = spawn_attacker(server.addr);
 
-    let failure = dialer.connect(relay).await.unwrap_err();
+    let failure = dialer.connect(attacker).await.unwrap_err();
     assert!(failure.downcast_ref::<AuthFailure>().is_some(), "{failure}");
-    assert!(failure.to_string().contains("failed to prove"), "{failure}");
     assert!(dialer.mesh_peers().await.is_empty());
     assert!(server.mesh_peers().await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relay_that_terminates_quic_twice_cannot_get_a_node_found_by_discovery_to_talk() {
+    let (dialer, server) = two_nodes().await;
+    let attacker = spawn_attacker(server.addr);
+
+    let failure = mesh::quic::connect(&dialer.state, attacker, &server.state.node_id).await.unwrap_err();
+    assert!(format!("{failure:#}").contains("dialed") || format!("{failure:#}").to_lowercase().contains("certificate"), "{failure:#}");
+    assert!(dialer.mesh_peers().await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relay_that_terminates_quic_twice_gets_no_pairing_code_shown() {
+    let (dialer, server) = two_nodes().await;
+    server.state.pairings.open();
+    let attacker = spawn_attacker(server.addr);
+
+    let failure = mesh::quic::pair(&dialer.state, attacker).await.unwrap_err();
+    assert!(failure.downcast_ref::<AuthFailure>().is_some(), "{failure}");
+    assert!(dialer.state.pairings.status().waiting.is_empty() && server.state.pairings.status().waiting.is_empty());
+    assert!(dialer.mesh_peers().await.is_empty() && server.mesh_peers().await.is_empty());
 }
