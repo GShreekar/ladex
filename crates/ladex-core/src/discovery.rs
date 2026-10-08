@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -11,23 +11,6 @@ use tokio::sync::RwLock;
 
 use crate::mesh;
 use crate::NodeState;
-
-// After a failed authentication, wait before redialing: 15 s, doubling up to 10 minutes.
-const AUTH_BACKOFF_BASE: Duration = Duration::from_secs(15);
-const AUTH_BACKOFF_MAX: Duration = Duration::from_secs(600);
-
-type AuthBackoff = Arc<Mutex<HashMap<String, (u32, Instant)>>>;
-
-fn backoff_active(backoff: &AuthBackoff, node_id: &str) -> bool {
-    backoff.lock().unwrap().get(node_id).is_some_and(|(_, until)| *until > Instant::now())
-}
-
-fn record_auth_failure(backoff: &AuthBackoff, node_id: &str) {
-    let mut map = backoff.lock().unwrap();
-    let failures = map.get(node_id).map_or(0, |(n, _)| *n) + 1;
-    let delay = AUTH_BACKOFF_BASE.saturating_mul(1 << (failures - 1).min(10)).min(AUTH_BACKOFF_MAX);
-    map.insert(node_id.to_string(), (failures, Instant::now() + delay));
-}
 
 /// Administratively scoped IPv4 multicast address — never forwarded beyond LAN.
 const MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(239, 255, 42, 99);
@@ -133,12 +116,11 @@ impl DiscoveryService {
         }
     }
 
-    /// Listens for announces and dials newly seen nodes; the smaller node id dials first, to avoid double connects.
+    /// Listens for announces and dials the nodes heard; of two nodes only the lower node id dials (see `mesh::dialer`).
     pub async fn listen_loop(&self, state: NodeState) -> anyhow::Result<()> {
         let mut buf = [0u8; 2048];
 
         let seen: Arc<RwLock<HashMap<String, (Instant, SocketAddr)>>> = Arc::new(RwLock::new(HashMap::new()));
-        let auth_backoff: AuthBackoff = Arc::new(Mutex::new(HashMap::new()));
 
         let seen_clone = seen.clone();
         let state_clone = state.clone();
@@ -189,50 +171,9 @@ impl DiscoveryService {
                 }
             }
 
-            if backoff_active(&auth_backoff, &packet.node_id) || mesh::is_revoked(&state, &packet.node_id) {
-                continue;
-            }
-
-            let peer_node_id = packet.node_id.clone();
+            // The announce is unauthenticated, but TLS only lets the dial succeed if the node there holds this id's key.
             let peer_addr = SocketAddr::new(from_addr.ip(), packet.quic_port);
-            let state_spawn = state.clone();
-            let my_node_id = state.node_id.clone();
-            let auth_backoff = auth_backoff.clone();
-
-            tokio::spawn(async move {
-                if my_node_id > peer_node_id {
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                    let already_connected = {
-                        let peers = state_spawn.mesh_peers.read().await;
-                        peers.contains_key(&peer_node_id)
-                    };
-                    if already_connected {
-                        return;
-                    }
-                }
-
-                {
-                    let peers = state_spawn.mesh_peers.read().await;
-                    if peers.contains_key(&peer_node_id) {
-                        return;
-                    }
-                }
-
-                tracing::info!("Discovery: new peer {peer_node_id} at {peer_addr} — connecting over QUIC");
-
-                // The announce is unauthenticated, but TLS only lets the dial succeed if the node there holds this id's key.
-                match mesh::quic::connect(&state_spawn, peer_addr, &peer_node_id).await {
-                    Ok(()) => {
-                        auth_backoff.lock().unwrap().remove(&peer_node_id);
-                    }
-                    Err(e) => {
-                        if e.downcast_ref::<mesh::AuthFailure>().is_some() {
-                            record_auth_failure(&auth_backoff, &peer_node_id);
-                        }
-                        tracing::warn!("Discovery: mesh connect to {peer_addr} failed: {e}");
-                    }
-                }
-            });
+            mesh::dialer::dial(&state, &packet.node_id, peer_addr);
         }
     }
 }
@@ -280,29 +221,6 @@ pub fn build_announce(state: &NodeState) -> AnnouncePacket {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn backoff_secs(backoff: &AuthBackoff, node_id: &str) -> u64 {
-        backoff.lock().unwrap()[node_id].1.duration_since(Instant::now()).as_secs()
-    }
-
-    #[test]
-    fn auth_backoff_doubles_and_is_capped() {
-        let backoff: AuthBackoff = Arc::new(Mutex::new(HashMap::new()));
-        assert!(!backoff_active(&backoff, "node"));
-
-        record_auth_failure(&backoff, "node");
-        assert!(backoff_active(&backoff, "node"));
-        assert!(backoff_secs(&backoff, "node") <= 15);
-
-        record_auth_failure(&backoff, "node");
-        assert!(backoff_secs(&backoff, "node") > 15 && backoff_secs(&backoff, "node") <= 30);
-
-        for _ in 0..20 {
-            record_auth_failure(&backoff, "node");
-        }
-        assert!(backoff_secs(&backoff, "node") <= AUTH_BACKOFF_MAX.as_secs());
-        assert!(!backoff_active(&backoff, "other-node"));
-    }
 
     const OWN_ID: &str = "node_own";
 

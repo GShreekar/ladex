@@ -722,6 +722,7 @@ mod tests {
                 last_seen: Instant::now(),
                 rtt_ms: None,
                 hang_up: Default::default(),
+                dialer: from.node_id.clone(),
             },
         );
         let (receiver, from_id) = (to.clone(), from.node_id.clone());

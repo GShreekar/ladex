@@ -280,6 +280,7 @@ async fn main() {
         trust,
         pairings: Arc::new(pairing::Pairings::new()),
         mesh_peers: Arc::new(RwLock::new(HashMap::new())),
+        dial_targets: Default::default(),
         mesh_endpoint: Some(mesh_endpoint.clone()),
         quic_port,
         passphrase,

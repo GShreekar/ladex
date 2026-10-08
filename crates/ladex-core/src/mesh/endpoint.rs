@@ -28,6 +28,9 @@ pub const ALPN: &[u8] = b"ladex-mesh";
 const IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 const KEEP_ALIVE: Duration = Duration::from_secs(5);
 
+/// Close code for a connection a node ended on purpose, so the other node doesn't redial it.
+pub const HUNG_UP: quinn::VarInt = quinn::VarInt::from_u32(1);
+
 // Peers are addressed by key, not by name; SNI just needs a valid DNS name.
 const SERVER_NAME: &str = "ladex";
 
@@ -113,7 +116,7 @@ impl MeshEndpoint {
 
     /// Closes every connection at once; peers are told, but nothing waits for them to hear it.
     pub fn close(&self) {
-        self.endpoint.close(0u32.into(), b"node shutting down");
+        self.endpoint.close(HUNG_UP, b"node shutting down");
     }
 
     /// Waits until every closed connection has told its peer.

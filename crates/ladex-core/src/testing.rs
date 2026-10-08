@@ -18,8 +18,10 @@ use crate::types::{FileMetadata, Holder, NodeId, PeerInfo, TextMessage};
 use crate::{files_api, mesh, ratelimit, server, state, tls, NodeState};
 
 mod faulty_link;
+mod udp_relay;
 pub(crate) use faulty_link::detour;
 pub use faulty_link::{Faults, FaultyLink, LinkedMesh};
+pub use udp_relay::UdpRelay;
 
 const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -142,8 +144,13 @@ pub async fn spawn_mesh(n: usize, passphrase: Option<&str>) -> Vec<NodeHandle> {
 }
 
 /// Polls `condition` until it holds, or gives up after a few seconds.
-pub async fn eventually(mut condition: impl AsyncFnMut() -> bool) -> bool {
-    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
+pub async fn eventually(condition: impl AsyncFnMut() -> bool) -> bool {
+    eventually_within(CONVERGENCE_TIMEOUT, condition).await
+}
+
+/// Polls `condition` until it holds, or gives up after `timeout`.
+pub async fn eventually_within(timeout: Duration, mut condition: impl AsyncFnMut() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
     loop {
         if condition().await {
             return true;

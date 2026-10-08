@@ -14,11 +14,11 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use super::endpoint::{Accepting, MeshEndpoint, PeerConnection};
+use super::endpoint::{Accepting, MeshEndpoint, PeerConnection, HUNG_UP};
 use super::frames::{FrameSender, FramedStream};
 use super::{
-    authenticate_inbound, connection_ended, dispatch, handshake_local, note_clock_skew, start_session, AuthFailure, Intro, MeshMessage,
-    PeerAddress, Session, MAX_MESH_MESSAGE_BYTES, PROTOCOL_VERSION,
+    authenticate_inbound, connection_ended, dialer, dispatch, handshake_local, keeps_open_connection, note_clock_skew, start_session,
+    AuthFailure, Intro, Liveness, MeshMessage, PeerAddress, Session, MAX_MESH_MESSAGE_BYTES, PROTOCOL_VERSION,
 };
 use crate::handshake::{self, Failure, Reason};
 use crate::trust::Standing;
@@ -30,6 +30,9 @@ const OPENING_MAX_FRAME: usize = 64 * 1024;
 const OPENING_TIMEOUT: Duration = Duration::from_secs(10);
 // A refused dialer gets this long to read why before the connection is dropped.
 const REFUSAL_LINGER: Duration = Duration::from_secs(2);
+// A peer hanging up on purpose closes the connection right after ending stream 0, so its close code arrives within this.
+const CLOSE_CODE_WAIT: Duration = Duration::from_secs(1);
+const CONNECTION_LOST: quinn::VarInt = quinn::VarInt::from_u32(0);
 
 const KIND_MESSAGE: u8 = 0;
 const KIND_CHUNKS: u8 = 1;
@@ -67,7 +70,7 @@ pub async fn connect(state: &NodeState, addr: SocketAddr, expected: &NodeId) -> 
     let mut stream = FramedStream::new(send, recv, OPENING_MAX_FRAME);
     let peer = open_outbound(state, &connection, &mut stream).await.map_err(|e| failure_error(addr, e))?;
     tracing::info!("Mesh: {addr} authenticated over QUIC (peer: {})", peer.node_id);
-    begin(state, connection, peer, stream).await;
+    begin(state, connection, peer, stream, state.node_id.clone()).await;
     Ok(())
 }
 
@@ -97,7 +100,8 @@ async fn serve_inbound(state: &NodeState, accepting: Accepting) -> anyhow::Resul
         }
     };
     tracing::info!("Mesh: inbound QUIC peer {} ({}) authenticated", peer.node_id, peer.name);
-    begin(state, connection, peer, stream).await;
+    let dialer = peer.node_id.clone();
+    begin(state, connection, peer, stream, dialer).await;
     Ok(())
 }
 
@@ -151,7 +155,7 @@ async fn resume_decision(state: &NodeState, connection: &PeerConnection, protoco
     if matches!(state.trust.standing(&connection.public_key).map_err(Failure::TrustStore)?, Standing::Revoked) {
         return Ok(Some(Reason::Revoked));
     }
-    if state.mesh_peers.read().await.contains_key(&connection.node_id) {
+    if keeps_open_connection(state, &connection.node_id, &connection.node_id).await {
         return Ok(Some(Reason::Duplicate));
     }
     Ok(None)
@@ -208,16 +212,17 @@ fn failure_error(addr: SocketAddr, failure: Failure) -> anyhow::Error {
     }
 }
 
-/// Registers the peer and starts its control loop; a peer already connected another way is hung up on.
-async fn begin(state: &NodeState, connection: PeerConnection, peer: handshake::Peer, mut stream: FramedStream) {
+/// Registers the peer and starts its control loop; hangs up instead if the connection already open with the peer stays.
+async fn begin(state: &NodeState, connection: PeerConnection, peer: handshake::Peer, mut stream: FramedStream, dialer: NodeId) {
     let intro = Intro::theirs(&peer);
     note_clock_skew(state, &peer.name, intro.now_ms).await;
     // The browser-facing address is kept for the UI and restarts; a lost QUIC peer is redialed by discovery instead.
     let ip = intro.ip.parse().unwrap_or_else(|_| connection.connection.remote_address().ip());
-    let address = PeerAddress { addr: SocketAddr::new(ip, intro.http_port), http_port: intro.http_port, redial: None };
+    let address =
+        PeerAddress { addr: SocketAddr::new(ip, intro.http_port), http_port: intro.http_port, dialer, liveness: Liveness::QuicIdleTimeout };
     let Some(session) = start_session(state, &peer.node_id, &peer.name, address).await else {
         tracing::warn!("Mesh: duplicate QUIC connection with {} — dropping", peer.node_id);
-        connection.connection.close(0u32.into(), b"already connected");
+        connection.connection.close(HUNG_UP, b"already connected");
         return;
     };
     stream.allow_frames_up_to(MAX_MESH_MESSAGE_BYTES + 1);
@@ -228,23 +233,33 @@ async fn control_loop(state: NodeState, connection: PeerConnection, peer_node_id
     let FramedStream { sender, mut receiver } = stream;
     let Session { sender: peer_tx, messages, data, hang_up } = session;
     let writer = tokio::spawn(write_frames(sender, messages, data));
-    loop {
+    let we_hung_up = loop {
         let frame = tokio::select! {
             frame = receiver.recv() => frame,
-            () = hang_up.notified() => break,
+            () = hang_up.notified() => break true,
         };
         match frame {
             Ok(Some(frame)) => handle_frame(&state, &peer_node_id, &frame).await,
-            Ok(None) => break,
+            Ok(None) => break false,
             Err(e) => {
                 tracing::warn!("Mesh: QUIC connection to {peer_node_id} ended: {e}");
-                break;
+                break false;
             }
         }
-    }
+    };
     writer.abort();
-    connection.connection.close(0u32.into(), b"connection ended");
-    connection_ended(&state, &peer_node_id, &peer_tx).await;
+    let deliberate = we_hung_up || peer_hung_up(&connection.connection).await;
+    connection.connection.close(if deliberate { HUNG_UP } else { CONNECTION_LOST }, b"connection ended");
+    if connection_ended(&state, &peer_node_id, &peer_tx).await && !deliberate {
+        tracing::info!("Mesh: lost the connection to {peer_node_id}");
+        dialer::dial(&state, &peer_node_id, connection.connection.remote_address());
+    }
+}
+
+/// Whether the peer closed the connection on purpose, rather than the link failing or going silent.
+async fn peer_hung_up(connection: &quinn::Connection) -> bool {
+    let reason = tokio::time::timeout(CLOSE_CODE_WAIT, connection.closed()).await;
+    matches!(reason, Ok(quinn::ConnectionError::ApplicationClosed(close)) if close.error_code == HUNG_UP)
 }
 
 async fn write_frames(mut sender: FrameSender, mut messages: mpsc::UnboundedReceiver<MeshMessage>, mut data: mpsc::Receiver<Vec<u8>>) {

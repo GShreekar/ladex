@@ -17,6 +17,7 @@ use tokio::sync::{mpsc, Notify, RwLock};
 use warp::ws::{Message, WebSocket, Ws};
 use warp::{Rejection, Reply};
 
+pub mod dialer;
 pub mod endpoint;
 mod frames;
 pub mod quic;
@@ -60,6 +61,8 @@ pub struct MeshPeerHandle {
     pub rtt_ms: Option<u32>,
     /// Ends the connection, as when the peer is revoked.
     pub hang_up: Arc<Notify>,
+    /// The node that opened this connection; decides which of two connections with the same peer stays.
+    pub dialer: NodeId,
 }
 
 pub type MeshPeers = Arc<RwLock<HashMap<NodeId, MeshPeerHandle>>>;
@@ -238,11 +241,10 @@ async fn note_clock_skew(state: &NodeState, peer_name: &str, peer_now_ms: u64) {
 
 /// Removes a peer from mesh_peers and cleans up after it.
 pub async fn remove_mesh_peer(state: &NodeState, peer_node_id: &NodeId) {
-    let removed = {
-        let mut peers = state.mesh_peers.write().await;
-        peers.remove(peer_node_id).is_some()
-    };
-    if removed {
+    let removed = state.mesh_peers.write().await.remove(peer_node_id);
+    if let Some(handle) = removed {
+        // Without this, QUIC keep-alives would hold the connection open with nothing reading it.
+        handle.hang_up.notify_one();
         tracing::info!("Mesh: peer disconnected: {peer_node_id}");
         peer_departed_cleanup(state, peer_node_id).await;
     }
@@ -256,11 +258,20 @@ struct Session {
     hang_up: Arc<Notify>,
 }
 
-/// Where an authenticated peer can be reached: its browser-facing address, and how to redial it if it drops.
+/// Where an authenticated peer can be reached, who opened the connection, and how a dead connection is noticed.
 struct PeerAddress {
     addr: SocketAddr,
     http_port: u16,
-    redial: Option<SocketAddr>,
+    dialer: NodeId,
+    liveness: Liveness,
+}
+
+#[derive(Clone, Copy)]
+enum Liveness {
+    /// QUIC's idle timeout ends a silent connection, so heartbeats only measure the round trip.
+    QuicIdleTimeout,
+    /// Missed pongs end the connection, which is then redialed at `redial`.
+    Heartbeat { redial: SocketAddr },
 }
 
 /// Registers a newly authenticated peer, sends it this node's state and starts its heartbeat; None if it is already connected.
@@ -279,6 +290,7 @@ async fn start_session(state: &NodeState, peer_node_id: &NodeId, peer_node_name:
         last_seen: Instant::now(),
         rtt_ms: None,
         hang_up: hang_up.clone(),
+        dialer: address.dialer,
     };
     if !register_peer(state, handle).await {
         return None;
@@ -286,18 +298,32 @@ async fn start_session(state: &NodeState, peer_node_id: &NodeId, peer_node_name:
     tracing::info!("Mesh: registered peer {peer_node_id} ({peer_node_name})");
     crate::transfer::sources_changed(state);
     post_handshake_sync(&sender, state).await;
-    spawn_heartbeat(state.clone(), peer_node_id.clone(), sender.clone(), address.redial);
+    spawn_heartbeat(state.clone(), peer_node_id.clone(), sender.clone(), address.liveness);
     Some(Session { sender, messages, data, hang_up })
 }
 
-/// Registers a connection unless the peer is already connected, so only one of two racing dials wins.
+/// Registers a connection, hanging up the open one with the peer if the new one replaces it; false if the open one stays.
 async fn register_peer(state: &NodeState, handle: MeshPeerHandle) -> bool {
     let mut peers = state.mesh_peers.write().await;
-    if peers.contains_key(&handle.node_id) {
-        return false;
+    if let Some(open) = peers.get(&handle.node_id) {
+        if !replaces(&open.dialer, &handle.dialer) {
+            return false;
+        }
+        tracing::info!("Mesh: a new connection with {} replaces the open one", handle.node_id);
+        open.hang_up.notify_one();
     }
     peers.insert(handle.node_id.clone(), handle);
     true
+}
+
+/// Whether the peer's open connection stays rather than one `new_dialer` is opening, so the new one can be turned away early.
+async fn keeps_open_connection(state: &NodeState, peer_node_id: &NodeId, new_dialer: &NodeId) -> bool {
+    state.mesh_peers.read().await.get(peer_node_id).is_some_and(|open| !replaces(&open.dialer, new_dialer))
+}
+
+/// The lower node id's connection wins, and a node redialing replaces its own: it only redials once it lost the old one.
+fn replaces(open_dialer: &str, new_dialer: &str) -> bool {
+    new_dialer <= open_dialer
 }
 
 /// Whether `sender` belongs to the connection currently registered for the peer.
@@ -357,7 +383,7 @@ async fn peer_departed_cleanup(state: &NodeState, departed_node_id: &NodeId) {
     state::broadcast_catalog(state).await;
 }
 
-/// Redials a lost peer with backoff (2, 4, 8, then every 30 s) for up to 10 minutes.
+/// Redials a lost WebSocket peer with jittered backoff for up to 10 minutes.
 pub fn spawn_reconnect(addr: IpAddr, http_port: u16, state: NodeState, peer_node_id: NodeId) {
     if addr.is_unspecified() || http_port == 0 {
         tracing::debug!("Reconnect: no dialable address for {peer_node_id} — not attempting");
@@ -366,12 +392,9 @@ pub fn spawn_reconnect(addr: IpAddr, http_port: u16, state: NodeState, peer_node
     if is_revoked(&state, &peer_node_id) {
         return;
     }
-    // The higher id waits a little longer, so two nodes redialing each other don't collide.
-    let stagger = if state.node_id > peer_node_id { Duration::from_secs(1) } else { Duration::ZERO };
     tokio::spawn(async move {
         let started = Instant::now();
-        let delays_secs = [2u64, 4, 8, 30];
-        let mut attempt = 0usize;
+        let mut attempt = 0;
         loop {
             if started.elapsed() > RECONNECT_GIVE_UP {
                 tracing::info!("Reconnect: giving up on {peer_node_id} after 10 min");
@@ -380,9 +403,8 @@ pub fn spawn_reconnect(addr: IpAddr, http_port: u16, state: NodeState, peer_node
             if state.mesh_peers.read().await.contains_key(&peer_node_id) {
                 return;
             }
-            let delay_secs = if attempt < delays_secs.len() { delays_secs[attempt] } else { 30 };
-            tokio::time::sleep(Duration::from_secs(delay_secs) + stagger).await;
             attempt += 1;
+            tokio::time::sleep(dialer::retry_delay(attempt, false, rand::random())).await;
             if state.mesh_peers.read().await.contains_key(&peer_node_id) {
                 return;
             }
@@ -413,8 +435,8 @@ pub async fn broadcast_goodbye(state: &NodeState) {
     tokio::time::sleep(Duration::from_millis(200)).await;
 }
 
-/// Pings one peer periodically, and drops it when Pongs stop; `redial` is where to redial a WebSocket peer.
-fn spawn_heartbeat(state: NodeState, peer_node_id: NodeId, sender: mpsc::UnboundedSender<MeshMessage>, redial: Option<SocketAddr>) {
+/// Pings one peer periodically to measure the round trip, and drops a WebSocket peer when pongs stop.
+fn spawn_heartbeat(state: NodeState, peer_node_id: NodeId, sender: mpsc::UnboundedSender<MeshMessage>, liveness: Liveness) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -428,6 +450,7 @@ fn spawn_heartbeat(state: NodeState, peer_node_id: NodeId, sender: mpsc::Unbound
             let ts = chrono::Utc::now().timestamp_millis() as u64;
             let _ = sender.send(MeshMessage::Ping { ts });
 
+            let Liveness::Heartbeat { redial } = liveness else { continue };
             tokio::time::sleep(HEARTBEAT_TIMEOUT).await;
 
             let timed_out = {
@@ -440,9 +463,7 @@ fn spawn_heartbeat(state: NodeState, peer_node_id: NodeId, sender: mpsc::Unbound
             if timed_out {
                 tracing::warn!("Heartbeat: peer {peer_node_id} timed out — removing");
                 connection_ended(&state, &peer_node_id, &sender).await;
-                if let Some(addr) = redial {
-                    spawn_reconnect(addr.ip(), addr.port(), state.clone(), peer_node_id.clone());
-                }
+                spawn_reconnect(redial.ip(), redial.port(), state.clone(), peer_node_id.clone());
                 return;
             }
         }
@@ -509,7 +530,8 @@ async fn authenticate_inbound<T: handshake::Transport>(
     }
 
     // Checked before the passphrase so a second connection from a peer isn't counted as proof.
-    if state.mesh_peers.read().await.contains_key(&incoming.claimed_node_id()) {
+    let claimed = incoming.claimed_node_id();
+    if keeps_open_connection(state, &claimed, &claimed).await {
         return Err(incoming.refuse(transport, Reason::Duplicate).await);
     }
     incoming.accept(transport, &local).await
@@ -602,7 +624,8 @@ async fn dial(addr: IpAddr, http_port: u16, state: NodeState, pairing: bool) -> 
     let connected_name = peer_node_name.clone();
 
     let remote_addr = SocketAddr::new(addr, http_port);
-    let address = PeerAddress { addr: remote_addr, http_port, redial: Some(remote_addr) };
+    let address =
+        PeerAddress { addr: remote_addr, http_port, dialer: state.node_id.clone(), liveness: Liveness::Heartbeat { redial: remote_addr } };
     let Some(Session { sender: peer_tx, messages: mut peer_rx, data: mut data_rx, hang_up }) =
         start_session(&state, &peer_node_id, &peer_node_name, address).await
     else {
@@ -678,7 +701,12 @@ async fn run_connection(
     http_port: u16,
     state: NodeState,
 ) {
-    let address = PeerAddress { addr, http_port, redial: Some(SocketAddr::new(addr.ip(), http_port)) };
+    let address = PeerAddress {
+        addr,
+        http_port,
+        dialer: peer_node_id.clone(),
+        liveness: Liveness::Heartbeat { redial: SocketAddr::new(addr.ip(), http_port) },
+    };
     let Some(Session { sender: peer_tx, messages: mut peer_rx, data: mut data_rx, hang_up }) =
         start_session(&state, &peer_node_id, &peer_node_name, address).await
     else {
