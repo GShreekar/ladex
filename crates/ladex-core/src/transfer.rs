@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 
 use crate::bitmap::Bitmap;
 use crate::mesh::MeshMessage;
-use crate::store::{chunk_count, Blob, ChunkHash, StoreError, WriteError, CHUNK_SIZE};
+use crate::store::{chunk_count, Blob, ChunkHash, Origin, StoreError, WriteError, CHUNK_SIZE};
 use crate::types::{FileMetadata, NodeId};
 use crate::validate;
 use crate::NodeState;
@@ -246,7 +246,8 @@ pub async fn ensure_file(state: &NodeState, id: &str) -> Result<Arc<Blob>, Fetch
         return Err(FetchError::NoOneHasIt);
     }
 
-    let blob = state.store.create(id, entry.size).map_err(FetchError::Store)?;
+    crate::state::make_room(state, entry.size).await;
+    let blob = state.store.create_with(id, entry.size, Origin::Cached).map_err(FetchError::Store)?;
     blob.expect_root(&root);
     blob.set_entry(entry);
     if blob.is_complete() {

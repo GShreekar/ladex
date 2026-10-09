@@ -221,15 +221,40 @@ pub async fn add_self_as_holder(state: &NodeState, id: &str) {
     }
 }
 
+/// Evicts least-recently-used cached files so `size` more bytes fit, and stops listing this node as their holder.
+pub async fn make_room(state: &NodeState, size: u64) {
+    for id in state.store.evict_to_fit(size) {
+        drop_self_as_holder(state, &id).await;
+    }
+}
+
+async fn drop_self_as_holder(state: &NodeState, id: &str) {
+    let entry = {
+        let mut files = state.files.write().await;
+        match files.get_mut(id) {
+            Some(file) if !file.deleted && file.is_held_by(&state.node_id) => {
+                file.set_holder(&state.node_id, false, state.clock.now());
+                Some(file.clone())
+            }
+            _ => None,
+        }
+    };
+    if let Some(entry) = entry {
+        publish_entry(state, entry).await;
+    }
+}
+
 const ABANDONED_PARTIAL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 const UNPUBLISHED_FOLDER_FILES_MS: u64 = 60 * 60 * 1000;
 
-/// Deletes abandoned partial files and uploads for folders that were never published.
+/// Deletes abandoned partial files and uploads for folders that were never published, and evicts cached files over the quota.
 pub async fn collect_garbage(state: &NodeState) {
     collect_garbage_with(state, ABANDONED_PARTIAL, UNPUBLISHED_FOLDER_FILES_MS).await;
 }
 
 async fn collect_garbage_with(state: &NodeState, partial_ttl: std::time::Duration, orphan_ttl_ms: u64) {
+    state.store.save_access_times().await;
+    make_room(state, 0).await;
     for blob in state.store.all() {
         let abandoned =
             !blob.is_complete() && !blob.is_being_written() && !state.transfers.is_downloading(blob.id()) && blob.idle_for() >= partial_ttl;
@@ -856,6 +881,26 @@ mod tests {
         assert!(partial.is_removed());
         assert!(state.store.get("file_writing").is_some(), "a file being uploaded right now is never collected");
         assert!(state.store.get("file_complete").is_some());
+    }
+
+    #[tokio::test]
+    async fn making_room_evicts_cached_files_and_stops_advertising_them() {
+        let mut state = NodeState::for_tests_node("node_a", None);
+        state.store = std::sync::Arc::new(crate::store::Store::open(&tempfile::tempdir().unwrap().keep(), 100).unwrap());
+        for (id, origin) in [("file_cached", crate::store::Origin::Cached), ("file_mine", crate::store::Origin::Published)] {
+            let blob = state.store.create_with(id, 50, origin).unwrap();
+            blob.write_chunk_hashing(0, vec![1; 50]).await.unwrap();
+            blob.seal().unwrap();
+            merge_files(&mut *state.files.write().await, vec![file(id, stamp(1, 0, "node_a"))], MAX_CATALOG_ENTRIES);
+        }
+
+        make_room(&state, 50).await;
+
+        assert!(state.store.get("file_cached").is_none());
+        assert!(state.store.get("file_mine").is_some(), "a node's own shares are never evicted");
+        let files = state.files.read().await;
+        assert!(!files["file_cached"].is_held_by("node_a"), "an evicted file is no longer advertised");
+        assert!(files["file_mine"].is_held_by("node_a"));
     }
 
     #[tokio::test]

@@ -357,6 +357,7 @@ impl FilesApi {
                 };
             }
         }
+        crate::state::make_room(state, size).await;
         let blob = match state.store.create(id, size) {
             Ok(blob) => blob,
             Err(e) => return store_error(e),
@@ -665,6 +666,7 @@ impl FilesApi {
         listing.children.sort_by(|a, b| a.path.cmp(&b.path));
         let bytes = serde_json::to_vec(&listing).unwrap_or_default();
 
+        crate::state::make_room(state, bytes.len() as u64).await;
         let blob = match state.store.create(id, bytes.len() as u64) {
             Ok(blob) => blob,
             Err(e) => return store_error(e),
