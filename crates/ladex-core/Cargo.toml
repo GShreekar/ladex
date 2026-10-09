@@ -40,6 +40,8 @@ tempfile = { workspace = true, optional = true }
 http-body-util.workspace = true
 percent-encoding.workspace = true
 crc32fast.workspace = true
+blake3.workspace = true
+rayon.workspace = true
 ed25519-dalek.workspace = true
 keyring.workspace = true
 data-encoding.workspace = true

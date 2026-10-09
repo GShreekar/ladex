@@ -14,6 +14,7 @@ pub mod handlers;
 pub mod handshake;
 pub mod hlc;
 pub mod identity;
+pub mod manifest;
 pub mod mdns;
 pub mod mesh;
 pub mod pairing;
