@@ -124,7 +124,7 @@ fn trusted(trust: &TrustStore, node_id: &str) -> anyhow::Result<Option<TrustedNo
     Ok(trust.get(node_id)?.filter(|node| !node.revoked))
 }
 
-mod hex_signature {
+pub(crate) mod hex_signature {
     use ed25519_dalek::Signature;
     use serde::{de::Error, Deserialize, Deserializer, Serializer};
 

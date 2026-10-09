@@ -8,6 +8,7 @@ use tokio::sync::RwLock;
 
 pub mod auth;
 pub mod bitmap;
+pub mod catalog;
 pub mod discovery;
 pub mod files_api;
 pub mod handlers;
