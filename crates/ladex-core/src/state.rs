@@ -712,4 +712,23 @@ mod tests {
         assert!(!state.catalog.contains("f1"));
         assert!(state.clock_alert_at.lock().unwrap().is_some());
     }
+
+    #[tokio::test]
+    async fn a_node_with_its_clock_a_year_ahead_cannot_override_the_others() {
+        const ONE_YEAR_MS: u64 = 365 * 24 * 60 * 60 * 1000;
+        let state = NodeState::for_tests_signing(None);
+        let fast = crate::identity::Identity::generate();
+        let year_ahead =
+            |seq: u64| Stamp { wall: crate::hlc::wall_clock_ms() + ONE_YEAR_MS, counter: seq as u32, node: fast.node_id().to_string() };
+        let shared = crate::catalog::sync::publish(&state, plain("f1", "d"), vec![fast.public_key()]).await.unwrap();
+        let takedown = crate::catalog::Remove::sign(&fast, year_ahead(1), 1, "f1".into(), vec![shared.stamp.clone()]);
+        let replacement = crate::catalog::Add::sign(&fast, year_ahead(2), 2, vec![], plain("f2", "d"));
+
+        let ops = [crate::catalog::Op::Remove(takedown), crate::catalog::Op::Add(replacement)];
+        crate::catalog::sync::on_ops(&state, &"node_fast".to_string(), &ops).await;
+
+        assert!(state.catalog.contains("f1"));
+        assert!(!state.catalog.contains("f2"));
+        assert_eq!(state.catalog.latest_stamp(fast.node_id()), None);
+    }
 }

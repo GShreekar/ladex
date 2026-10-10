@@ -166,6 +166,22 @@ mod tests {
     }
 
     #[test]
+    fn a_remove_received_before_its_add_still_hides_the_file_after_a_restart() {
+        let (origin_dir, replica_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (identity, clock) = identity_and_clock();
+        let origin = SharedCatalog::open(origin_dir.path(), CAPACITY).unwrap();
+        origin.publish(&identity, &clock, entry("f1"), vec![]).unwrap();
+        origin.unpublish(&identity, &clock, "f1").unwrap();
+        let mut ops = origin.ops_missing_from(&VersionVector::default());
+        ops.reverse();
+        {
+            let replica = SharedCatalog::open(replica_dir.path(), CAPACITY).unwrap();
+            replica.receive(ops);
+        }
+        assert!(!SharedCatalog::open(replica_dir.path(), CAPACITY).unwrap().contains("f1"));
+    }
+
+    #[test]
     fn received_ops_are_saved() {
         let (origin_dir, replica_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         let (identity, clock) = identity_and_clock();

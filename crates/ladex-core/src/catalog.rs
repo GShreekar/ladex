@@ -1058,6 +1058,22 @@ mod tests {
         }
 
         #[test]
+        fn many_replicas_given_the_same_ops_in_different_orders_agree(
+            (ops, orders) in prop::collection::vec((0u8..3, 0u8..4, any::<bool>()), 0..40).prop_flat_map(|actions| {
+                let (ops, _) = history(&actions);
+                let orders = prop::collection::vec(Just(ops.clone()).prop_shuffle(), 5);
+                (Just(ops), orders)
+            })
+        ) {
+            let replicas: Vec<Catalog> = orders.into_iter().map(replica_with).collect();
+            for replica in &replicas {
+                prop_assert_eq!(shared_ids(replica), shared_ids(&replicas[0]));
+                prop_assert_eq!(replica.version(), replicas[0].version());
+                prop_assert_eq!(replica.op_count(), ops.len());
+            }
+        }
+
+        #[test]
         fn delivering_every_op_twice_changes_nothing(
             (expected, ops) in prop::collection::vec((0u8..3, 0u8..4, any::<bool>()), 0..40).prop_flat_map(|actions| {
                 let (ops, expected) = history(&actions);

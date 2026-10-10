@@ -98,7 +98,7 @@ async fn a_file_of_several_chunks_downloads_over_quic() {
     let (a, b) = (&nodes[0], &nodes[1]);
     let content: Vec<u8> = (0..(2 * 1024 * 1024 + 4321)).map(|i| (i % 251) as u8).collect();
     a.share_file("big", &content).await;
-    assert!(eventually(async || b.live_files().await.contains("big")).await);
+    assert!(eventually(async || !b.hosts_of("big").await.is_empty()).await);
 
     let blob = transfer::ensure_file(&b.state, "big").await.unwrap();
     assert!(eventually(async || blob.is_complete()).await, "the download never finished");
