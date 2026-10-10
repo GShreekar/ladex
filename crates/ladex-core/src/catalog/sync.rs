@@ -47,12 +47,19 @@ pub async fn on_ops(state: &NodeState, from: &NodeId, ops: &[Op]) {
     if let Some(refusal) = received.refused.first() {
         tracing::warn!("Catalog: refused {} op(s) from {from}, the first because {refusal}", received.refused.len());
     }
+    if !received.applied.is_empty() {
+        let mut affected: Vec<String> = received.applied.iter().map(|op| op.file_id().to_string()).collect();
+        affected.sort();
+        affected.dedup();
+        state::catalog_changed(state, &affected).await;
+    }
 }
 
 /// Shares a file in this node's name and tells the mesh.
 pub async fn publish(state: &NodeState, entry: CatalogEntry, authorized: Vec<VerifyingKey>) -> Result<Add, Refusal> {
     let add = state.catalog.publish(&state.identity, &state.clock, entry, authorized)?;
     push(state, vec![Op::Add(add.clone())]).await;
+    state::catalog_changed(state, std::slice::from_ref(&add.entry.file_id)).await;
     Ok(add)
 }
 
@@ -60,6 +67,7 @@ pub async fn publish(state: &NodeState, entry: CatalogEntry, authorized: Vec<Ver
 pub async fn unpublish(state: &NodeState, file_id: &str) -> Result<Remove, UnpublishError> {
     let remove = state.catalog.unpublish(&state.identity, &state.clock, file_id)?;
     push(state, vec![Op::Remove(remove.clone())]).await;
+    state::catalog_changed(state, &[file_id.to_string()]).await;
     Ok(remove)
 }
 

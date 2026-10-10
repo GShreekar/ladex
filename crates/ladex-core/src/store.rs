@@ -1,4 +1,4 @@
-//! On-disk storage for the files this node holds: 1 MiB chunks, each checked against its SHA-256 before it is written.
+//! On-disk storage for the files this node holds: 1 MiB chunks, each checked against its BLAKE3 hash before it is written.
 //!
 //! Layout under the store root: `blobs/<file_id>` (the data, preallocated), `hashes/<file_id>` (32 bytes per chunk)
 //! and `store.redb` (one record per file: progress, ownership, pin and last access).
@@ -6,6 +6,7 @@
 mod evict;
 mod index;
 mod legacy;
+mod rehash;
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -15,22 +16,20 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ring::digest;
 use tokio::sync::Notify;
 
 use self::index::{Index, Record};
 use crate::bitmap::Bitmap;
-use crate::types::FileMetadata;
+use crate::manifest::root_of;
 use crate::validate;
 
-pub use self::index::Origin;
+pub use self::index::{LegacyEntry, Origin};
+pub use crate::manifest::{hash_chunk, root_of as manifest_root, ChunkHash};
 
-pub const CHUNK_SIZE: u64 = 1 << 20;
+pub const CHUNK_SIZE: u64 = crate::manifest::CHUNK_SIZE as u64;
 // Always leave this much free on the disk, whatever the quota says.
 const MIN_FREE_BYTES: u64 = 512 * 1024 * 1024;
 const PERSIST_EVERY_WRITES: u32 = 64;
-
-pub type ChunkHash = [u8; 32];
 
 pub fn chunk_count(size: u64) -> u32 {
     size.div_ceil(CHUNK_SIZE) as u32
@@ -39,23 +38,6 @@ pub fn chunk_count(size: u64) -> u32 {
 pub fn chunk_len(size: u64, index: u32) -> usize {
     let start = index as u64 * CHUNK_SIZE;
     size.saturating_sub(start).min(CHUNK_SIZE) as usize
-}
-
-pub fn hash_chunk(data: &[u8]) -> ChunkHash {
-    let mut hash = [0u8; 32];
-    hash.copy_from_slice(digest::digest(&digest::SHA256, data).as_ref());
-    hash
-}
-
-/// Identifies a file's exact contents: its size and every chunk hash.
-pub fn manifest_root(size: u64, hashes: &[ChunkHash]) -> String {
-    let mut context = digest::Context::new(&digest::SHA256);
-    context.update(b"ladex manifest v1");
-    context.update(&size.to_be_bytes());
-    for hash in hashes {
-        context.update(hash);
-    }
-    hex::encode(context.finish().as_ref())
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -141,7 +123,8 @@ struct State {
     hash_known: Bitmap,
     expected_root: Option<String>,
     sealed: Option<String>,
-    entry: Option<FileMetadata>,
+    // Saved by an earlier version; handed over once, then no longer kept.
+    legacy_entry: Option<LegacyEntry>,
 }
 
 pub struct Blob {
@@ -249,7 +232,7 @@ impl Blob {
             hash_known: state.hash_known.to_hex(),
             expected_root: state.expected_root.clone(),
             sealed: state.sealed.clone(),
-            entry: state.entry.clone(),
+            entry: state.legacy_entry.clone(),
             origin: self.origin,
             pinned: self.is_pinned(),
             created_ms: self.created_ms,
@@ -294,12 +277,9 @@ impl Blob {
         state.hash_known.is_full().then(|| state.hashes.clone())
     }
 
-    pub fn entry(&self) -> Option<FileMetadata> {
-        self.state.lock().unwrap().entry.clone()
-    }
-
-    pub fn set_entry(&self, entry: FileMetadata) {
-        self.state.lock().unwrap().entry = Some(entry);
+    /// The entry an earlier version saved with this file, once; the next save forgets it.
+    pub fn take_legacy_entry(&self) -> Option<LegacyEntry> {
+        self.state.lock().unwrap().legacy_entry.take()
     }
 
     /// How many chunks from the start are all present: where an interrupted upload resumes.
@@ -439,7 +419,7 @@ impl Blob {
         if hashes.len() != self.chunks as usize {
             return Err("manifest has the wrong number of chunks");
         }
-        if manifest_root(self.size, &hashes) != root {
+        if root_of(self.size, &hashes) != root {
             return Err("manifest does not match the catalog");
         }
         {
@@ -473,7 +453,7 @@ impl Blob {
         if !state.have.is_full() || !state.hash_known.is_full() {
             return Err("file is not complete");
         }
-        let root = manifest_root(self.size, &state.hashes);
+        let root = root_of(self.size, &state.hashes);
         if state.expected_root.as_ref().is_some_and(|expected| *expected != root) {
             return Err("file does not match the catalog");
         }
@@ -552,6 +532,7 @@ impl Store {
         if migrated > 0 {
             tracing::info!("Store: moved {migrated} files into the new layout");
         }
+        rehash::migrate(&layout, &index)?;
 
         let store = Self { layout, quota, index, registry: Mutex::new(Registry { blobs: HashMap::new(), used: 0 }) };
         store.load_records()?;
@@ -618,7 +599,8 @@ impl Store {
             created_ms: record.created_ms,
             last_access_ms: record.last_access_ms,
         };
-        let state = State { have, hashes, hash_known, expected_root: record.expected_root, sealed: record.sealed, entry: record.entry };
+        let state =
+            State { have, hashes, hash_known, expected_root: record.expected_root, sealed: record.sealed, legacy_entry: record.entry };
         Ok(self.new_blob(id, header, OpenFiles { data, hashes_file }, state))
     }
 
@@ -696,7 +678,7 @@ impl Store {
             hash_known: Bitmap::new(chunks),
             expected_root: None,
             sealed: None,
-            entry: None,
+            legacy_entry: None,
         };
         let now = now_ms();
         let header = Header { size, origin, pinned: false, created_ms: now, last_access_ms: now };

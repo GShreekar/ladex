@@ -7,6 +7,7 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 
 pub mod auth;
+pub mod availability;
 pub mod bitmap;
 pub mod catalog;
 pub mod discovery;
@@ -39,7 +40,6 @@ pub mod zip;
 use types::*;
 
 pub type LocalPeers = Arc<RwLock<HashMap<SessionId, PeerInfo>>>;
-pub type Files = Arc<RwLock<HashMap<String, FileMetadata>>>;
 pub type Messages = Arc<RwLock<Vec<types::TextMessage>>>;
 
 #[derive(Clone)]
@@ -47,7 +47,6 @@ pub struct NodeState {
     pub local_peers: LocalPeers,
     pub local_senders: types::PeerSenders,
 
-    pub files: Files,
     pub messages: Messages,
 
     /// This node's id, derived from its identity key.
@@ -92,6 +91,9 @@ pub struct NodeState {
     /// Orders catalog and peer updates across nodes without trusting wall clocks.
     pub clock: Arc<hlc::Clock>,
 
+    /// Which connected nodes have which files, from their `Have` messages (see availability.rs).
+    pub availability: Arc<availability::Availability>,
+
     /// The files this node holds (see store.rs), and the transfers in progress (see transfer.rs).
     pub store: Arc<store::Store>,
     pub transfers: Arc<transfer::Transfers>,
@@ -129,21 +131,32 @@ impl NodeState {
 
     #[cfg(any(test, feature = "test-support"))]
     pub fn for_tests_node(node_id: &str, passphrase: Option<&str>) -> Self {
+        Self::for_tests_with(identity::Identity::generate(), node_id.to_string(), passphrase)
+    }
+
+    /// A node with no network whose id is derived from its key, so it can sign catalog changes.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn for_tests_signing(passphrase: Option<&str>) -> Self {
+        let identity = identity::Identity::generate();
+        let node_id = identity.node_id().to_string();
+        Self::for_tests_with(identity, node_id, passphrase)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn for_tests_with(identity: identity::Identity, node_id: NodeId, passphrase: Option<&str>) -> Self {
         let policy = || ratelimit::Policy {
             free_attempts: 3,
             base_lockout: Duration::from_secs(30),
             max_lockout: Duration::from_secs(300),
             global_cap: None,
         };
-        let node_id: NodeId = node_id.to_string();
         let data_dir = tempfile::tempdir().unwrap().keep();
         NodeState {
             local_peers: Arc::new(RwLock::new(HashMap::new())),
             local_senders: Arc::new(RwLock::new(HashMap::new())),
-            files: Arc::new(RwLock::new(HashMap::new())),
             messages: Arc::new(RwLock::new(Vec::new())),
             node_id: node_id.clone(),
-            identity: Arc::new(identity::Identity::generate()),
+            identity: Arc::new(identity),
             trust: Arc::new(trust::TrustStore::open(&data_dir).unwrap()),
             pairings: Arc::new(pairing::Pairings::new()),
             mesh_peers: Arc::new(RwLock::new(HashMap::new())),
@@ -156,6 +169,7 @@ impl NodeState {
             mesh_limiter: Arc::new(ratelimit::AttemptLimiter::new(policy())),
             sessions: Arc::new(sessions::SessionStore::new()),
             clock: Arc::new(hlc::Clock::new(node_id)),
+            availability: Arc::new(availability::Availability::default()),
             store: Arc::new(store::Store::open(&data_dir, 1 << 40).unwrap()),
             transfers: Arc::new(transfer::Transfers::with_tuning(transfer::Tuning {
                 request_timeout: Duration::from_millis(400),

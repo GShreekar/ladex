@@ -237,8 +237,7 @@ async fn handle_client_message(
                 peers.len()
             };
 
-            let files = state::live_files(&*state.files.read().await);
-            let _ = peer_tx.send(ServerMessage::FileListUpdate { files });
+            let _ = peer_tx.send(ServerMessage::FileListUpdate { files: state::file_views(state) });
 
             let messages = state.messages.read().await.clone();
             if !messages.is_empty() {
@@ -296,33 +295,8 @@ async fn handle_client_message(
 
         // The sharing device may unshare a file, and so may the node's own machine; a folder takes its files with it.
         ClientMessage::DeleteFile { session_id: _, file_id } => {
-            let tombstones: Vec<FileMetadata> = {
-                let mut files = state.files.write().await;
-                let allowed = files
-                    .get(&file_id)
-                    .is_some_and(|f| !f.deleted && (f.uploader_id == bound || (conn.is_host && f.uploader_node == state.node_id)));
-                if !allowed {
-                    Vec::new()
-                } else {
-                    let ids: Vec<String> = files
-                        .values()
-                        .filter(|f| !f.deleted && (f.id == file_id || f.parent.as_deref() == Some(file_id.as_str())))
-                        .map(|f| f.id.clone())
-                        .collect();
-                    let mut tombstones = Vec::new();
-                    for id in ids {
-                        if let Some(file) = files.get_mut(&id) {
-                            file.version = state.clock.now();
-                            file.deleted = true;
-                            file.deleted_at = file.version.wall;
-                            tombstones.push(file.clone());
-                        }
-                    }
-                    tombstones
-                }
-            };
-
-            if tombstones.is_empty() {
+            let taken_down = state::unshare(state, &file_id, &bound, conn.is_host).await;
+            if taken_down.is_empty() {
                 send_to(
                     state,
                     &bound,
@@ -331,13 +305,6 @@ async fn handle_client_message(
                     },
                 )
                 .await;
-            } else {
-                for tombstone in &tombstones {
-                    state::forget_file(state, &tombstone.id).await;
-                }
-                state::broadcast_catalog(state).await;
-                broadcast(state, ServerMessage::FileRemoved { file_id: file_id.clone() }).await;
-                state::push_files_to_mesh(&state.mesh_peers, tombstones).await;
             }
         }
 

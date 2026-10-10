@@ -1,3 +1,4 @@
+use crate::catalog::{EntryKind, Listed};
 use crate::hlc::Stamp;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -55,70 +56,57 @@ pub struct AuthResponse {
     pub message: Option<String>,
 }
 
-/// Whether one node has the complete file; each node only changes its own record.
+/// A shared file as a browser tab sees it: the catalog entry, who published it, and which nodes have it right now.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Holder {
-    pub since: Stamp,
-    pub present: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FileMetadata {
+pub struct FileView {
     pub id: String,
     pub name: String,
     pub size: u64,
     pub mime_type: String,
-    /// Device that shared the file (empty for files found on disk); only it, or the node's own machine, may unshare it.
+    /// The device that shared it (empty for none).
     pub uploader_id: SessionId,
-    /// Node it was first shared through.
-    #[serde(default)]
+    /// The node that published it.
     pub uploader_node: NodeId,
-    /// Nodes that have the complete file (and can serve it).
-    #[serde(default)]
-    pub holders: HashMap<NodeId, Holder>,
+    /// Nodes that have the whole file and can serve it.
+    pub hosts: Vec<NodeId>,
+    /// When it was shared, for display.
     pub uploaded_at: chrono::DateTime<chrono::Utc>,
-    /// Creation time (Unix ms), for display only.
-    #[serde(default)]
     pub created_at: u64,
-
-    /// Stamp of the latest change; the greater stamp wins a merge (see hlc.rs).
-    #[serde(default)]
-    pub version: Stamp,
-
-    /// True once the file has been unshared; the tombstone propagates across the mesh.
-    #[serde(default)]
-    pub deleted: bool,
-    /// Unix-millisecond wall-clock time of deletion, for display only.
-    #[serde(default)]
-    pub deleted_at: u64,
-
-    /// Identifies the exact contents (size and every chunk hash, see store.rs).
-    #[serde(default)]
-    pub manifest_root: Option<String>,
-
-    /// A folder is a JSON listing of its children, which are catalog entries with `parent` set.
-    #[serde(default)]
+    pub manifest_root: String,
     pub is_folder: bool,
-    #[serde(default)]
     pub parent: Option<String>,
     /// For a folder: what is inside, for display. `size` is the listing's own size.
-    #[serde(default)]
     pub folder_bytes: u64,
-    #[serde(default)]
     pub folder_files: u32,
 }
 
-impl FileMetadata {
-    pub fn is_held_by(&self, node: &str) -> bool {
-        self.holders.get(node).is_some_and(|h| h.present)
+impl FileView {
+    pub fn new(listed: &Listed, hosts: Vec<NodeId>) -> Self {
+        let entry = &listed.entry;
+        let (folder_bytes, folder_files) = match entry.kind {
+            EntryKind::Folder { bytes, files } => (bytes, files),
+            EntryKind::File { .. } => (0, 0),
+        };
+        Self {
+            id: entry.file_id.clone(),
+            name: entry.name.clone(),
+            size: entry.size,
+            mime_type: entry.mime_type.clone(),
+            uploader_id: entry.uploader_id.clone(),
+            uploader_node: listed.publisher.clone(),
+            hosts,
+            uploaded_at: chrono::DateTime::from_timestamp_millis(entry.created_at_ms as i64).unwrap_or_default(),
+            created_at: entry.created_at_ms,
+            manifest_root: entry.manifest_root.clone(),
+            is_folder: entry.is_folder(),
+            parent: entry.parent().map(String::from),
+            folder_bytes,
+            folder_files,
+        }
     }
 
-    pub fn holder_nodes(&self) -> impl Iterator<Item = &NodeId> {
-        self.holders.iter().filter(|(_, h)| h.present).map(|(node, _)| node)
-    }
-
-    pub fn set_holder(&mut self, node: &str, present: bool, since: Stamp) {
-        self.holders.insert(node.to_string(), Holder { since, present });
+    pub fn is_available(&self) -> bool {
+        !self.hosts.is_empty()
     }
 }
 
@@ -182,7 +170,7 @@ pub enum ServerMessage {
 
     /// Full file catalog (sent on join and whenever the catalog changes)
     #[serde(rename = "file_list_update")]
-    FileListUpdate { files: Vec<FileMetadata> },
+    FileListUpdate { files: Vec<FileView> },
 
     /// A single file was removed (host went offline, no remaining hosts)
     #[serde(rename = "file_removed")]

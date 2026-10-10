@@ -124,7 +124,7 @@ function memoryDirectory(existing = {}) {
     let entry = await app.uploadFile(new File([big], 'big file.bin', { type: 'application/octet-stream' }));
     check('uploadFile returns the node\'s catalog entry', entry.name === 'big file.bin' && entry.size === big.length && entry.uploader_id === app.sessionId, JSON.stringify(entry));
     check('progress reached 100%', p1.log.progress.length > 0 && p1.log.progress.at(-1).pct === 100, JSON.stringify(p1.log.progress.at(-1)));
-    const stored = fs.readFileSync(path.join(ROOT, `n1/files/${entry.id}.data`));
+    const stored = fs.readFileSync(path.join(ROOT, `n1/files/blobs/${entry.id}`));
     check('the node stores exactly the bytes sent', sha(stored) === sha(big));
 
     const data2 = crypto.randomBytes(10 * MiB + 5);
@@ -132,7 +132,7 @@ function memoryDirectory(existing = {}) {
     entry = await app.uploadFile(new File([data2], 'resumed.bin'));
     const sentFull = p1.log.progress.filter((p) => p.done === data2.length).length > 0;
     check('an interrupted upload resumes and completes', entry.size === data2.length && sentFull, JSON.stringify(entry));
-    check('the resumed file is intact', sha(fs.readFileSync(path.join(ROOT, `n1/files/${entry.id}.data`))) === sha(data2));
+    check('the resumed file is intact', sha(fs.readFileSync(path.join(ROOT, `n1/files/blobs/${entry.id}`))) === sha(data2));
 
     p1.slowMs = 20;
     const slow = new File([crypto.randomBytes(8 * MiB)], 'slow.bin');
@@ -172,7 +172,7 @@ function memoryDirectory(existing = {}) {
     const probe = await fetch(`http://${b2}/api/files/${entry.id}`, { headers: { Cookie: `auth=${t2}` } });
     check('and that URL really serves the file from node 2', sha(Buffer.from(await probe.arrayBuffer())) === sha(data2));
 
-    a2.serverFiles = [{ ...w2.files()[0], id: 'file_ghost', is_folder: false, holders: {} }];
+    a2.serverFiles = [{ ...w2.files()[0], id: 'file_ghost', is_folder: false, hosts: [] }];
     p2.log.toasts.length = 0;
     await a2.downloadFile('file_ghost');
     check('an unknown file is reported, not downloaded', p2.log.toasts.some((t) => /removed/.test(t.message)) && p2.log.clicks.length === 1, JSON.stringify(p2.log.toasts));

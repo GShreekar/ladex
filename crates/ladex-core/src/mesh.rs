@@ -19,7 +19,8 @@ pub mod quic;
 
 // 8: mesh messages on QUIC stream 0 are postcard-encoded instead of JSON.
 // 9: nodes trade catalog version vectors and signed ops.
-pub const PROTOCOL_VERSION: u32 = 9;
+// 10: holders are told with `Have` messages instead of being listed in the catalog.
+pub const PROTOCOL_VERSION: u32 = 10;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const DATA_QUEUE_FRAMES: usize = 8;
@@ -72,9 +73,6 @@ pub enum MeshMessage {
         ts: u64,
     },
 
-    CatalogSync {
-        files: Vec<FileMetadata>,
-    },
     PeerSync {
         peers: Vec<PeerInfo>,
     },
@@ -85,8 +83,8 @@ pub enum MeshMessage {
         message: TextMessage,
     },
 
-    /// A node still fetching a file says which chunks it has, so others can fetch from it too.
-    ChunkMap {
+    /// A node says which chunks of a file it has, so others can fetch from it, even before it has them all.
+    Have {
         file_id: String,
         chunks: u32,
         bitmap: String,
@@ -136,6 +134,15 @@ pub enum MeshMessage {
     /// Signed catalog ops: sent in answer to a version, or pushed when the sender makes one.
     CatalogOps {
         ops: Vec<crate::catalog::Op>,
+    },
+
+    /// These files are complete on the sender.
+    HaveAll {
+        file_ids: Vec<String>,
+    },
+    /// The sender no longer has these files.
+    Lost {
+        file_ids: Vec<String>,
     },
 }
 
@@ -284,8 +291,9 @@ async fn connection_ended(state: &NodeState, peer_node_id: &NodeId, sender: &mps
     current
 }
 
-/// Marks the browser tabs a departed node hosted as offline and its files as unavailable.
+/// Marks the browser tabs a departed node hosted as offline; the files it had are no longer hosted by it.
 async fn peer_departed_cleanup(state: &NodeState, departed_node_id: &NodeId) {
+    state.availability.drop_node(departed_node_id);
     // Marked left with a fresh version, or other nodes' merges would ignore the change.
     let departed_peers: Vec<PeerInfo> = {
         let mut local = state.local_peers.write().await;
@@ -310,18 +318,6 @@ async fn peer_departed_cleanup(state: &NodeState, departed_node_id: &NodeId) {
         }
     }
 
-    let changed: Vec<FileMetadata> = {
-        let mut files = state.files.write().await;
-        files
-            .values_mut()
-            .filter(|f| !f.deleted && f.is_held_by(departed_node_id))
-            .map(|file| {
-                file.set_holder(departed_node_id, false, state.clock.now());
-                file.clone()
-            })
-            .collect()
-    };
-    state::push_files_to_mesh(&state.mesh_peers, changed).await;
     crate::transfer::sources_changed(state);
 
     state::broadcast_catalog(state).await;
@@ -409,10 +405,7 @@ async fn post_handshake_sync(peer_tx: &mpsc::UnboundedSender<MeshMessage>, state
     }
 
     crate::catalog::sync::offer_version(peer_tx, state);
-
-    // Tombstones too: a peer that was away must learn what was unshared meanwhile.
-    let files: Vec<FileMetadata> = state.files.read().await.values().cloned().collect();
-    let _ = peer_tx.send(MeshMessage::CatalogSync { files });
+    crate::availability::announce_all(peer_tx, state);
 
     let peers: Vec<PeerInfo> = state.local_peers.read().await.values().cloned().collect();
     let _ = peer_tx.send(MeshMessage::PeerSync { peers });
@@ -459,18 +452,13 @@ pub(crate) async fn dispatch(msg: &MeshMessage, from_node_id: &NodeId, state: &N
             }
         }
 
-        MeshMessage::CatalogSync { files } => {
-            tracing::debug!("Mesh CatalogSync from {from_node_id}: {} file(s)", files.len());
-            state::apply_catalog_sync(state, files.clone(), from_node_id).await;
-            state::reassert_holdership(state).await;
-            crate::transfer::sources_changed(state);
-        }
-
         MeshMessage::GetManifest { file_id } => crate::transfer::serve_manifest(state, from_node_id, file_id).await,
         MeshMessage::Manifest { file_id, hashes, .. } => crate::transfer::on_manifest(state, from_node_id, file_id, hashes),
         MeshMessage::GetChunks { file_id, indices } => crate::transfer::serve_chunks(state, from_node_id, file_id, indices.clone()).await,
         MeshMessage::ChunkError { file_id, index, .. } => crate::transfer::on_chunk_error(state, from_node_id, file_id, *index),
-        MeshMessage::ChunkMap { file_id, chunks, bitmap } => crate::transfer::on_chunk_map(state, from_node_id, file_id, *chunks, bitmap),
+        MeshMessage::Have { file_id, chunks, bitmap } => crate::availability::on_have(state, from_node_id, file_id, *chunks, bitmap).await,
+        MeshMessage::HaveAll { file_ids } => crate::availability::on_have_all(state, from_node_id, file_ids).await,
+        MeshMessage::Lost { file_ids } => crate::availability::on_lost(state, from_node_id, file_ids).await,
         MeshMessage::PeerSync { peers } => {
             tracing::debug!("Mesh PeerSync from {from_node_id}: {} peer(s)", peers.len());
             state::apply_peer_sync(state, peers.clone(), from_node_id).await;

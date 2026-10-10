@@ -79,7 +79,8 @@ async fn when_a_node_says_goodbye_the_others_drop_it_and_its_files_become_unavai
     let remaining = &nodes[..2];
     let dropped_and_unavailable = async || {
         for node in remaining {
-            let unavailable = node.state.files.read().await.get("leaving_file").is_some_and(|f| !f.is_held_by(&leaver));
+            let unavailable =
+                node.live_files().await.contains("leaving_file") && !node.state.availability.hosts("leaving_file").contains(&leaver);
             if node.mesh_peers().await.contains(&leaver) || !unavailable {
                 return false;
             }

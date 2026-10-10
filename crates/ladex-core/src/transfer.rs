@@ -7,10 +7,11 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
+use crate::availability::Have;
 use crate::bitmap::Bitmap;
 use crate::mesh::MeshMessage;
 use crate::store::{chunk_count, Blob, ChunkHash, Origin, StoreError, WriteError, CHUNK_SIZE};
-use crate::types::{FileMetadata, NodeId};
+use crate::types::NodeId;
 use crate::validate;
 use crate::NodeState;
 
@@ -151,7 +152,6 @@ pub struct Download {
     events: mpsc::Sender<Event>,
     readers: Mutex<HashMap<u64, u32>>,
     next_reader: AtomicU64,
-    partial: Mutex<HashMap<NodeId, Bitmap>>,
     cancelled: AtomicBool,
 }
 
@@ -237,19 +237,14 @@ pub async fn ensure_file(state: &NodeState, id: &str) -> Result<Arc<Blob>, Fetch
         }
     }
 
-    let entry: FileMetadata = {
-        let files = state.files.read().await;
-        files.get(id).filter(|f| !f.deleted).cloned().ok_or(FetchError::NotFound)?
-    };
-    let root = entry.manifest_root.clone().ok_or(FetchError::NotFound)?;
-    if !someone_online_has(state, &entry).await {
+    let entry = state.catalog.listed(id).ok_or(FetchError::NotFound)?.entry;
+    if !someone_online_has(state, id).await {
         return Err(FetchError::NoOneHasIt);
     }
 
     crate::state::make_room(state, entry.size).await;
     let blob = state.store.create_with(id, entry.size, Origin::Cached).map_err(FetchError::Store)?;
-    blob.expect_root(&root);
-    blob.set_entry(entry);
+    blob.expect_root(&entry.manifest_root);
     if blob.is_complete() {
         return Ok(blob);
     }
@@ -260,7 +255,6 @@ pub async fn ensure_file(state: &NodeState, id: &str) -> Result<Arc<Blob>, Fetch
         events,
         readers: Mutex::new(HashMap::new()),
         next_reader: AtomicU64::new(1),
-        partial: Mutex::new(HashMap::new()),
         cancelled: AtomicBool::new(false),
     });
     {
@@ -274,9 +268,9 @@ pub async fn ensure_file(state: &NodeState, id: &str) -> Result<Arc<Blob>, Fetch
     Ok(blob)
 }
 
-async fn someone_online_has(state: &NodeState, entry: &FileMetadata) -> bool {
+async fn someone_online_has(state: &NodeState, id: &str) -> bool {
     let peers = state.mesh_peers.read().await;
-    entry.holder_nodes().any(|node| peers.contains_key(node))
+    state.availability.hosts(id).iter().any(|node| peers.contains_key(node))
 }
 
 pub fn open_reader(state: &NodeState, blob: &Blob) -> Option<Reader> {
@@ -318,17 +312,6 @@ pub fn on_manifest(state: &NodeState, from: &NodeId, file_id: &str, hashes_hex: 
     let Ok(raw) = hex::decode(hashes_hex) else { return };
     let hashes = raw.as_chunks::<32>().0.to_vec();
     let _ = download.events.try_send(Event::Manifest { from: from.clone(), hashes });
-}
-
-pub fn on_chunk_map(state: &NodeState, from: &NodeId, file_id: &str, chunks: u32, bitmap_hex: &str) {
-    let Some(download) = state.transfers.get(file_id) else { return };
-    if chunks != download.blob.chunk_count() {
-        return;
-    }
-    if let Some(map) = Bitmap::from_hex(chunks, bitmap_hex) {
-        download.partial.lock().unwrap().insert(from.clone(), map);
-        let _ = download.events.try_send(Event::Wake);
-    }
 }
 
 pub async fn serve_manifest(state: &NodeState, to: &NodeId, file_id: &str) {
@@ -482,7 +465,8 @@ async fn run(state: NodeState, download: Arc<Download>, mut events: mpsc::Receiv
             match blob.seal() {
                 Ok(_) => {
                     blob.persist().await;
-                    crate::state::add_self_as_holder(&state, &id).await;
+                    crate::state::broadcast_catalog(&state).await;
+                    crate::availability::announce_complete(&state, std::slice::from_ref(&id)).await;
                     tracing::info!("Transfer: {id} complete");
                 }
                 Err(why) => tracing::error!("Transfer: {id} failed verification: {why}"),
@@ -492,10 +476,7 @@ async fn run(state: NodeState, download: Arc<Download>, mut events: mpsc::Receiv
 
         let connected: HashMap<NodeId, mpsc::UnboundedSender<MeshMessage>> =
             state.mesh_peers.read().await.iter().map(|(n, h)| (n.clone(), h.sender.clone())).collect();
-        let holders: HashSet<NodeId> = {
-            let files = state.files.read().await;
-            files.get(&id).map(|f| f.holder_nodes().cloned().collect()).unwrap_or_default()
-        };
+        let holders: HashSet<NodeId> = state.availability.hosts(&id).into_iter().collect();
         peers.retain(|node, p| connected.contains_key(node) || p.banned);
 
         if !blob.has_manifest() {
@@ -516,7 +497,6 @@ async fn run(state: NodeState, download: Arc<Download>, mut events: mpsc::Receiv
             }
 
             let have = blob.bitmap();
-            let partial = download.partial.lock().unwrap().clone();
             let mut sources: Vec<Source> = Vec::new();
             let mut source_nodes: Vec<NodeId> = Vec::new();
             for node in connected.keys() {
@@ -524,12 +504,10 @@ async fn run(state: NodeState, download: Arc<Download>, mut events: mpsc::Receiv
                 if peer.banned {
                     continue;
                 }
-                let has = if holders.contains(node) {
-                    None
-                } else if let Some(map) = partial.get(node) {
-                    Some(map.clone())
-                } else {
-                    continue;
+                let has = match state.availability.get(node, &id) {
+                    Some(Have::Complete) => None,
+                    Some(Have::Partial(map)) if map.len() == have.len() => Some(map),
+                    _ => continue,
                 };
                 sources.push(Source { has, in_flight: peer.in_flight.len(), speed_bps: peer.speed_bps });
                 source_nodes.push(node.clone());
@@ -564,7 +542,7 @@ async fn run(state: NodeState, download: Arc<Download>, mut events: mpsc::Receiv
         if have.count() != last_map.1 && last_map.0.elapsed() >= tuning.map_interval {
             last_map = (Instant::now(), have.count());
             for sender in connected.values() {
-                let _ = sender.send(MeshMessage::ChunkMap { file_id: id.clone(), chunks: have.len(), bitmap: have.to_hex() });
+                let _ = sender.send(MeshMessage::Have { file_id: id.clone(), chunks: have.len(), bitmap: have.to_hex() });
             }
         }
 
@@ -585,9 +563,11 @@ fn finish(state: &NodeState, id: &str, download: &Arc<Download>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::{Add, CatalogEntry, EntryKind, Op};
+    use crate::hlc::Stamp;
+    use crate::identity::Identity;
+    use crate::manifest::root_of;
     use crate::mesh::{dispatch, MeshPeerHandle};
-    use crate::store::manifest_root;
-    use crate::types::Holder;
 
     #[test]
     fn a_download_gives_up_after_sixty_seconds_without_progress() {
@@ -749,37 +729,38 @@ mod tests {
         connect_one_way(b, a, None).await;
     }
 
-    async fn share(node: &NodeState, others: &[&NodeState], id: &str, content: &[u8]) -> FileMetadata {
+    // Lists the entry in each node's catalog, as the mesh would after a publisher's add reached them.
+    fn list(nodes: &[&NodeState], entry: &CatalogEntry) {
+        let author = Identity::generate();
+        let stamp = Stamp { wall: crate::hlc::wall_clock_ms(), counter: 0, node: author.node_id().to_string() };
+        let add = Add::sign(&author, stamp, 1, vec![], entry.clone());
+        for node in nodes {
+            let received = node.catalog.receive(vec![Op::Add(add.clone())]);
+            assert!(received.refused.is_empty(), "{:?}", received.refused);
+        }
+    }
+
+    async fn share(node: &NodeState, others: &[&NodeState], id: &str, content: &[u8]) -> CatalogEntry {
         let blob = node.store.create(id, content.len() as u64).unwrap();
         for index in 0..blob.chunk_count() {
             let start = index as usize * CHUNK_SIZE as usize;
             let end = (start + CHUNK_SIZE as usize).min(content.len());
             blob.write_chunk_hashing(index, content[start..end].to_vec()).await.unwrap();
         }
-        let root = blob.seal().unwrap();
-        let stamp = node.clock.now();
-        let entry = FileMetadata {
-            id: id.into(),
+        let entry = CatalogEntry {
+            file_id: id.into(),
             name: format!("{id}.bin"),
             size: content.len() as u64,
             mime_type: "application/octet-stream".into(),
+            created_at_ms: crate::hlc::wall_clock_ms(),
+            manifest_root: blob.seal().unwrap(),
             uploader_id: "peer_a".into(),
-            uploader_node: node.node_id.clone(),
-            holders: [(node.node_id.clone(), Holder { since: stamp.clone(), present: true })].into(),
-            uploaded_at: chrono::Utc::now(),
-            created_at: stamp.wall,
-            version: stamp,
-            deleted: false,
-            deleted_at: 0,
-            manifest_root: Some(root),
-            is_folder: false,
-            parent: None,
-            folder_bytes: 0,
-            folder_files: 0,
+            kind: EntryKind::File { parent: None },
         };
-        blob.set_entry(entry.clone());
-        for n in std::iter::once(node).chain(others.iter().copied()) {
-            n.files.write().await.insert(id.into(), entry.clone());
+        let everyone: Vec<&NodeState> = std::iter::once(node).chain(others.iter().copied()).collect();
+        list(&everyone, &entry);
+        for n in others {
+            n.availability.set_complete(&node.node_id, &[id.to_string()]);
         }
         entry
     }
@@ -803,9 +784,10 @@ mod tests {
         false
     }
 
-    async fn lists_itself_as_holder(node: &NodeState, id: &str) -> bool {
+    // Whether `observer` has been told that `host` has the whole file.
+    async fn is_known_host(observer: &NodeState, host: &NodeState, id: &str) -> bool {
         for _ in 0..100 {
-            if node.files.read().await.get(id).is_some_and(|f| f.is_held_by(&node.node_id)) {
+            if observer.availability.hosts(id).contains(&host.node_id) {
                 return true;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -829,7 +811,7 @@ mod tests {
 
         assert_eq!(read_all(&blob).await, content);
         assert_eq!(blob.manifest_root(), a.store.get("file_x").unwrap().manifest_root());
-        assert!(lists_itself_as_holder(&b, "file_x").await);
+        assert!(is_known_host(&a, &b, "file_x").await, "a should be told that b now has the file");
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(b.transfers.active(), 0);
     }
@@ -869,12 +851,8 @@ mod tests {
         let content = data_pattern(24 * CHUNK_SIZE as usize, 3);
         share(&a, &[&b, &c], "file_x", &content).await;
         share(&c, &[&a, &b], "file_x", &content).await;
-        for n in [&a, &b, &c] {
-            let mut files = n.files.write().await;
-            let entry = files.get_mut("file_x").unwrap();
-            entry.set_holder("node_a", true, a.clock.now());
-            entry.set_holder("node_c", true, c.clock.now());
-        }
+        b.availability.set_complete("node_a", &["file_x".to_string()]);
+        b.availability.set_complete("node_c", &["file_x".to_string()]);
 
         let blob = ensure_file(&b, "file_x").await.unwrap();
         assert!(wait_complete(&blob, 15).await);
@@ -902,12 +880,8 @@ mod tests {
         let content = data_pattern(12 * CHUNK_SIZE as usize, 4);
         share(&a, &[&b, &evil], "file_x", &content).await;
         share(&evil, &[&a, &b], "file_x", &content).await;
-        for n in [&a, &b, &evil] {
-            let mut files = n.files.write().await;
-            let entry = files.get_mut("file_x").unwrap();
-            entry.set_holder("node_a", true, a.clock.now());
-            entry.set_holder("node_evil", true, evil.clock.now());
-        }
+        b.availability.set_complete("node_a", &["file_x".to_string()]);
+        b.availability.set_complete("node_evil", &["file_x".to_string()]);
 
         let blob = ensure_file(&b, "file_x").await.unwrap();
         assert!(wait_complete(&blob, 15).await);
@@ -926,12 +900,8 @@ mod tests {
         let content = data_pattern(10 * CHUNK_SIZE as usize, 5);
         share(&a, &[&b, &dead], "file_x", &content).await;
         share(&dead, &[&a, &b], "file_x", &content).await;
-        for n in [&a, &b, &dead] {
-            let mut files = n.files.write().await;
-            let entry = files.get_mut("file_x").unwrap();
-            entry.set_holder("node_a", true, a.clock.now());
-            entry.set_holder("node_dead", true, dead.clock.now());
-        }
+        b.availability.set_complete("node_a", &["file_x".to_string()]);
+        b.availability.set_complete("node_dead", &["file_x".to_string()]);
 
         let blob = ensure_file(&b, "file_x").await.unwrap();
         assert!(wait_complete(&blob, 20).await, "the download should recover from a silent source");
@@ -943,8 +913,10 @@ mod tests {
         let [a, b] = nodes(["node_a", "node_b"]);
         link(&a, &b, None).await;
         let content = data_pattern(3 * CHUNK_SIZE as usize, 6);
-        share(&a, &[&b], "file_x", &content).await;
-        b.files.write().await.get_mut("file_x").unwrap().manifest_root = Some(manifest_root(content.len() as u64, &[[7; 32]; 3]));
+        let entry = share(&a, &[], "file_x", &content).await;
+        let wrong = CatalogEntry { manifest_root: root_of(content.len() as u64, &[[7; 32]; 3]), ..entry };
+        list(&[&b], &wrong);
+        b.availability.set_complete("node_a", &["file_x".to_string()]);
 
         let blob = ensure_file(&b, "file_x").await.unwrap();
         tokio::time::sleep(Duration::from_millis(600)).await;
@@ -984,6 +956,6 @@ mod tests {
         assert!(wait_complete(&at_b, 15).await);
         assert!(wait_complete(&at_c, 20).await, "c should get the file from b");
         assert_eq!(read_all(&at_c).await, content);
-        assert!(lists_itself_as_holder(&c, "file_x").await);
+        assert!(is_known_host(&b, &c, "file_x").await, "b should be told that c now has the file");
     }
 }

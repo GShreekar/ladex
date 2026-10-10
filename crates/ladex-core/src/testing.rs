@@ -8,10 +8,11 @@ use std::time::{Duration, Instant};
 
 use tokio::task::JoinHandle;
 
+use crate::catalog::{CatalogEntry, EntryKind};
 use crate::identity::Identity;
 use crate::mesh::endpoint::MeshEndpoint;
 use crate::store::CHUNK_SIZE;
-use crate::types::{FileMetadata, Holder, NodeId, PeerInfo, TextMessage};
+use crate::types::{FileView, NodeId, PeerInfo, TextMessage};
 use crate::{mesh, ratelimit, state, NodeState};
 
 mod faulty_link;
@@ -170,16 +171,20 @@ impl NodeHandle {
         self.state.mesh_peers.read().await.keys().cloned().collect()
     }
 
-    /// The whole catalog, tombstones and holders included, in a form that compares across nodes.
+    /// The whole catalog with each file's hosts, in a form that compares across nodes.
     pub async fn catalog(&self) -> serde_json::Value {
-        let files: BTreeMap<String, FileMetadata> =
-            self.state.files.read().await.iter().map(|(id, file)| (id.clone(), file.clone())).collect();
+        let files: BTreeMap<String, FileView> = state::file_views(&self.state).into_iter().map(|file| (file.id.clone(), file)).collect();
         serde_json::to_value(files).expect("a catalog serializes")
     }
 
-    /// Ids of the files listed and not unshared.
+    /// Ids of the files listed.
     pub async fn live_files(&self) -> BTreeSet<String> {
-        self.state.files.read().await.values().filter(|f| !f.deleted).map(|f| f.id.clone()).collect()
+        state::file_views(&self.state).into_iter().map(|file| file.id).collect()
+    }
+
+    /// The nodes this node knows to have the whole file right now.
+    pub async fn hosts_of(&self, id: &str) -> Vec<NodeId> {
+        state::hosts_of(&self.state, id)
     }
 
     /// Chat message ids, in the order this node shows them.
@@ -188,50 +193,33 @@ impl NodeHandle {
     }
 
     /// Stores `content` on this node and lists it in the mesh catalog.
-    pub async fn share_file(&self, id: &str, content: &[u8]) -> FileMetadata {
+    pub async fn share_file(&self, id: &str, content: &[u8]) -> FileView {
         let state = &self.state;
         let blob = state.store.create(id, content.len() as u64).expect("create the file");
         for (index, chunk) in content.chunks(CHUNK_SIZE as usize).enumerate() {
             blob.write_chunk_hashing(index as u32, chunk.to_vec()).await.expect("write a chunk");
         }
-        let root = blob.seal().expect("seal the file");
-        let stamp = state.clock.now();
-        let entry = FileMetadata {
-            id: id.to_string(),
+        let entry = CatalogEntry {
+            file_id: id.to_string(),
             name: format!("{id}.bin"),
             size: content.len() as u64,
             mime_type: "application/octet-stream".to_string(),
-            uploader_id: format!("device_{}", state.node_id),
-            uploader_node: state.node_id.clone(),
-            holders: [(state.node_id.clone(), Holder { since: stamp.clone(), present: true })].into(),
-            uploaded_at: chrono::Utc::now(),
-            created_at: stamp.wall,
-            version: stamp,
-            deleted: false,
-            deleted_at: 0,
-            manifest_root: Some(root),
-            is_folder: false,
-            parent: None,
-            folder_bytes: 0,
-            folder_files: 0,
+            created_at_ms: crate::hlc::wall_clock_ms(),
+            manifest_root: blob.seal().expect("seal the file"),
+            uploader_id: self.device_id(),
+            kind: EntryKind::File { parent: None },
         };
-        state::publish_entry(state, entry.clone()).await;
-        entry
+        state::share_file(state, entry).await.expect("list the file")
     }
 
     /// Unshares a file, as its uploader would from the browser.
     pub async fn unshare_file(&self, id: &str) {
-        let state = &self.state;
-        let tombstone = {
-            let mut files = state.files.write().await;
-            let file = files.get_mut(id).expect("the file is in the catalog");
-            file.version = state.clock.now();
-            file.deleted = true;
-            file.deleted_at = file.version.wall;
-            file.clone()
-        };
-        state::forget_file(state, id).await;
-        state::push_files_to_mesh(&state.mesh_peers, vec![tombstone]).await;
+        let taken_down = state::unshare(&self.state, id, &self.device_id(), false).await;
+        assert!(!taken_down.is_empty(), "the file is in the catalog and was shared by this node");
+    }
+
+    fn device_id(&self) -> String {
+        format!("device_{}", self.state.node_id)
     }
 
     /// Posts a chat message from a device on this node.

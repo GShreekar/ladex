@@ -1,78 +1,22 @@
-//! Merges the file catalog, peer list and chat across nodes, and fans changes out to local tabs.
+//! Turns the signed catalog, live availability, peers and chat into what local tabs see, and applies changes from the mesh.
 
 use std::collections::HashMap;
 
+use crate::catalog::{self, CatalogEntry, EntryKind, Refusal};
 use crate::hlc::{ClockError, Stamp};
+use crate::store::Origin;
 use crate::types::*;
 use crate::validate;
 use crate::websocket;
 use crate::NodeState;
 
 const TOMBSTONE_TTL_MS: u64 = 60 * 60 * 1000;
-const UNHELD_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 pub const MAX_CATALOG_ENTRIES: usize = 5000;
 const MAX_PEERS: usize = 2000;
-
-fn merge_holders(into: &mut HashMap<NodeId, Holder>, from: HashMap<NodeId, Holder>) {
-    for (node, holder) in from {
-        match into.get(&node) {
-            Some(existing) if existing.since >= holder.since => {}
-            _ => {
-                into.insert(node, holder);
-            }
-        }
-    }
-}
-
-/// Merges `incoming` into `local`: the greater `version` wins and holders merge per node. Returns how many new ids were skipped for lack of room.
-pub fn merge_files(local: &mut HashMap<String, FileMetadata>, incoming: Vec<FileMetadata>, capacity: usize) -> usize {
-    let mut skipped = 0;
-    for entry in incoming {
-        let Some(existing) = local.get_mut(&entry.id) else {
-            if local.len() >= capacity {
-                skipped += 1;
-            } else {
-                local.insert(entry.id.clone(), entry);
-            }
-            continue;
-        };
-        if entry.version > existing.version {
-            let old_holders = std::mem::take(&mut existing.holders);
-            *existing = entry;
-            merge_holders(&mut existing.holders, old_holders);
-        } else {
-            merge_holders(&mut existing.holders, entry.holders);
-        }
-    }
-    skipped
-}
-
-/// Removes tombstones older than `TOMBSTONE_TTL_MS`.
-pub fn prune_tombstones(local: &mut HashMap<String, FileMetadata>, now_ms: u64) {
-    local.retain(|_, f| !f.deleted || now_ms.saturating_sub(f.version.wall) < TOMBSTONE_TTL_MS);
-}
-
-/// Drops entries no node has held for a day.
-pub fn prune_unheld(local: &mut HashMap<String, FileMetadata>, now_ms: u64) {
-    local.retain(|_, f| f.deleted || f.holder_nodes().next().is_some() || now_ms.saturating_sub(f.version.wall) < UNHELD_TTL_MS);
-}
 
 /// Removes departed-peer tombstones older than `TOMBSTONE_TTL_MS`.
 pub fn prune_peer_tombstones(local: &mut HashMap<SessionId, PeerInfo>, now_ms: u64) {
     local.retain(|_, p| !p.left || now_ms.saturating_sub(p.version.wall) < TOMBSTONE_TTL_MS);
-}
-
-/// Make room for new entries by dropping the oldest tombstones first.
-pub fn evict_old_tombstones(local: &mut HashMap<String, FileMetadata>, capacity: usize) {
-    if local.len() < capacity {
-        return;
-    }
-    let mut tombstones: Vec<(Stamp, String)> = local.values().filter(|f| f.deleted).map(|f| (f.version.clone(), f.id.clone())).collect();
-    tombstones.sort();
-    let excess = local.len() + 1 - capacity;
-    for (_, id) in tombstones.into_iter().take(excess) {
-        local.remove(&id);
-    }
 }
 
 /// Merges `incoming` messages into `local`, keeping the first copy of each id.
@@ -144,40 +88,45 @@ pub async fn report_clock_problem(state: &NodeState, from: &str, problem: &impl 
     }
 }
 
-/// Apply an incoming catalog sync and fan out the updated list to local tabs.
-pub async fn apply_catalog_sync(state: &NodeState, incoming: Vec<FileMetadata>, from: &str) {
-    let (mut accepted, clock_problem) = accept_from_mesh(state, incoming, validate::incoming_file, |f| &f.version);
-    // Holder records carry stamps too; absorb them so what this node stamps next outranks them.
-    for file in &mut accepted {
-        file.holders.retain(|_, holder| state.clock.observe(&holder.since).is_ok());
-    }
-    let ids: Vec<String> = accepted.iter().map(|f| f.id.clone()).collect();
-    let (updated, unshared): (Vec<FileMetadata>, Vec<String>) = {
-        let mut files = state.files.write().await;
-        evict_old_tombstones(&mut files, MAX_CATALOG_ENTRIES);
-        let skipped = merge_files(&mut files, accepted, MAX_CATALOG_ENTRIES);
-        if skipped > 0 {
-            tracing::warn!("Catalog full: ignored {skipped} new entries from {from}");
-        }
-        let unshared = ids.into_iter().filter(|id| files.get(id).is_some_and(|f| f.deleted)).collect();
-        (live_files(&files), unshared)
-    };
-    for id in unshared {
-        forget_file(state, &id).await;
-    }
-    if let Some(problem) = clock_problem {
-        report_clock_problem(state, from, &problem).await;
-    }
-    websocket::broadcast(state, ServerMessage::FileListUpdate { files: updated }).await;
+/// The size of a shared file, if this node knows of it.
+pub fn known_size(state: &NodeState, id: &str) -> Option<u64> {
+    state.catalog.listed(id).map(|listed| listed.entry.size)
 }
 
-pub fn live_files(files: &HashMap<String, FileMetadata>) -> Vec<FileMetadata> {
-    files.values().filter(|f| !f.deleted).cloned().collect()
+/// The nodes that have the whole file right now, this one included.
+pub fn hosts_of(state: &NodeState, id: &str) -> Vec<NodeId> {
+    let mut hosts = state.availability.hosts(id);
+    if state.store.contains_complete(id) && !hosts.contains(&state.node_id) {
+        hosts.push(state.node_id.clone());
+        hosts.sort();
+    }
+    hosts
+}
+
+/// Every shared file as a browser tab shows it.
+pub fn file_views(state: &NodeState) -> Vec<FileView> {
+    state.catalog.listing().iter().map(|listed| FileView::new(listed, hosts_of(state, &listed.entry.file_id))).collect()
+}
+
+pub fn file_view(state: &NodeState, id: &str) -> Option<FileView> {
+    state.catalog.listed(id).map(|listed| FileView::new(&listed, hosts_of(state, id)))
 }
 
 pub async fn broadcast_catalog(state: &NodeState) {
-    let files = live_files(&*state.files.read().await);
-    websocket::broadcast(state, ServerMessage::FileListUpdate { files }).await;
+    websocket::broadcast(state, ServerMessage::FileListUpdate { files: file_views(state) }).await;
+}
+
+/// Acts on the files whose listing just changed: deletes copies of those taken down and tells local tabs.
+pub async fn catalog_changed(state: &NodeState, file_ids: &[String]) {
+    let taken_down: Vec<&String> = file_ids.iter().filter(|id| state.catalog.was_removed(id)).collect();
+    for id in &taken_down {
+        forget_file(state, id).await;
+    }
+    broadcast_catalog(state).await;
+    for id in taken_down {
+        websocket::broadcast(state, ServerMessage::FileRemoved { file_id: id.clone() }).await;
+    }
+    crate::transfer::sources_changed(state);
 }
 
 /// Delete our copy of a file that was unshared, and stop any transfer of it.
@@ -186,61 +135,53 @@ pub async fn forget_file(state: &NodeState, id: &str) {
     if state.store.get(id).is_some() {
         tracing::info!("Store: removing {id} (unshared)");
         state.store.remove(id);
+        crate::availability::announce_lost(state, &[id.to_string()]).await;
     }
 }
 
-/// Adds or replaces the entry for a file this node holds, saves it with the file, and tells local tabs and the mesh.
-pub async fn publish_entry(state: &NodeState, entry: FileMetadata) {
-    if let Some(blob) = state.store.get(&entry.id) {
-        blob.set_entry(entry.clone());
+/// Lists a file this node already holds, tells the mesh it has it, and returns how tabs will see it.
+pub async fn share_file(state: &NodeState, entry: CatalogEntry) -> Result<FileView, Refusal> {
+    let id = entry.file_id.clone();
+    // Saved before it is listed, so a restart never finds a shared file that is not marked complete.
+    if let Some(blob) = state.store.get(&id) {
         blob.persist().await;
     }
-    {
-        let mut files = state.files.write().await;
-        evict_old_tombstones(&mut files, MAX_CATALOG_ENTRIES);
-        merge_files(&mut files, vec![entry.clone()], MAX_CATALOG_ENTRIES);
-    }
-    broadcast_catalog(state).await;
-    push_file_to_mesh(&state.mesh_peers, entry).await;
+    catalog::sync::publish(state, entry, Vec::new()).await?;
+    crate::availability::announce_complete(state, std::slice::from_ref(&id)).await;
+    Ok(file_view(state, &id).expect("a file just published is listed"))
 }
 
-/// This node has just finished fetching a file: it can serve it from now on.
-pub async fn add_self_as_holder(state: &NodeState, id: &str) {
-    let entry = {
-        let mut files = state.files.write().await;
-        match files.get_mut(id) {
-            Some(file) if !file.deleted => {
-                file.set_holder(&state.node_id, true, state.clock.now());
-                Some(file.clone())
-            }
-            _ => None,
+/// Takes down a file and, for a folder, what is in it; returns the ids that were taken down.
+/// Only the device that shared it may, or the node's own machine for files shared through this node.
+pub async fn unshare(state: &NodeState, file_id: &str, device: &str, is_host: bool) -> Vec<String> {
+    let Some(listed) = state.catalog.listed(file_id) else { return Vec::new() };
+    let is_ours = listed.publisher == state.node_id;
+    let may_unshare = listed.entry.uploader_id == device || (is_host && is_ours);
+    if !is_ours || !may_unshare {
+        return Vec::new();
+    }
+    let ids: Vec<String> = state
+        .catalog
+        .listing()
+        .into_iter()
+        .filter(|l| l.entry.file_id == file_id || l.entry.parent() == Some(file_id))
+        .map(|l| l.entry.file_id)
+        .collect();
+    let mut taken_down = Vec::new();
+    for id in ids {
+        if catalog::sync::unpublish(state, &id).await.is_ok() {
+            taken_down.push(id);
         }
-    };
-    if let Some(entry) = entry {
-        publish_entry(state, entry).await;
     }
+    taken_down
 }
 
-/// Evicts least-recently-used cached files so `size` more bytes fit, and stops listing this node as their holder.
+/// Evicts least-recently-used cached files so `size` more bytes fit, and tells the mesh they are gone.
 pub async fn make_room(state: &NodeState, size: u64) {
-    for id in state.store.evict_to_fit(size) {
-        drop_self_as_holder(state, &id).await;
-    }
-}
-
-async fn drop_self_as_holder(state: &NodeState, id: &str) {
-    let entry = {
-        let mut files = state.files.write().await;
-        match files.get_mut(id) {
-            Some(file) if !file.deleted && file.is_held_by(&state.node_id) => {
-                file.set_holder(&state.node_id, false, state.clock.now());
-                Some(file.clone())
-            }
-            _ => None,
-        }
-    };
-    if let Some(entry) = entry {
-        publish_entry(state, entry).await;
+    let evicted = state.store.evict_to_fit(size);
+    if !evicted.is_empty() {
+        crate::availability::announce_lost(state, &evicted).await;
+        broadcast_catalog(state).await;
     }
 }
 
@@ -265,97 +206,56 @@ async fn collect_garbage_with(state: &NodeState, partial_ttl: std::time::Duratio
     }
 
     let now = crate::hlc::wall_clock_ms();
-    let tombstones: Vec<FileMetadata> = {
-        let mut files = state.files.write().await;
-        let orphans: Vec<String> = files
-            .values()
-            .filter(|f| !f.deleted && f.uploader_node == state.node_id && now.saturating_sub(f.created_at) >= orphan_ttl_ms)
-            .filter(|f| f.parent.as_ref().is_some_and(|parent| !files.get(parent).is_some_and(|p| !p.deleted)))
-            .map(|f| f.id.clone())
-            .collect();
-        let mut tombstones = Vec::new();
-        for id in orphans {
-            if let Some(file) = files.get_mut(&id) {
-                file.version = state.clock.now();
-                file.deleted = true;
-                file.deleted_at = file.version.wall;
-                tombstones.push(file.clone());
-            }
-        }
-        tombstones
-    };
-    if !tombstones.is_empty() {
-        for tombstone in &tombstones {
-            forget_file(state, &tombstone.id).await;
-        }
-        broadcast_catalog(state).await;
-        push_files_to_mesh(&state.mesh_peers, tombstones).await;
+    let listing = state.catalog.listing();
+    let orphans = listing
+        .iter()
+        .filter(|l| l.publisher == state.node_id && now.saturating_sub(l.entry.created_at_ms) >= orphan_ttl_ms)
+        .filter(|l| l.entry.parent().is_some_and(|parent| !listing.iter().any(|other| other.entry.file_id == parent)));
+    for orphan in orphans {
+        // Unpublishing also deletes the copy and tells the tabs.
+        let _ = catalog::sync::unpublish(state, &orphan.entry.file_id).await;
     }
 }
 
-/// Entries for the files on this node's disk, from before it last stopped.
-pub async fn load_catalog_from_store(state: &NodeState) {
-    let mut files = state.files.write().await;
+/// Deletes the copies of files that were taken down while this node was not listening.
+pub async fn reconcile_store(state: &NodeState) {
     for blob in state.store.all() {
-        if let (true, Some(entry)) = (blob.is_complete(), blob.entry()) {
-            if let Some(entry) = validate::incoming_file(entry) {
-                merge_files(&mut files, vec![entry], MAX_CATALOG_ENTRIES);
-            }
+        if state.catalog.was_removed(blob.id()) {
+            forget_file(state, blob.id()).await;
         }
     }
 }
 
-/// Re-lists this node as a holder of every complete file on disk, and deletes copies of files unshared meanwhile.
-pub async fn reassert_holdership(state: &NodeState) {
-    let mut changed = Vec::new();
-    let mut unshared = Vec::new();
-    {
-        let mut files = state.files.write().await;
-        for blob in state.store.all().into_iter().filter(|b| b.is_complete()) {
-            match files.get_mut(blob.id()) {
-                Some(file) if file.deleted => unshared.push(blob.id().to_string()),
-                Some(file) if !file.is_held_by(&state.node_id) => {
-                    file.set_holder(&state.node_id, true, state.clock.now());
-                    changed.push(file.clone());
-                }
-                _ => {}
-            }
+/// Lists, in the signed catalog, the files an earlier version of this node shared; returns how many.
+pub async fn import_legacy_entries(state: &NodeState) -> usize {
+    let mut imported = 0;
+    for blob in state.store.all() {
+        let Some(old) = blob.take_legacy_entry() else { continue };
+        blob.persist().await;
+        let (Origin::Published, Some(root)) = (blob.origin(), blob.manifest_root()) else { continue };
+        if old.deleted || state.catalog.contains(&old.id) || state.catalog.was_removed(&old.id) {
+            continue;
+        }
+        let kind = match old.is_folder {
+            true => EntryKind::Folder { bytes: old.folder_bytes, files: old.folder_files },
+            false => EntryKind::File { parent: old.parent },
+        };
+        let entry = CatalogEntry {
+            file_id: old.id,
+            name: validate::sanitize_file_name(&old.name),
+            size: old.size,
+            mime_type: validate::sanitize_mime(&old.mime_type),
+            created_at_ms: old.created_at,
+            manifest_root: root,
+            uploader_id: old.uploader_id,
+            kind,
+        };
+        match state.catalog.publish(&state.identity, &state.clock, entry, Vec::new()) {
+            Ok(_) => imported += 1,
+            Err(refusal) => tracing::warn!("Catalog: could not list {} from an earlier version because {refusal}", blob.id()),
         }
     }
-    for id in unshared {
-        forget_file(state, &id).await;
-    }
-    for entry in changed {
-        publish_entry(state, entry).await;
-    }
-}
-
-/// Moves what this node uploaded and holds from `old_id` to its current id, with fresh stamps.
-pub async fn adopt_node_id(state: &NodeState, old_id: &str) {
-    let changed: Vec<FileMetadata> = {
-        let mut files = state.files.write().await;
-        files
-            .values_mut()
-            .filter(|f| f.uploader_node == old_id || f.holders.contains_key(old_id))
-            .map(|file| {
-                let now = state.clock.now();
-                if file.uploader_node == old_id {
-                    file.uploader_node = state.node_id.clone();
-                }
-                if let Some(held) = file.holders.get(old_id).map(|h| h.present) {
-                    file.set_holder(old_id, false, now.clone());
-                    if held {
-                        file.set_holder(&state.node_id, true, now.clone());
-                    }
-                }
-                file.version = now;
-                file.clone()
-            })
-            .collect()
-    };
-    for entry in changed {
-        publish_entry(state, entry).await;
-    }
+    imported
 }
 
 /// Apply an incoming peer sync and fan out the updated peer list to local tabs.
@@ -418,27 +318,6 @@ pub async fn apply_chat_message(state: &NodeState, message: TextMessage) {
 
 use crate::mesh::{MeshMessage, MeshPeers};
 
-/// Broadcast a single file entry to all connected mesh peers.
-pub async fn push_file_to_mesh(mesh_peers: &MeshPeers, file: FileMetadata) {
-    let peers = mesh_peers.read().await;
-    let msg = MeshMessage::CatalogSync { files: vec![file] };
-    for handle in peers.values() {
-        let _ = handle.sender.send(msg.clone());
-    }
-}
-
-/// Broadcast several file entries to all connected mesh peers in one message.
-pub async fn push_files_to_mesh(mesh_peers: &MeshPeers, files: Vec<FileMetadata>) {
-    if files.is_empty() {
-        return;
-    }
-    let peers = mesh_peers.read().await;
-    let msg = MeshMessage::CatalogSync { files };
-    for handle in peers.values() {
-        let _ = handle.sender.send(msg.clone());
-    }
-}
-
 /// Broadcast a single chat message to all connected mesh peers.
 pub async fn push_message_to_mesh(mesh_peers: &MeshPeers, message: TextMessage) {
     let peers = mesh_peers.read().await;
@@ -477,187 +356,9 @@ pub async fn push_peer_left_to_mesh(mesh_peers: &MeshPeers, session_id: SessionI
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hlc::Clock;
 
     fn stamp(wall: u64, counter: u32, node: &str) -> Stamp {
         Stamp { wall, counter, node: node.into() }
-    }
-
-    fn file(id: &str, version: Stamp) -> FileMetadata {
-        FileMetadata {
-            id: id.into(),
-            name: format!("{id}.txt"),
-            size: 1,
-            mime_type: "text/plain".into(),
-            uploader_id: "peer_a".into(),
-            uploader_node: "node_a".into(),
-            holders: [("node_a".to_string(), Holder { since: version.clone(), present: true })].into(),
-            uploaded_at: chrono::Utc::now(),
-            created_at: version.wall,
-            version,
-            deleted: false,
-            deleted_at: 0,
-            manifest_root: Some("ab".repeat(32)),
-            is_folder: false,
-            parent: None,
-            folder_bytes: 0,
-            folder_files: 0,
-        }
-    }
-
-    fn tombstone(id: &str, version: Stamp) -> FileMetadata {
-        FileMetadata { deleted: true, deleted_at: version.wall, ..file(id, version) }
-    }
-
-    fn catalog(entries: Vec<FileMetadata>) -> HashMap<String, FileMetadata> {
-        entries.into_iter().map(|f| (f.id.clone(), f)).collect()
-    }
-
-    #[test]
-    fn the_greater_version_wins_and_equal_versions_keep_what_we_have() {
-        let mut local = catalog(vec![file("f", stamp(10, 0, "a"))]);
-
-        let mut newer = file("f", stamp(11, 0, "b"));
-        newer.name = "newer.txt".into();
-        merge_files(&mut local, vec![newer], 100);
-        assert_eq!(local["f"].name, "newer.txt");
-
-        let mut same = file("f", stamp(11, 0, "b"));
-        same.name = "echo.txt".into();
-        merge_files(&mut local, vec![same], 100);
-        assert_eq!(local["f"].name, "newer.txt");
-
-        let mut older = file("f", stamp(5, 0, "c"));
-        older.name = "older.txt".into();
-        merge_files(&mut local, vec![older], 100);
-        assert_eq!(local["f"].name, "newer.txt");
-    }
-
-    fn held_by(mut f: FileMetadata, node: &str, present: bool, since: Stamp) -> FileMetadata {
-        f.set_holder(node, present, since);
-        f
-    }
-
-    #[test]
-    fn holders_added_by_different_nodes_at_the_same_time_both_survive() {
-        let base = file("f", stamp(10, 0, "node_a"));
-        let mut one = catalog(vec![held_by(base.clone(), "node_b", true, stamp(20, 0, "node_b"))]);
-        let mut two = catalog(vec![held_by(base.clone(), "node_c", true, stamp(21, 0, "node_c"))]);
-        let from_one = one["f"].clone();
-        let from_two = two["f"].clone();
-        merge_files(&mut one, vec![from_two], 100);
-        merge_files(&mut two, vec![from_one], 100);
-        for merged in [&one["f"], &two["f"]] {
-            let mut nodes: Vec<_> = merged.holder_nodes().cloned().collect();
-            nodes.sort();
-            assert_eq!(nodes, ["node_a", "node_b", "node_c"]);
-        }
-    }
-
-    #[test]
-    fn a_holder_is_kept_when_a_newer_version_of_the_entry_arrives() {
-        let mut local = catalog(vec![held_by(file("f", stamp(10, 0, "node_a")), "node_b", true, stamp(15, 0, "node_b"))]);
-        let mut renamed = file("f", stamp(30, 0, "node_a"));
-        renamed.name = "renamed.txt".into();
-        merge_files(&mut local, vec![renamed], 100);
-        assert_eq!(local["f"].name, "renamed.txt");
-        assert!(local["f"].is_held_by("node_b"));
-    }
-
-    #[test]
-    fn a_node_leaving_wins_over_its_older_holding_and_not_over_a_newer_one() {
-        let mut local = catalog(vec![held_by(file("f", stamp(10, 0, "node_a")), "node_b", true, stamp(15, 0, "node_b"))]);
-        let left = held_by(file("f", stamp(10, 0, "node_a")), "node_b", false, stamp(20, 0, "node_c"));
-        merge_files(&mut local, vec![left], 100);
-        assert!(!local["f"].is_held_by("node_b"));
-
-        let stale = held_by(file("f", stamp(10, 0, "node_a")), "node_b", true, stamp(15, 0, "node_b"));
-        merge_files(&mut local, vec![stale], 100);
-        assert!(!local["f"].is_held_by("node_b"));
-
-        let back = held_by(file("f", stamp(10, 0, "node_a")), "node_b", true, stamp(40, 0, "node_b"));
-        merge_files(&mut local, vec![back], 100);
-        assert!(local["f"].is_held_by("node_b"));
-    }
-
-    #[test]
-    fn entries_nobody_holds_are_dropped_after_a_day() {
-        let day = 24 * 60 * 60 * 1000;
-        let now = 100 * day;
-        let mut gone = file("gone", stamp(now - day - 1, 0, "node_a"));
-        gone.set_holder("node_a", false, stamp(now - day - 1, 0, "node_a"));
-        let mut recent = file("recent", stamp(now - 1000, 0, "node_a"));
-        recent.set_holder("node_a", false, stamp(now - 1000, 0, "node_a"));
-        let held = file("held", stamp(now - 5 * day, 0, "node_a"));
-        let mut local = catalog(vec![gone, recent, held, tombstone("t", stamp(now - 5 * day, 0, "node_a"))]);
-
-        prune_unheld(&mut local, now);
-
-        let mut kept: Vec<_> = local.keys().cloned().collect();
-        kept.sort();
-        assert_eq!(kept, ["held", "recent", "t"]);
-    }
-
-    #[test]
-    fn an_older_live_entry_cannot_bring_back_a_newer_deletion() {
-        let mut local = catalog(vec![tombstone("f", stamp(20, 0, "a"))]);
-        merge_files(&mut local, vec![file("f", stamp(10, 0, "b"))], 100);
-        assert!(local["f"].deleted);
-    }
-
-    #[test]
-    fn a_node_with_a_slow_clock_can_still_delete_what_it_has_seen() {
-        let fast = Clock::new("fast".into());
-        let slow = Clock::new("slow".into());
-        let created = file("f", fast.now());
-        slow.observe(&created.version).unwrap();
-        let deletion = tombstone("f", slow.now());
-
-        let mut local = catalog(vec![created]);
-        merge_files(&mut local, vec![deletion], 100);
-        assert!(local["f"].deleted);
-    }
-
-    #[test]
-    fn concurrent_changes_resolve_the_same_way_on_every_node() {
-        let a = file("f", stamp(10, 0, "node_a"));
-        let b = file("f", stamp(10, 0, "node_b"));
-        let mut one = catalog(vec![a.clone()]);
-        let mut two = catalog(vec![b.clone()]);
-        merge_files(&mut one, vec![b], 100);
-        merge_files(&mut two, vec![a], 100);
-        assert_eq!(one["f"].version, two["f"].version);
-    }
-
-    #[test]
-    fn a_full_catalog_ignores_new_ids_but_still_applies_updates() {
-        let mut local = catalog(vec![file("old", stamp(1, 0, "a"))]);
-        let skipped = merge_files(&mut local, vec![file("new", stamp(2, 0, "a")), file("old", stamp(3, 0, "a"))], 1);
-        assert_eq!(skipped, 1);
-        assert!(!local.contains_key("new"));
-        assert_eq!(local["old"].version.wall, 3);
-    }
-
-    #[test]
-    fn the_oldest_tombstones_are_evicted_first_to_make_room() {
-        let mut local = catalog(vec![tombstone("t1", stamp(1, 0, "a")), tombstone("t2", stamp(2, 0, "a")), file("live", stamp(3, 0, "a"))]);
-        evict_old_tombstones(&mut local, 3);
-        assert!(!local.contains_key("t1") && local.contains_key("t2") && local.contains_key("live"));
-    }
-
-    #[test]
-    fn pruning_keeps_recent_and_future_tombstones_and_does_not_underflow() {
-        let now = 10 * TOMBSTONE_TTL_MS;
-        let mut local = catalog(vec![
-            tombstone("expired", stamp(now - TOMBSTONE_TTL_MS - 1, 0, "a")),
-            tombstone("recent", stamp(now - 1000, 0, "a")),
-            tombstone("future", stamp(now + 30 * 60 * 1000, 0, "a")),
-            file("live", stamp(1, 0, "a")),
-        ]);
-        prune_tombstones(&mut local, now);
-        let mut kept: Vec<_> = local.keys().cloned().collect();
-        kept.sort();
-        assert_eq!(kept, ["future", "live", "recent"]);
     }
 
     fn peer(id: &str, version: Stamp, left: bool) -> PeerInfo {
@@ -734,27 +435,6 @@ mod tests {
     }
 
     #[test]
-    fn merging_the_same_catalog_twice_changes_nothing() {
-        let incoming = vec![file("a", stamp(10, 0, "n")), tombstone("b", stamp(11, 0, "n"))];
-        let mut once = HashMap::new();
-        merge_files(&mut once, incoming.clone(), 100);
-        let mut twice = once.clone();
-        merge_files(&mut twice, incoming, 100);
-        for (id, entry) in &once {
-            assert_eq!(twice[id].version, entry.version);
-            assert_eq!(twice[id].deleted, entry.deleted);
-        }
-        assert_eq!(once.len(), twice.len());
-    }
-
-    #[test]
-    fn merging_an_empty_catalog_changes_nothing() {
-        let mut local = catalog(vec![file("a", stamp(10, 0, "n"))]);
-        merge_files(&mut local, Vec::new(), 100);
-        assert_eq!(local.len(), 1);
-    }
-
-    #[test]
     fn a_full_peer_list_ignores_new_peers_but_still_updates_known_ones() {
         let mut local: HashMap<SessionId, PeerInfo> = HashMap::new();
         for i in 0..MAX_PEERS {
@@ -799,37 +479,6 @@ mod tests {
         let mut messages = vec![chat_message("a", 1), chat_message("b", 2)];
         prune_messages(&mut messages);
         assert_eq!(messages.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn a_catalog_sync_from_another_node_is_validated_and_advances_our_clock() {
-        let state = NodeState::for_tests(None);
-        let remote = Stamp { wall: crate::hlc::wall_clock_ms() + 1000, counter: 7, node: "node_remote".into() };
-        let mut ok = file("f_ok", remote.clone());
-        ok.name = "../evil:name.txt".into();
-        let mut bad_id = file("f_bad", remote.clone());
-        bad_id.id = "../x".into();
-
-        apply_catalog_sync(&state, vec![ok, bad_id], "node_remote").await;
-
-        let files = state.files.read().await;
-        assert_eq!(files.len(), 1);
-        assert_eq!(files["f_ok"].name, ".._evil_name.txt");
-        assert!(state.clock.now() > remote);
-    }
-
-    #[tokio::test]
-    async fn entries_stamped_far_in_the_future_are_dropped_and_reported_once() {
-        let state = NodeState::for_tests(None);
-        let future = Stamp { wall: crate::hlc::wall_clock_ms() + 2 * crate::hlc::MAX_DRIFT_MS, counter: 0, node: "node_fast".into() };
-        let sane = Stamp { wall: crate::hlc::wall_clock_ms(), counter: 0, node: "node_fast".into() };
-
-        apply_catalog_sync(&state, vec![file("future", future), file("sane", sane)], "node_fast").await;
-
-        let files = state.files.read().await;
-        assert!(files.contains_key("sane") && !files.contains_key("future"));
-        assert!(state.clock_alert_at.lock().unwrap().is_some());
-        assert!(state.clock.now().wall < crate::hlc::wall_clock_ms() + 60_000);
     }
 
     #[tokio::test]
@@ -883,79 +532,184 @@ mod tests {
         assert!(state.store.get("file_complete").is_some());
     }
 
+    fn entry(id: &str, uploader: &str, kind: EntryKind) -> CatalogEntry {
+        CatalogEntry {
+            file_id: id.into(),
+            name: format!("{id}.txt"),
+            size: 10,
+            mime_type: "text/plain".into(),
+            created_at_ms: crate::hlc::wall_clock_ms(),
+            manifest_root: "ab".repeat(32),
+            uploader_id: uploader.into(),
+            kind,
+        }
+    }
+
+    fn plain(id: &str, uploader: &str) -> CatalogEntry {
+        entry(id, uploader, EntryKind::File { parent: None })
+    }
+
+    async fn hold(state: &NodeState, id: &str) {
+        let blob = state.store.create(id, 10).unwrap();
+        blob.write_chunk_hashing(0, vec![1; 10]).await.unwrap();
+        blob.seal().unwrap();
+    }
+
     #[tokio::test]
-    async fn making_room_evicts_cached_files_and_stops_advertising_them() {
-        let mut state = NodeState::for_tests_node("node_a", None);
+    async fn a_shared_file_is_listed_with_this_node_as_its_host() {
+        let state = NodeState::for_tests_signing(None);
+        hold(&state, "f1").await;
+        let view = share_file(&state, plain("f1", "device_1")).await.unwrap();
+        assert_eq!((view.uploader_node, view.hosts), (state.node_id.clone(), vec![state.node_id.clone()]));
+    }
+
+    #[tokio::test]
+    async fn a_shared_file_is_still_complete_after_the_store_is_reopened() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("files");
+        let mut state = NodeState::for_tests_signing(None);
+        state.store = std::sync::Arc::new(crate::store::Store::open(&root, 1 << 30).unwrap());
+        hold(&state, "f1").await;
+        share_file(&state, plain("f1", "device_1")).await.unwrap();
+        drop(state);
+
+        let reopened = crate::store::Store::open(&root, 1 << 30).unwrap();
+        assert!(reopened.contains_complete("f1"));
+    }
+
+    #[tokio::test]
+    async fn hosts_are_the_nodes_that_said_they_have_the_file_and_leave_with_them() {
+        let state = NodeState::for_tests_signing(None);
+        share_file(&state, plain("f1", "device_1")).await.unwrap();
+        state.availability.set_complete("node_b", &["f1".to_string()]);
+        assert_eq!(file_view(&state, "f1").unwrap().hosts, vec!["node_b".to_string()]);
+
+        state.availability.drop_node("node_b");
+        assert!(!file_view(&state, "f1").unwrap().is_available());
+    }
+
+    #[tokio::test]
+    async fn the_sharing_device_can_unshare_and_its_folder_contents_go_with_a_folder() {
+        let state = NodeState::for_tests_signing(None);
+        share_file(&state, entry("folder", "device_1", EntryKind::Folder { bytes: 20, files: 2 })).await.unwrap();
+        share_file(&state, entry("inside", "device_1", EntryKind::File { parent: Some("folder".into()) })).await.unwrap();
+        share_file(&state, plain("elsewhere", "device_1")).await.unwrap();
+
+        let mut taken_down = unshare(&state, "folder", "device_1", false).await;
+        taken_down.sort();
+        assert_eq!(taken_down, ["folder", "inside"]);
+        let left: Vec<String> = file_views(&state).into_iter().map(|v| v.id).collect();
+        assert_eq!(left, ["elsewhere"]);
+    }
+
+    #[tokio::test]
+    async fn another_device_cannot_unshare_but_the_node_s_own_machine_can() {
+        let state = NodeState::for_tests_signing(None);
+        share_file(&state, plain("f1", "device_1")).await.unwrap();
+        assert!(unshare(&state, "f1", "device_2", false).await.is_empty());
+        assert_eq!(unshare(&state, "f1", "device_2", true).await, ["f1"]);
+    }
+
+    #[tokio::test]
+    async fn unsharing_deletes_this_node_s_copy_and_tells_the_mesh() {
+        let state = NodeState::for_tests_signing(None);
+        hold(&state, "f1").await;
+        share_file(&state, plain("f1", "device_1")).await.unwrap();
+
+        unshare(&state, "f1", "device_1", false).await;
+        assert!(state.store.get("f1").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_node_cannot_unshare_a_file_another_node_published() {
+        let (a, b) = (NodeState::for_tests_signing(None), NodeState::for_tests_signing(None));
+        share_file(&a, plain("f1", "device_1")).await.unwrap();
+        crate::catalog::sync::on_ops(&b, &"node_a".to_string(), &a.catalog.ops_missing_from(&Default::default())).await;
+
+        assert!(unshare(&b, "f1", "device_1", true).await.is_empty());
+        assert!(b.catalog.contains("f1"));
+    }
+
+    #[tokio::test]
+    async fn a_file_taken_down_while_this_node_was_away_is_deleted_on_reconcile() {
+        let state = NodeState::for_tests_signing(None);
+        hold(&state, "f1").await;
+        hold(&state, "f2").await;
+        share_file(&state, plain("f1", "device_1")).await.unwrap();
+        state.catalog.unpublish(&state.identity, &state.clock, "f1").unwrap();
+
+        reconcile_store(&state).await;
+        assert!(state.store.get("f1").is_none());
+        assert!(state.store.get("f2").is_some(), "a copy with no catalog entry yet is kept");
+    }
+
+    #[tokio::test]
+    async fn an_entry_saved_by_an_earlier_version_is_listed_in_the_signed_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("files");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("file_old.data"), vec![7u8; 10]).unwrap();
+        std::fs::write(root.join("file_old.hashes"), [0u8; 32]).unwrap();
+        std::fs::write(
+            root.join("file_old.json"),
+            r#"{"id":"file_old","size":10,"have":"01","hash_known":"01","expected_root":null,"sealed":"old","entry":
+               {"id":"file_old","name":"notes.txt","size":10,"mime_type":"text/plain","uploader_id":"device_1",
+                "uploader_node":"node_old","holders":{},"uploaded_at":"2024-01-01T00:00:00Z","created_at":1700000000000,
+                "version":{"wall":1,"counter":0,"node":"node_old"},"deleted":false,"deleted_at":0,"manifest_root":"old"}}"#,
+        )
+        .unwrap();
+        let mut state = NodeState::for_tests_signing(None);
+        state.store = std::sync::Arc::new(crate::store::Store::open(&root, 1 << 30).unwrap());
+
+        assert_eq!(import_legacy_entries(&state).await, 1);
+        let view = file_view(&state, "file_old").unwrap();
+        assert_eq!((view.name.as_str(), view.uploader_id.as_str(), view.created_at), ("notes.txt", "device_1", 1_700_000_000_000));
+        assert_eq!(Some(view.manifest_root), state.store.get("file_old").unwrap().manifest_root());
+        assert_eq!(import_legacy_entries(&state).await, 0, "importing again lists nothing twice");
+    }
+
+    #[tokio::test]
+    async fn making_room_evicts_cached_files_and_keeps_the_nodes_own_shares() {
+        let mut state = NodeState::for_tests_signing(None);
         state.store = std::sync::Arc::new(crate::store::Store::open(&tempfile::tempdir().unwrap().keep(), 100).unwrap());
-        for (id, origin) in [("file_cached", crate::store::Origin::Cached), ("file_mine", crate::store::Origin::Published)] {
+        for (id, origin) in [("file_cached", Origin::Cached), ("file_mine", Origin::Published)] {
             let blob = state.store.create_with(id, 50, origin).unwrap();
             blob.write_chunk_hashing(0, vec![1; 50]).await.unwrap();
             blob.seal().unwrap();
-            merge_files(&mut *state.files.write().await, vec![file(id, stamp(1, 0, "node_a"))], MAX_CATALOG_ENTRIES);
         }
 
         make_room(&state, 50).await;
 
         assert!(state.store.get("file_cached").is_none());
         assert!(state.store.get("file_mine").is_some(), "a node's own shares are never evicted");
-        let files = state.files.read().await;
-        assert!(!files["file_cached"].is_held_by("node_a"), "an evicted file is no longer advertised");
-        assert!(files["file_mine"].is_held_by("node_a"));
     }
 
     #[tokio::test]
-    async fn files_uploaded_for_a_folder_that_was_never_published_are_removed() {
-        let state = NodeState::for_tests_node("node_a", None);
-        let mut orphan = file("file_orphan", stamp(1, 0, "node_a"));
-        orphan.parent = Some("folder_never".into());
-        let mut inside_real = file("file_inside", stamp(2, 0, "node_a"));
-        inside_real.parent = Some("folder_real".into());
-        let mut folder = file("folder_real", stamp(3, 0, "node_a"));
-        folder.is_folder = true;
-        let mut elsewhere = file("file_elsewhere", stamp(4, 0, "node_other"));
-        elsewhere.parent = Some("folder_unknown".into());
-        elsewhere.uploader_node = "node_other".into();
-        let loose = file("file_loose", stamp(5, 0, "node_a"));
-        for entry in [orphan, inside_real, folder, elsewhere, loose] {
-            state.files.write().await.insert(entry.id.clone(), entry);
-        }
+    async fn files_uploaded_for_a_folder_that_was_never_published_are_taken_down() {
+        let state = NodeState::for_tests_signing(None);
+        share_file(&state, entry("orphan", "d", EntryKind::File { parent: Some("folder_never".into()) })).await.unwrap();
+        share_file(&state, entry("folder_real", "d", EntryKind::Folder { bytes: 1, files: 1 })).await.unwrap();
+        share_file(&state, entry("inside", "d", EntryKind::File { parent: Some("folder_real".into()) })).await.unwrap();
+        share_file(&state, plain("loose", "d")).await.unwrap();
 
         collect_garbage_with(&state, std::time::Duration::from_secs(3600), 0).await;
 
-        let files = state.files.read().await;
-        assert!(files["file_orphan"].deleted, "no such folder: the file goes");
-        assert!(!files["file_inside"].deleted && !files["folder_real"].deleted);
-        assert!(!files["file_elsewhere"].deleted, "another node's files are its own business");
-        assert!(!files["file_loose"].deleted);
+        let mut left: Vec<String> = file_views(&state).into_iter().map(|v| v.id).collect();
+        left.sort();
+        assert_eq!(left, ["folder_real", "inside", "loose"]);
     }
 
     #[tokio::test]
-    async fn a_new_node_id_takes_over_what_the_old_one_uploaded_and_held() {
-        let state = NodeState::for_tests_node("node_new", None);
-        let old_version = stamp(1, 0, "node_a");
-        state.files.write().await.insert("file_mine".into(), file("file_mine", old_version.clone()));
+    async fn an_op_stamped_far_in_the_future_is_dropped_and_reported() {
+        let state = NodeState::for_tests_signing(None);
+        let other = crate::identity::Identity::generate();
+        let future =
+            Stamp { wall: crate::hlc::wall_clock_ms() + 2 * crate::hlc::MAX_DRIFT_MS, counter: 0, node: other.node_id().to_string() };
+        let add = crate::catalog::Add::sign(&other, future, 1, vec![], plain("f1", "d"));
 
-        adopt_node_id(&state, "node_a").await;
+        crate::catalog::sync::on_ops(&state, &"node_fast".to_string(), &[crate::catalog::Op::Add(add)]).await;
 
-        let files = state.files.read().await;
-        let mine = &files["file_mine"];
-        assert_eq!(mine.uploader_node, "node_new");
-        assert!(mine.is_held_by("node_new") && !mine.is_held_by("node_a"));
-        assert!(mine.version > old_version);
-    }
-
-    #[tokio::test]
-    async fn adopting_a_new_node_id_leaves_other_nodes_files_alone() {
-        let state = NodeState::for_tests_node("node_new", None);
-        let mut theirs = file("file_theirs", stamp(1, 0, "node_b"));
-        theirs.uploader_node = "node_b".into();
-        theirs.holders = [("node_b".to_string(), Holder { since: stamp(1, 0, "node_b"), present: true })].into();
-        state.files.write().await.insert("file_theirs".into(), theirs.clone());
-
-        adopt_node_id(&state, "node_a").await;
-
-        let files = state.files.read().await;
-        assert_eq!(files["file_theirs"].version, theirs.version);
-        assert_eq!(files["file_theirs"].uploader_node, "node_b");
+        assert!(!state.catalog.contains("f1"));
+        assert!(state.clock_alert_at.lock().unwrap().is_some());
     }
 }

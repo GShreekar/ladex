@@ -90,8 +90,8 @@ print(json.dumps({n: hashlib.sha256(z.read(n)).hexdigest() for n in z.namelist()
 
     c1.send({ type: 'delete_file', session_id: 'peer_one', file_id: 'folder_x' });
     await sleep(1500);
-    const left = fs.readdirSync(path.join(ROOT, 'n1/files')).filter((f) => f.endsWith('.data'));
-    const left2 = fs.readdirSync(path.join(ROOT, 'n2/files')).filter((f) => f.endsWith('.data'));
+    const left = fs.readdirSync(path.join(ROOT, 'n1/files/blobs'));
+    const left2 = fs.readdirSync(path.join(ROOT, 'n2/files/blobs'));
     check('deleting the folder deletes its files on both nodes', left.length === 0 && left2.length === 0, `${left} | ${left2}`);
     check('and they leave the catalog', c2.files().filter((f) => f.parent === 'folder_x' || f.id === 'folder_x').length === 0);
 

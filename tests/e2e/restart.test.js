@@ -90,10 +90,9 @@ const check = (name, ok, detail = '') => { console.log(`${ok ? 'PASS' : 'FAIL'} 
     const list = await d.wait((m) => m.type === 'file_list_update' && m.files.some((f) => f.id === 'file_keep'));
     const kept = list?.files.find((f) => f.id === 'file_keep');
     check('the shared file is still listed', !!kept);
-    check('the node is still its holder under the same id', kept?.holders?.[nodeId]?.present === true, JSON.stringify(kept?.holders));
+    check('the node still hosts it under the same id', kept?.hosts?.includes(nodeId) === true, JSON.stringify(kept?.hosts));
     check('an unshared file stays unshared', !list?.files.some((f) => f.id === 'file_gone'));
-    const saved = JSON.parse(fs.readFileSync(path.join(ROOT, 'files', 'node.state'), 'utf8'));
-    check('the unshare record is saved', saved.tombstones.some((f) => f.id === 'file_gone' && f.deleted));
+    check('the signed catalog is saved on disk', fs.existsSync(path.join(ROOT, 'files', 'catalog.redb')));
     const r = await fetch(`http://${BASE}/api/files/file_keep`, { headers: { Cookie: `auth=${token}` } });
     check('the file downloads intact', Buffer.from(await r.arrayBuffer()).equals(body));
     d.send({ type: 'delete_file', session_id: 'peer_one', file_id: 'file_keep' });

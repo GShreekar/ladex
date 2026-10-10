@@ -1,4 +1,4 @@
-//! A file's content address: BLAKE3 hashes of its 1 MiB chunks, and the `file_id` derived from them.
+//! A file's content address: BLAKE3 hashes of its 1 MiB chunks, and the root derived from them.
 
 use std::fs::File;
 use std::io::{self, Read};
@@ -13,7 +13,7 @@ pub const CHUNK_SIZE: u32 = 1 << 20;
 
 const HASH_LEN: usize = 32;
 const HEADER_LEN: usize = 8 + 4 + 4;
-const FILE_ID_CONTEXT: &str = "ladex file_id v1";
+const ROOT_CONTEXT: &str = "ladex manifest root v1";
 // Chunks read ahead of the hashers; bounds memory to a few batches whatever the file size.
 const BATCH_CHUNKS: usize = 16;
 const BATCHES_IN_FLIGHT: usize = 2;
@@ -40,18 +40,16 @@ impl Manifest {
             let mut chunk_hashes = Vec::with_capacity(total_chunks as usize);
             for batch in receiver {
                 let chunks = batch.context("could not read the file")?;
-                chunk_hashes.par_extend(chunks.par_iter().map(|chunk| *blake3::hash(chunk).as_bytes()));
+                chunk_hashes.par_extend(chunks.par_iter().map(|chunk| hash_chunk(chunk)));
             }
             ensure!(chunk_hashes.len() == total_chunks as usize, "the file changed while it was being hashed");
             Ok(Self { size, chunk_hashes })
         })
     }
 
-    /// Identifies this exact content; the same bytes always give the same id.
-    pub fn file_id(&self) -> String {
-        let mut hasher = blake3::Hasher::new_derive_key(FILE_ID_CONTEXT);
-        hasher.update(&self.encode());
-        hasher.finalize().to_hex().to_string()
+    /// Identifies this exact content; the same bytes always give the same root.
+    pub fn root(&self) -> String {
+        root_of(self.size, &self.chunk_hashes)
     }
 
     pub fn chunk_count(&self) -> u32 {
@@ -59,14 +57,7 @@ impl Manifest {
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(HEADER_LEN + self.chunk_hashes.len() * HASH_LEN);
-        bytes.extend_from_slice(&self.size.to_le_bytes());
-        bytes.extend_from_slice(&CHUNK_SIZE.to_le_bytes());
-        bytes.extend_from_slice(&self.chunk_count().to_le_bytes());
-        for hash in &self.chunk_hashes {
-            bytes.extend_from_slice(hash);
-        }
-        bytes
+        encode_parts(self.size, &self.chunk_hashes)
     }
 
     /// Parses a manifest received from another node, rejecting anything inconsistent.
@@ -84,6 +75,28 @@ impl Manifest {
         let chunk_hashes = hash_bytes.chunks_exact(HASH_LEN).map(|hash| hash.try_into().expect("chunks are HASH_LEN long")).collect();
         Ok(Self { size, chunk_hashes })
     }
+}
+
+/// The root of a file of `size` bytes whose chunks hash to `chunk_hashes`.
+pub fn root_of(size: u64, chunk_hashes: &[ChunkHash]) -> String {
+    let mut hasher = blake3::Hasher::new_derive_key(ROOT_CONTEXT);
+    hasher.update(&encode_parts(size, chunk_hashes));
+    hasher.finalize().to_hex().to_string()
+}
+
+pub fn hash_chunk(data: &[u8]) -> ChunkHash {
+    *blake3::hash(data).as_bytes()
+}
+
+fn encode_parts(size: u64, chunk_hashes: &[ChunkHash]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(HEADER_LEN + chunk_hashes.len() * HASH_LEN);
+    bytes.extend_from_slice(&size.to_le_bytes());
+    bytes.extend_from_slice(&CHUNK_SIZE.to_le_bytes());
+    bytes.extend_from_slice(&(chunk_hashes.len() as u32).to_le_bytes());
+    for hash in chunk_hashes {
+        bytes.extend_from_slice(hash);
+    }
+    bytes
 }
 
 fn chunk_count(size: u64) -> anyhow::Result<u32> {
@@ -173,25 +186,34 @@ mod tests {
     }
 
     #[test]
-    fn same_content_gets_the_same_file_id() {
+    fn same_content_gets_the_same_root() {
         let first = Manifest::build(file_with(&patterned(CHUNK + 1)).path()).unwrap();
         let second = Manifest::build(file_with(&patterned(CHUNK + 1)).path()).unwrap();
-        assert_eq!(first.file_id(), second.file_id());
+        assert_eq!(first.root(), second.root());
     }
 
     #[test]
-    fn changing_one_byte_changes_the_file_id() {
+    fn changing_one_byte_changes_the_root() {
         let mut bytes = patterned(CHUNK + 1);
         let before = Manifest::build(file_with(&bytes).path()).unwrap();
         bytes[CHUNK] ^= 1;
         let after = Manifest::build(file_with(&bytes).path()).unwrap();
-        assert_ne!(before.file_id(), after.file_id());
+        assert_ne!(before.root(), after.root());
     }
 
     #[test]
-    fn file_id_is_a_valid_store_id() {
-        let manifest = Manifest::build(file_with(b"hello").path()).unwrap();
-        assert!(crate::validate::is_valid_id(&manifest.file_id()));
+    fn the_root_is_64_lowercase_hex_characters() {
+        let root = Manifest::build(file_with(b"hello").path()).unwrap().root();
+        assert!(root.len() == 64 && root.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
+    }
+
+    #[test]
+    fn the_root_depends_on_size_and_every_chunk() {
+        let (a, b) = (hash_chunk(b"a"), hash_chunk(b"b"));
+        let root = root_of(10, &[a, b]);
+        assert_ne!(root, root_of(11, &[a, b]));
+        assert_ne!(root, root_of(10, &[b, a]));
+        assert_ne!(root, root_of(10, &[a]));
     }
 
     #[test]

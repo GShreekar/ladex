@@ -16,7 +16,7 @@ use crate::hlc::{Clock, Stamp};
 use crate::identity::{self, Identity};
 use crate::revocation::hex_signature;
 use crate::trust::hex_public_key;
-use crate::types::NodeId;
+use crate::types::{NodeId, SessionId};
 use crate::validate;
 
 const ADD_LABEL: &[u8] = b"ladex-catalog-add";
@@ -28,6 +28,14 @@ pub const MAX_OBSERVED: usize = 64;
 /// The most origin nodes one version vector may name.
 pub const MAX_VERSION_ENTRIES: usize = 1024;
 
+/// What a catalog entry is: a file, possibly inside a folder, or a folder's listing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EntryKind {
+    File { parent: Option<String> },
+    Folder { bytes: u64, files: u32 },
+}
+
+/// A shared file as every node lists it. Who has it right now is not here: that is told live (see availability.rs).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogEntry {
     pub file_id: String,
@@ -35,6 +43,11 @@ pub struct CatalogEntry {
     pub size: u64,
     pub mime_type: String,
     pub created_at_ms: u64,
+    /// Names the file's exact content: the root of its manifest (see manifest.rs).
+    pub manifest_root: String,
+    /// The browser device that shared it, or empty.
+    pub uploader_id: SessionId,
+    pub kind: EntryKind,
 }
 
 impl CatalogEntry {
@@ -45,7 +58,38 @@ impl CatalogEntry {
             && validate::sanitize_mime(&self.mime_type) == self.mime_type
             && self.size <= validate::MAX_SAFE_INTEGER
             && self.created_at_ms <= validate::MAX_SAFE_INTEGER
+            && validate::is_valid_root(&self.manifest_root)
+            && (self.uploader_id.is_empty() || validate::is_valid_id(&self.uploader_id))
+            && self.kind.is_valid()
     }
+
+    pub fn is_folder(&self) -> bool {
+        matches!(self.kind, EntryKind::Folder { .. })
+    }
+
+    /// The folder this file is in, if any.
+    pub fn parent(&self) -> Option<&str> {
+        match &self.kind {
+            EntryKind::File { parent } => parent.as_deref(),
+            EntryKind::Folder { .. } => None,
+        }
+    }
+}
+
+impl EntryKind {
+    fn is_valid(&self) -> bool {
+        match self {
+            EntryKind::File { parent } => parent.as_deref().is_none_or(validate::is_valid_id),
+            EntryKind::Folder { bytes, files } => *bytes <= validate::MAX_SAFE_INTEGER && *files <= validate::MAX_FOLDER_FILES,
+        }
+    }
+}
+
+/// A live entry with the node that published it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listed {
+    pub entry: CatalogEntry,
+    pub publisher: NodeId,
 }
 
 /// A node's signed statement that it shares a file.
@@ -147,6 +191,14 @@ impl Op {
         match self {
             Op::Add(add) => add.seq,
             Op::Remove(remove) => remove.seq,
+        }
+    }
+
+    /// The file the op is about.
+    pub fn file_id(&self) -> &str {
+        match self {
+            Op::Add(add) => &add.entry.file_id,
+            Op::Remove(remove) => &remove.file_id,
         }
     }
 
@@ -301,6 +353,27 @@ impl Catalog {
 
     /// Every shared file once, ordered by id.
     pub fn entries(&self) -> Vec<&CatalogEntry> {
+        self.live().into_iter().map(|add| &add.entry).collect()
+    }
+
+    /// Every shared file once with the node that published it, ordered by id.
+    pub fn listing(&self) -> Vec<Listed> {
+        self.live().into_iter().map(|add| Listed { entry: add.entry.clone(), publisher: add.stamp.node.clone() }).collect()
+    }
+
+    /// One file as listed, if it is shared.
+    pub fn listed(&self, file_id: &str) -> Option<Listed> {
+        let add = self.live_adds(file_id).into_iter().max_by(|a, b| a.stamp.cmp(&b.stamp))?;
+        Some(Listed { entry: add.entry.clone(), publisher: add.stamp.node.clone() })
+    }
+
+    /// Whether the file was shared and every add of it has since been taken down.
+    pub fn was_removed(&self, file_id: &str) -> bool {
+        let mut adds = self.adds.values().filter(|add| add.entry.file_id == file_id).peekable();
+        adds.peek().is_some() && adds.all(|add| !self.is_live(add))
+    }
+
+    fn live(&self) -> Vec<&Add> {
         let mut newest: HashMap<&str, &Add> = HashMap::new();
         for add in self.adds.values().filter(|add| self.is_live(add)) {
             let slot = newest.entry(&add.entry.file_id).or_insert(add);
@@ -308,9 +381,9 @@ impl Catalog {
                 *slot = add;
             }
         }
-        let mut entries: Vec<&CatalogEntry> = newest.values().map(|add| &add.entry).collect();
-        entries.sort_by(|a, b| a.file_id.cmp(&b.file_id));
-        entries
+        let mut live: Vec<&Add> = newest.into_values().collect();
+        live.sort_by(|a, b| a.entry.file_id.cmp(&b.entry.file_id));
+        live
     }
 
     pub fn op_count(&self) -> usize {
@@ -434,6 +507,9 @@ fn add_signed_bytes(stamp: &Stamp, seq: u64, publisher: &VerifyingKey, authorize
     bytes.extend_from_slice(&entry.size.to_be_bytes());
     put_text(&mut bytes, &entry.mime_type);
     bytes.extend_from_slice(&entry.created_at_ms.to_be_bytes());
+    put_text(&mut bytes, &entry.manifest_root);
+    put_text(&mut bytes, &entry.uploader_id);
+    put_kind(&mut bytes, &entry.kind);
     bytes
 }
 
@@ -458,6 +534,21 @@ fn put_len(bytes: &mut Vec<u8>, len: usize) {
 fn put_text(bytes: &mut Vec<u8>, text: &str) {
     put_len(bytes, text.len());
     bytes.extend_from_slice(text.as_bytes());
+}
+
+fn put_kind(bytes: &mut Vec<u8>, kind: &EntryKind) {
+    match kind {
+        EntryKind::File { parent } => {
+            bytes.push(0);
+            bytes.push(parent.is_some() as u8);
+            put_text(bytes, parent.as_deref().unwrap_or(""));
+        }
+        EntryKind::Folder { bytes: size, files } => {
+            bytes.push(1);
+            bytes.extend_from_slice(&size.to_be_bytes());
+            bytes.extend_from_slice(&files.to_be_bytes());
+        }
+    }
 }
 
 fn put_stamp(bytes: &mut Vec<u8>, stamp: &Stamp) {
@@ -504,7 +595,16 @@ mod tests {
     }
 
     fn entry(file_id: &str) -> CatalogEntry {
-        CatalogEntry { file_id: file_id.into(), name: format!("{file_id}.txt"), size: 10, mime_type: "text/plain".into(), created_at_ms: 1 }
+        CatalogEntry {
+            file_id: file_id.into(),
+            name: format!("{file_id}.txt"),
+            size: 10,
+            mime_type: "text/plain".into(),
+            created_at_ms: 1,
+            manifest_root: "ab".repeat(32),
+            uploader_id: "device_a".into(),
+            kind: EntryKind::File { parent: None },
+        }
     }
 
     fn catalog() -> Catalog {
@@ -669,6 +769,73 @@ mod tests {
         let unsafe_entry = CatalogEntry { name: "../etc/passwd".into(), ..entry("f1") };
         let add = Add::sign(&alice.identity, alice.clock.now(), 1, vec![], unsafe_entry);
         assert_eq!(catalog.apply(Op::Add(add)), Err(Refusal::InvalidEntry));
+    }
+
+    fn refused_entry(change: impl FnOnce(&mut CatalogEntry)) -> Result<Outcome, Refusal> {
+        let alice = node(1);
+        let mut unsafe_entry = entry("f1");
+        change(&mut unsafe_entry);
+        catalog().apply(Op::Add(Add::sign(&alice.identity, alice.clock.now(), 1, vec![], unsafe_entry)))
+    }
+
+    #[test]
+    fn an_add_with_a_malformed_file_id_is_refused() {
+        assert_eq!(refused_entry(|e| e.file_id = "../x".into()), Err(Refusal::InvalidEntry));
+    }
+
+    #[test]
+    fn an_add_with_a_size_a_browser_cannot_represent_is_refused() {
+        assert_eq!(refused_entry(|e| e.size = u64::MAX), Err(Refusal::InvalidEntry));
+    }
+
+    #[test]
+    fn an_add_with_a_malformed_manifest_root_is_refused() {
+        assert_eq!(refused_entry(|e| e.manifest_root = "not-a-root".into()), Err(Refusal::InvalidEntry));
+    }
+
+    #[test]
+    fn an_add_with_a_malformed_uploader_is_refused() {
+        assert_eq!(refused_entry(|e| e.uploader_id = "bad id".into()), Err(Refusal::InvalidEntry));
+    }
+
+    #[test]
+    fn an_add_without_an_uploader_is_accepted() {
+        assert_eq!(refused_entry(|e| e.uploader_id = String::new()), Ok(Outcome::Applied));
+    }
+
+    #[test]
+    fn an_add_inside_a_folder_with_a_malformed_id_is_refused() {
+        assert_eq!(refused_entry(|e| e.kind = EntryKind::File { parent: Some("bad folder".into()) }), Err(Refusal::InvalidEntry));
+    }
+
+    #[test]
+    fn a_folder_listing_more_files_than_allowed_is_refused() {
+        let too_many = validate::MAX_FOLDER_FILES + 1;
+        assert_eq!(refused_entry(|e| e.kind = EntryKind::Folder { bytes: 1, files: too_many }), Err(Refusal::InvalidEntry));
+    }
+
+    #[test]
+    fn a_changed_manifest_root_breaks_the_signature() {
+        let (mut catalog, alice) = (catalog(), node(1));
+        let mut add = Add::sign(&alice.identity, alice.clock.now(), 1, vec![], entry("f1"));
+        add.entry.manifest_root = "cd".repeat(32);
+        assert_eq!(catalog.apply(Op::Add(add)), Err(Refusal::BadSignature));
+    }
+
+    #[test]
+    fn a_taken_down_file_is_reported_as_removed_and_a_shared_one_is_not() {
+        let (mut catalog, alice) = (catalog(), node(1));
+        publish(&mut catalog, &alice, "f1");
+        publish(&mut catalog, &alice, "f2");
+        catalog.unpublish(&alice.identity, &alice.clock, "f1").unwrap();
+        assert_eq!((catalog.was_removed("f1"), catalog.was_removed("f2"), catalog.was_removed("never_seen")), (true, false, false));
+    }
+
+    #[test]
+    fn a_listed_file_names_the_node_that_published_it() {
+        let (mut catalog, alice) = (catalog(), node(1));
+        publish(&mut catalog, &alice, "f1");
+        assert_eq!(catalog.listed("f1").unwrap().publisher, alice.identity.node_id());
     }
 
     #[test]

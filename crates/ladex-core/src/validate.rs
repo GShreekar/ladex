@@ -11,7 +11,6 @@ const MAX_EXTENSION_BYTES: usize = 16;
 const MAX_ID_LEN: usize = 64;
 const MAX_MESSAGE_ID_LEN: usize = 128;
 const MAX_MIME_LEN: usize = 255;
-const MAX_HOLDERS: usize = 256;
 const MAX_PATH_BYTES: usize = 1024;
 const MAX_PATH_DEPTH: usize = 32;
 pub const MAX_FOLDER_FILES: u32 = 100_000;
@@ -89,7 +88,8 @@ fn is_valid_id_up_to(s: &str, max: usize) -> bool {
     !s.is_empty() && s.len() <= max && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
-pub fn is_valid_sha256(s: &str) -> bool {
+/// A manifest root: 64 lowercase hex characters.
+pub fn is_valid_root(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
@@ -112,32 +112,6 @@ pub fn clean_message(s: &str) -> Option<String> {
     let cleaned: String = s.chars().filter(|c| matches!(c, '\n' | '\t') || !is_stripped(*c)).take(MAX_MESSAGE_CHARS).collect();
     let cleaned = cleaned.trim().to_string();
     (!cleaned.is_empty()).then_some(cleaned)
-}
-
-/// Cleans an entry from another node; drops it if it has a bad id or no manifest root.
-pub fn incoming_file(mut file: FileMetadata) -> Option<FileMetadata> {
-    if !is_valid_id(&file.id) || file.size > MAX_SAFE_INTEGER || !file.version.is_set() {
-        return None;
-    }
-    let optional_id_ok = |id: &str| id.is_empty() || is_valid_id(id);
-    if !optional_id_ok(&file.uploader_id) || !optional_id_ok(&file.uploader_node) {
-        return None;
-    }
-    if file.holders.len() > MAX_HOLDERS {
-        return None;
-    }
-    file.holders.retain(|node, holder| is_valid_id(node) && holder.since.is_set());
-    if !file.deleted && !file.manifest_root.as_deref().is_some_and(is_valid_sha256) {
-        return None;
-    }
-    file.parent = file.parent.filter(|parent| is_valid_id(parent));
-    if file.folder_bytes > MAX_SAFE_INTEGER || file.folder_files > MAX_FOLDER_FILES {
-        return None;
-    }
-    file.name = sanitize_file_name(&file.name);
-    file.mime_type = sanitize_mime(&file.mime_type);
-    file.uploaded_at = file.uploaded_at.min(chrono::Utc::now());
-    Some(file)
 }
 
 pub fn incoming_peer(mut peer: PeerInfo) -> Option<PeerInfo> {
@@ -169,7 +143,6 @@ pub fn incoming_message(mut message: TextMessage) -> Option<TextMessage> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hlc::Stamp;
 
     #[derive(serde::Deserialize)]
     struct Case {
@@ -219,9 +192,9 @@ mod tests {
         assert!(!is_valid_id("has space"));
         assert!(!is_valid_id("<script>"));
         assert!(!is_valid_id(&"a".repeat(65)));
-        assert!(is_valid_sha256(&"ab01".repeat(16)));
-        assert!(!is_valid_sha256(&"AB01".repeat(16)));
-        assert!(!is_valid_sha256("abc"));
+        assert!(is_valid_root(&"ab01".repeat(16)));
+        assert!(!is_valid_root(&"AB01".repeat(16)));
+        assert!(!is_valid_root("abc"));
     }
 
     #[test]
@@ -239,72 +212,6 @@ mod tests {
         assert_eq!(clean_message("hi\nthere\u{0}\u{202E}").as_deref(), Some("hi\nthere"));
         assert_eq!(clean_message("  \n\t "), None);
         assert_eq!(clean_message(&"x".repeat(5000)).unwrap().chars().count(), MAX_MESSAGE_CHARS);
-    }
-
-    fn stamp() -> Stamp {
-        Stamp { wall: 1, counter: 0, node: "node_a".into() }
-    }
-
-    fn incoming() -> FileMetadata {
-        FileMetadata {
-            id: "file_1".into(),
-            name: "a/b.txt".into(),
-            size: 5,
-            mime_type: "text/plain".into(),
-            uploader_id: "peer_1".into(),
-            uploader_node: "node_a".into(),
-            holders: [
-                ("node_a".to_string(), Holder { since: stamp(), present: true }),
-                ("bad node".to_string(), Holder { since: stamp(), present: true }),
-                ("node_unset".to_string(), Holder { since: Stamp::default(), present: true }),
-            ]
-            .into(),
-            uploaded_at: chrono::Utc::now() + chrono::Duration::days(30),
-            created_at: 0,
-            version: stamp(),
-            deleted: false,
-            deleted_at: 0,
-            manifest_root: Some("ab".repeat(32)),
-            is_folder: false,
-            parent: Some("folder 1".into()),
-            folder_bytes: 0,
-            folder_files: 0,
-        }
-    }
-
-    #[test]
-    fn incoming_files_from_other_nodes_are_cleaned() {
-        let file = incoming_file(incoming()).unwrap();
-        assert_eq!(file.name, "a_b.txt");
-        assert_eq!(file.holders.keys().collect::<Vec<_>>(), ["node_a"]);
-        assert_eq!(file.parent, None);
-        assert!(file.uploaded_at <= chrono::Utc::now());
-    }
-
-    #[test]
-    fn incoming_files_that_cannot_be_used_are_dropped() {
-        let broken: [fn(&mut FileMetadata); 8] = [
-            |f| f.version = Stamp::default(),
-            |f| f.id = "../x".into(),
-            |f| f.size = u64::MAX,
-            |f| f.uploader_id = "bad id".into(),
-            |f| f.uploader_node = "<x>".into(),
-            |f| f.holders = (0..300).map(|i| (format!("node_{i}"), Holder { since: stamp(), present: true })).collect(),
-            |f| f.manifest_root = None,
-            |f| f.folder_files = MAX_FOLDER_FILES + 1,
-        ];
-        for (i, change) in broken.iter().enumerate() {
-            let mut f = incoming();
-            change(&mut f);
-            assert!(incoming_file(f).is_none(), "case {i}");
-        }
-        let mut tombstone = incoming();
-        tombstone.deleted = true;
-        tombstone.manifest_root = None;
-        assert!(incoming_file(tombstone).is_some());
-        let mut orphan = incoming();
-        orphan.uploader_id = String::new();
-        assert!(incoming_file(orphan).is_some());
     }
 
     #[test]

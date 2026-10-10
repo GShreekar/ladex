@@ -5,9 +5,9 @@ use std::path::Path;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
-use crate::types::FileMetadata;
-
 const BLOBS: TableDefinition<&str, &[u8]> = TableDefinition::new("blobs");
+const META: TableDefinition<&str, &str> = TableDefinition::new("meta");
+const HASH_KEY: &str = "chunk_hash";
 
 /// Where a file came from; decides whether the garbage collector may evict it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -19,6 +19,31 @@ pub enum Origin {
     Cached,
 }
 
+/// The catalog entry that older versions saved with each file; read once to carry it into the signed catalog.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LegacyEntry {
+    pub id: String,
+    pub name: String,
+    pub size: u64,
+    pub mime_type: String,
+    #[serde(default)]
+    pub uploader_id: String,
+    #[serde(default)]
+    pub created_at: u64,
+    #[serde(default)]
+    pub deleted: bool,
+    #[serde(default)]
+    pub manifest_root: Option<String>,
+    #[serde(default)]
+    pub is_folder: bool,
+    #[serde(default)]
+    pub parent: Option<String>,
+    #[serde(default)]
+    pub folder_bytes: u64,
+    #[serde(default)]
+    pub folder_files: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Record {
     pub size: u64,
@@ -26,7 +51,8 @@ pub struct Record {
     pub hash_known: String,
     pub expected_root: Option<String>,
     pub sealed: Option<String>,
-    pub entry: Option<FileMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<LegacyEntry>,
     pub origin: Origin,
     pub pinned: bool,
     pub created_ms: u64,
@@ -42,8 +68,22 @@ impl Index {
         let db = Database::create(path)?;
         let txn = db.begin_write()?;
         txn.open_table(BLOBS)?;
+        txn.open_table(META)?;
         txn.commit()?;
         Ok(Self { db })
+    }
+
+    /// Which hash the chunk hashes on disk were made with; None for a store from before this was recorded.
+    pub fn chunk_hash_algorithm(&self) -> anyhow::Result<Option<String>> {
+        let txn = self.db.begin_read()?;
+        Ok(txn.open_table(META)?.get(HASH_KEY)?.map(|value| value.value().to_string()))
+    }
+
+    pub fn set_chunk_hash_algorithm(&self, algorithm: &str) -> anyhow::Result<()> {
+        let txn = self.db.begin_write()?;
+        txn.open_table(META)?.insert(HASH_KEY, algorithm)?;
+        txn.commit()?;
+        Ok(())
     }
 
     pub fn load_all(&self) -> anyhow::Result<Vec<(String, Record)>> {

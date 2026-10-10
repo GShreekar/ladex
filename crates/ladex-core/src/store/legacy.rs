@@ -5,9 +5,8 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-use super::index::{Index, Origin, Record};
+use super::index::{Index, LegacyEntry, Origin, Record};
 use super::Layout;
-use crate::types::FileMetadata;
 use crate::validate;
 
 #[derive(Deserialize)]
@@ -18,7 +17,7 @@ struct LegacyMeta {
     hash_known: String,
     expected_root: Option<String>,
     sealed: Option<String>,
-    entry: Option<FileMetadata>,
+    entry: Option<LegacyEntry>,
 }
 
 /// Imports every old-style file under `root`; returns how many were moved.

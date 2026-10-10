@@ -6,7 +6,7 @@ use std::sync::{Mutex, MutexGuard};
 use ed25519_dalek::VerifyingKey;
 
 use super::log::OpLog;
-use super::{Add, Catalog, CatalogEntry, Op, Outcome, Refusal, Remove, UnpublishError, VersionVector};
+use super::{Add, Catalog, CatalogEntry, Listed, Op, Outcome, Refusal, Remove, UnpublishError, VersionVector};
 use crate::hlc::{Clock, Stamp};
 use crate::identity::Identity;
 
@@ -77,8 +77,16 @@ impl SharedCatalog {
         self.lock().latest_stamp(origin).cloned()
     }
 
-    pub fn entries(&self) -> Vec<CatalogEntry> {
-        self.lock().entries().into_iter().cloned().collect()
+    pub fn listing(&self) -> Vec<Listed> {
+        self.lock().listing()
+    }
+
+    pub fn listed(&self, file_id: &str) -> Option<Listed> {
+        self.lock().listed(file_id)
+    }
+
+    pub fn was_removed(&self, file_id: &str) -> bool {
+        self.lock().was_removed(file_id)
     }
 
     pub fn contains(&self, file_id: &str) -> bool {
@@ -104,7 +112,16 @@ mod tests {
     const CAPACITY: usize = 100;
 
     fn entry(file_id: &str) -> CatalogEntry {
-        CatalogEntry { file_id: file_id.into(), name: format!("{file_id}.txt"), size: 1, mime_type: "text/plain".into(), created_at_ms: 1 }
+        CatalogEntry {
+            file_id: file_id.into(),
+            name: format!("{file_id}.txt"),
+            size: 1,
+            mime_type: "text/plain".into(),
+            created_at_ms: 1,
+            manifest_root: "ab".repeat(32),
+            uploader_id: String::new(),
+            kind: super::super::EntryKind::File { parent: None },
+        }
     }
 
     fn identity_and_clock() -> (Identity, Clock) {

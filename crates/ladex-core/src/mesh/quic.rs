@@ -361,35 +361,36 @@ async fn handle_frame(state: &NodeState, peer_node_id: &NodeId, frame: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::{Add, CatalogEntry, EntryKind, Op, Remove};
     use crate::hlc::Stamp;
     use crate::identity::Identity;
     use crate::revocation::Revocation;
-    use crate::types::{FileMetadata, Holder, PeerInfo, ServerMessage, TextMessage};
+    use crate::types::{PeerInfo, ServerMessage, TextMessage};
 
     fn stamp() -> Stamp {
         Stamp { wall: 1_700_000_000_000, counter: 3, node: "node_a".into() }
     }
 
-    fn file() -> FileMetadata {
-        FileMetadata {
-            id: "file_1".into(),
+    fn entry() -> CatalogEntry {
+        CatalogEntry {
+            file_id: "file_1".into(),
             name: "notes.txt".into(),
             size: 42,
             mime_type: "text/plain".into(),
+            created_at_ms: 1,
+            manifest_root: "ab".repeat(32),
             uploader_id: "device_1".into(),
-            uploader_node: "node_a".into(),
-            holders: [("node_a".to_string(), Holder { since: stamp(), present: true })].into(),
-            uploaded_at: chrono::Utc::now(),
-            created_at: 1,
-            version: stamp(),
-            deleted: false,
-            deleted_at: 0,
-            manifest_root: Some("ab".repeat(32)),
-            is_folder: false,
-            parent: Some("folder_1".into()),
-            folder_bytes: 0,
-            folder_files: 0,
+            kind: EntryKind::File { parent: Some("folder_1".into()) },
         }
+    }
+
+    // A signed add and the remove that takes it down, from one node.
+    fn catalog_ops() -> (Add, Remove) {
+        let identity = Identity::generate();
+        let stamp = |counter| Stamp { wall: 1_700_000_000_000, counter, node: identity.node_id().to_string() };
+        let add = Add::sign(&identity, stamp(1), 1, vec![Identity::generate().public_key()], entry());
+        let remove = Remove::sign(&identity, stamp(2), 2, "file_1".into(), vec![add.stamp.clone()]);
+        (add, remove)
     }
 
     fn text(id: &str) -> TextMessage {
@@ -437,7 +438,9 @@ mod tests {
 
     #[test]
     fn a_catalog_sync_survives_postcard() {
-        assert_survives_postcard(MeshMessage::CatalogSync { files: vec![file()] });
+        let (add, remove) = catalog_ops();
+        assert_survives_postcard(MeshMessage::CatalogOps { ops: vec![Op::Add(add), Op::Remove(remove)] });
+        assert_survives_postcard(MeshMessage::CatalogVersion { version: crate::catalog::VersionVector::default() });
     }
 
     #[test]
@@ -471,7 +474,9 @@ mod tests {
         assert_survives_postcard(MeshMessage::GetManifest { file_id: "file_1".into() });
         assert_survives_postcard(MeshMessage::Manifest { file_id: "file_1".into(), size: 3, hashes: "cd".repeat(32) });
         assert_survives_postcard(MeshMessage::GetChunks { file_id: "file_1".into(), indices: vec![0, 5, 300] });
-        assert_survives_postcard(MeshMessage::ChunkMap { file_id: "file_1".into(), chunks: 9, bitmap: "ff01".into() });
+        assert_survives_postcard(MeshMessage::Have { file_id: "file_1".into(), chunks: 9, bitmap: "ff01".into() });
+        assert_survives_postcard(MeshMessage::HaveAll { file_ids: vec!["file_1".into(), "file_2".into()] });
+        assert_survives_postcard(MeshMessage::Lost { file_ids: vec!["file_1".into()] });
         assert_survives_postcard(MeshMessage::ChunkError { file_id: "file_1".into(), index: 2, reason: "gone".into() });
     }
 

@@ -266,7 +266,6 @@ async fn main() {
     let state = NodeState {
         local_peers: Arc::new(RwLock::new(HashMap::new())),
         local_senders: Arc::new(RwLock::new(HashMap::new())),
-        files: Arc::new(RwLock::new(HashMap::new())),
         messages: Arc::new(RwLock::new(Vec::new())),
         node_id: node_id.clone(),
         identity: Arc::new(identity),
@@ -280,6 +279,7 @@ async fn main() {
         tls_fingerprint,
         auth_limiter,
         mesh_limiter,
+        availability: Arc::new(ladex_core::availability::Availability::default()),
         store: store.clone(),
         catalog,
         transfers: Arc::new(transfer::Transfers::with_tuning(transfer::Tuning {
@@ -296,7 +296,6 @@ async fn main() {
         node_name: types::hostname(),
     };
 
-    state::load_catalog_from_store(&state).await;
     // Never reissue a stamp this node already signed an op with.
     if let Some(latest) = state.catalog.latest_stamp(&node_id) {
         state.clock.resume_from(latest.wall, latest.counter);
@@ -305,9 +304,13 @@ async fn main() {
         persist::restore(&state, saved).await;
         if saved.node_id != node_id {
             tracing::info!("Node ID changed from {} to {node_id}, now derived from the node's key", saved.node_id);
-            state::adopt_node_id(&state, &saved.node_id).await;
         }
     }
+    let imported = state::import_legacy_entries(&state).await;
+    if imported > 0 {
+        println!("Listed {imported} file(s) shared by an earlier version in the signed catalog");
+    }
+    state::reconcile_store(&state).await;
     let saver = persist::spawn_saver(state.clone(), &data_dir, saved.as_ref());
     tokio::spawn(mesh::quic::accept_loop(state.clone(), mesh_endpoint.clone()));
 
@@ -373,16 +376,6 @@ async fn main() {
                 interval.tick().await;
                 state_prune.sessions.purge_expired();
                 state::collect_garbage(&state_prune).await;
-                let mut files = state_prune.files.write().await;
-                let before = files.len();
-                state::prune_tombstones(&mut files, hlc::wall_clock_ms());
-                state::prune_unheld(&mut files, hlc::wall_clock_ms());
-                let pruned = before - files.len();
-                if pruned > 0 {
-                    tracing::info!("State: pruned {pruned} stale tombstone(s) from file catalog");
-                }
-                drop(files);
-
                 let mut peers = state_prune.local_peers.write().await;
                 let before = peers.len();
                 state::prune_peer_tombstones(&mut peers, hlc::wall_clock_ms());

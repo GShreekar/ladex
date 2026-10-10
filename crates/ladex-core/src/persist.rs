@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::mesh;
 use crate::sessions::SavedSession;
-use crate::state::{self, MAX_CATALOG_ENTRIES};
-use crate::types::{FileMetadata, NodeId, TextMessage};
+use crate::state;
+use crate::types::{NodeId, TextMessage};
 use crate::{hlc, validate, NodeState};
 
 const FILE_NAME: &str = "node.state";
@@ -36,7 +36,6 @@ pub struct Saved {
     // Proves the sessions below were issued under the current passphrase.
     login: Option<LoginTag>,
     messages: Vec<TextMessage>,
-    tombstones: Vec<FileMetadata>,
     sessions: Vec<SavedSession>,
     pub peers: Vec<KnownPeer>,
 }
@@ -94,11 +93,6 @@ pub async fn restore(state: &NodeState, saved: &Saved) {
         let mut messages = state.messages.write().await;
         state::merge_messages(&mut messages, saved.messages.iter().cloned().filter_map(validate::incoming_message).collect());
     }
-    {
-        let tombstones = saved.tombstones.iter().filter(|f| f.deleted).cloned().filter_map(validate::incoming_file).collect();
-        let mut files = state.files.write().await;
-        state::merge_files(&mut files, tombstones, MAX_CATALOG_ENTRIES);
-    }
 
     let same_login = match (&state.passphrase, &saved.login) {
         (Some(passphrase), Some(tag)) => login_tag_matches(tag, passphrase),
@@ -149,7 +143,6 @@ impl Saver {
             clock: state.clock.latest(),
             login: self.login.clone(),
             messages: state.messages.read().await.clone(),
-            tombstones: state.files.read().await.values().filter(|f| f.deleted).cloned().collect(),
             sessions: state.sessions.export(),
             peers: self.peers.clone(),
         }
@@ -224,31 +217,6 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hlc::Stamp;
-    use crate::types::Holder;
-
-    fn tombstone(id: &str) -> FileMetadata {
-        let version = Stamp { wall: hlc::wall_clock_ms(), counter: 0, node: "node_a".into() };
-        FileMetadata {
-            id: id.into(),
-            name: "gone.txt".into(),
-            size: 1,
-            mime_type: "text/plain".into(),
-            uploader_id: "peer_a".into(),
-            uploader_node: "node_a".into(),
-            holders: [("node_a".to_string(), Holder { since: version.clone(), present: false })].into(),
-            uploaded_at: chrono::Utc::now(),
-            created_at: version.wall,
-            deleted_at: version.wall,
-            version,
-            deleted: true,
-            manifest_root: Some("ab".repeat(32)),
-            is_folder: false,
-            parent: None,
-            folder_bytes: 0,
-            folder_files: 0,
-        }
-    }
 
     fn chat(id: &str) -> TextMessage {
         TextMessage {
@@ -268,11 +236,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_unshares_and_logins_survive_a_restart() {
+    async fn chat_and_logins_survive_a_restart() {
         let dir = tempfile::tempdir().unwrap();
         let before = NodeState::for_tests_node("node_before", Some("secret"));
         before.messages.write().await.push(chat("m1"));
-        before.files.write().await.insert("f1".into(), tombstone("f1"));
         let (token, _) = before.sessions.create("10.0.0.2".parse().unwrap(), None);
 
         let saved = saved_by(&before, dir.path()).await;
@@ -281,7 +248,6 @@ mod tests {
         let after = NodeState::for_tests_node("node_before", Some("secret"));
         restore(&after, &saved).await;
         assert_eq!(after.messages.read().await.len(), 1);
-        assert!(after.files.read().await["f1"].deleted);
         assert!(after.sessions.authenticate(&token).is_some());
     }
 

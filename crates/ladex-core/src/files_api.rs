@@ -12,11 +12,11 @@ use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, NON_AL
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, Semaphore};
 
+use crate::catalog::{CatalogEntry, EntryKind};
 use crate::server::{Api, BoxError, PeerAddr, ServerBody};
 use crate::sessions::SessionHandle;
 use crate::store::{chunk_len, Blob, StoreError, CHUNK_SIZE};
 use crate::transfer::{self, FetchError};
-use crate::types::{FileMetadata, Holder};
 use crate::{state, validate, zip, NodeState};
 
 const MAX_CONCURRENT_UPLOADS: usize = 8;
@@ -350,7 +350,7 @@ impl FilesApi {
 
         if let Some(existing) = state.store.get(id) {
             if existing.is_complete() {
-                let entry = state.files.read().await.get(id).filter(|f| !f.deleted && f.uploader_id == device).cloned();
+                let entry = state::file_view(state, id).filter(|f| f.uploader_id == device);
                 return match entry {
                     Some(file) => json(StatusCode::OK, &serde_json::json!({ "success": true, "file": file })),
                     None => fail(StatusCode::CONFLICT, "a file with this id already exists"),
@@ -418,29 +418,22 @@ impl FilesApi {
             Ok(root) => root,
             Err(why) => return fail(StatusCode::INTERNAL_SERVER_ERROR, why),
         };
-        let stamp = state.clock.now();
-        let entry = FileMetadata {
-            id: id.to_string(),
+        let entry = CatalogEntry {
+            file_id: id.to_string(),
             name,
             size,
             mime_type: mime,
+            created_at_ms: crate::hlc::wall_clock_ms(),
+            manifest_root: root,
             uploader_id: device,
-            uploader_node: state.node_id.clone(),
-            holders: [(state.node_id.clone(), Holder { since: stamp.clone(), present: true })].into(),
-            uploaded_at: chrono::Utc::now(),
-            created_at: stamp.wall,
-            version: stamp,
-            deleted: false,
-            deleted_at: 0,
-            manifest_root: Some(root),
-            is_folder: false,
-            parent,
-            folder_bytes: 0,
-            folder_files: 0,
+            kind: EntryKind::File { parent },
         };
-        state::publish_entry(state, entry.clone()).await;
-        tracing::info!("Upload: {} ({} bytes) shared by {}", entry.name, size, entry.uploader_id);
-        json(StatusCode::CREATED, &serde_json::json!({ "success": true, "complete": true, "file": entry }))
+        let view = match state::share_file(state, entry).await {
+            Ok(view) => view,
+            Err(refusal) => return fail(StatusCode::INTERNAL_SERVER_ERROR, &format!("could not list the file: {refusal}")),
+        };
+        tracing::info!("Upload: {} ({} bytes) shared by {}", view.name, size, view.uploader_id);
+        json(StatusCode::CREATED, &serde_json::json!({ "success": true, "complete": true, "file": view }))
     }
 
     async fn upload_status(&self, req: Request<Incoming>, id: &str) -> Response<ServerBody> {
@@ -458,13 +451,10 @@ impl FilesApi {
             Ok(blob) => blob,
             Err(e) => return fetch_error(e),
         };
-        let (name, etag) = {
-            let files = state.files.read().await;
-            match files.get(id) {
-                Some(f) => (f.name.clone(), f.manifest_root.as_ref().map(|root| format!("\"{root}\""))),
-                None => return fail(StatusCode::NOT_FOUND, "no such file"),
-            }
+        let Some(listed) = state.catalog.listed(id) else {
+            return fail(StatusCode::NOT_FOUND, "no such file");
         };
+        let (name, etag) = (listed.entry.name, Some(format!("\"{}\"", listed.entry.manifest_root)));
         let size = blob.size();
 
         let range_header =
@@ -523,8 +513,8 @@ impl FilesApi {
             Ok(blob) => blob,
             Err(e) => return fetch_error(e),
         };
-        let folder = match state.files.read().await.get(folder_id) {
-            Some(f) if f.is_folder && !f.deleted => f.clone(),
+        let folder = match state.catalog.listed(folder_id) {
+            Some(listed) if listed.entry.is_folder() => listed.entry,
             _ => return fail(StatusCode::NOT_FOUND, "no such folder"),
         };
 
@@ -547,15 +537,12 @@ impl FilesApi {
 
         // Sizes come from the catalog, not from the listing, so the length announced is the length sent.
         let mut children: Vec<(String, String, u64)> = Vec::with_capacity(listing.children.len());
-        {
-            let files = state.files.read().await;
-            for child in &listing.children {
-                let entry = files.get(&child.file_id).filter(|f| !f.deleted && f.parent.as_deref() == Some(folder_id));
-                let (Some(entry), Some(path)) = (entry, validate::sanitize_relative_path(&child.path)) else {
-                    return fail(StatusCode::CONFLICT, "part of this folder is no longer available");
-                };
-                children.push((path, entry.id.clone(), entry.size));
-            }
+        for child in &listing.children {
+            let entry = state.catalog.listed(&child.file_id).map(|l| l.entry).filter(|e| e.parent() == Some(folder_id));
+            let (Some(entry), Some(path)) = (entry, validate::sanitize_relative_path(&child.path)) else {
+                return fail(StatusCode::CONFLICT, "part of this folder is no longer available");
+            };
+            children.push((path, entry.file_id, entry.size));
         }
         for (_, id, _) in children.iter().take(ZIP_PREFETCH) {
             if let Err(e) = transfer::ensure_file(state, id).await {
@@ -581,7 +568,7 @@ impl FilesApi {
             return response;
         }
 
-        let when = zip::dos_time(folder.uploaded_at);
+        let when = zip::dos_time(chrono::DateTime::from_timestamp_millis(folder.created_at_ms as i64).unwrap_or_default());
         let Ok(slot) = self.downloads.clone().try_acquire_owned() else {
             return busy();
         };
@@ -645,22 +632,18 @@ impl FilesApi {
         // Every file must have been uploaded by this device, for this folder.
         let mut listing = FolderListing { v: 1, name: validate::sanitize_file_name(&folder.name), children: Vec::new() };
         let mut seen = std::collections::HashSet::new();
-        {
-            let files = state.files.read().await;
-            for child in &folder.children {
-                let Some(path) = validate::sanitize_relative_path(&child.path) else {
-                    return fail(StatusCode::BAD_REQUEST, "a file in the folder has an unusable path");
-                };
-                if !seen.insert(path.to_lowercase()) {
-                    return fail(StatusCode::BAD_REQUEST, "two files in the folder have the same path");
+        for child in &folder.children {
+            let Some(path) = validate::sanitize_relative_path(&child.path) else {
+                return fail(StatusCode::BAD_REQUEST, "a file in the folder has an unusable path");
+            };
+            if !seen.insert(path.to_lowercase()) {
+                return fail(StatusCode::BAD_REQUEST, "two files in the folder have the same path");
+            }
+            match state.catalog.listed(&child.file_id).map(|l| l.entry) {
+                Some(f) if f.uploader_id == device && f.parent() == Some(id) => {
+                    listing.children.push(ListingChild { path, file_id: f.file_id, size: f.size });
                 }
-                let entry = files.get(&child.file_id).filter(|f| !f.deleted);
-                match entry {
-                    Some(f) if f.uploader_id == device && f.parent.as_deref() == Some(id) && f.manifest_root.is_some() => {
-                        listing.children.push(ListingChild { path, file_id: f.id.clone(), size: f.size });
-                    }
-                    _ => return fail(StatusCode::CONFLICT, "a file in the folder was not uploaded for it"),
-                }
+                _ => return fail(StatusCode::CONFLICT, "a file in the folder was not uploaded for it"),
             }
         }
         listing.children.sort_by(|a, b| a.path.cmp(&b.path));
@@ -682,28 +665,20 @@ impl FilesApi {
             Ok(root) => root,
             Err(why) => return fail(StatusCode::INTERNAL_SERVER_ERROR, why),
         };
-        let stamp = state.clock.now();
-        let entry = FileMetadata {
-            id: id.to_string(),
+        let entry = CatalogEntry {
+            file_id: id.to_string(),
             name: listing.name.clone(),
             size: bytes.len() as u64,
             mime_type: "inode/directory".into(),
+            created_at_ms: crate::hlc::wall_clock_ms(),
+            manifest_root: root,
             uploader_id: device,
-            uploader_node: state.node_id.clone(),
-            holders: [(state.node_id.clone(), Holder { since: stamp.clone(), present: true })].into(),
-            uploaded_at: chrono::Utc::now(),
-            created_at: stamp.wall,
-            version: stamp,
-            deleted: false,
-            deleted_at: 0,
-            manifest_root: Some(root),
-            is_folder: true,
-            parent: None,
-            folder_bytes: listing.children.iter().map(|c| c.size).sum(),
-            folder_files: listing.children.len() as u32,
+            kind: EntryKind::Folder { bytes: listing.children.iter().map(|c| c.size).sum(), files: listing.children.len() as u32 },
         };
-        state::publish_entry(state, entry.clone()).await;
-        json(StatusCode::CREATED, &serde_json::json!({ "success": true, "file": entry }))
+        match state::share_file(state, entry).await {
+            Ok(view) => json(StatusCode::CREATED, &serde_json::json!({ "success": true, "file": view })),
+            Err(refusal) => fail(StatusCode::INTERNAL_SERVER_ERROR, &format!("could not list the folder: {refusal}")),
+        }
     }
 }
 

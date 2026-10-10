@@ -60,7 +60,7 @@ async fn a_file_arrives_intact_over_a_slow_reordering_link() {
     let mesh = LinkedMesh::spawn(2).await;
     let content = three_chunk_file();
     mesh.nodes[0].share_file("big_file", &content).await;
-    assert!(eventually(async || mesh.nodes[1].live_files().await.contains("big_file")).await);
+    assert!(eventually(async || !mesh.nodes[1].hosts_of("big_file").await.is_empty()).await);
 
     mesh.set_faults_everywhere(SLOW_AND_REORDERING);
     assert_eq!(fetched_contents(&mesh, 1, "big_file").await, Some(content));
@@ -71,7 +71,7 @@ async fn a_file_arrives_intact_when_the_link_loses_messages() {
     let mesh = LinkedMesh::spawn(2).await;
     let content = three_chunk_file();
     mesh.nodes[0].share_file("big_file", &content).await;
-    assert!(eventually(async || mesh.nodes[1].live_files().await.contains("big_file")).await);
+    assert!(eventually(async || !mesh.nodes[1].hosts_of("big_file").await.is_empty()).await);
 
     mesh.set_faults_everywhere(Faults { drop: 0.2, ..Default::default() });
     assert_eq!(fetched_contents(&mesh, 1, "big_file").await, Some(content));

@@ -149,9 +149,7 @@
 
     /** Names of the nodes that currently have the whole file. */
     LADEXApp.prototype._holderNames = function(file) {
-        return Object.entries(file.holders || {})
-            .filter(([, holder]) => holder && holder.present)
-            .map(([nodeId]) => this._nodeName(nodeId));
+        return (file.hosts || []).map((nodeId) => this._nodeName(nodeId));
     };
 
     LADEXApp.prototype.updateConnectionStatus = function(connected) {

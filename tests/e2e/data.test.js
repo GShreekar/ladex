@@ -90,7 +90,7 @@ const check = (name, ok, detail = '') => { console.log(`${ok ? 'PASS' : 'FAIL'} 
     let r = await upload(n1.base, t1, 'peer_one', 'file_a', fileA, { name: 'photo ünï.bin' });
     check('upload to node 1 is accepted', r.status === 201 && r.body.file && r.body.file.id === 'file_a', JSON.stringify(r));
     const rootA = r.body.file && r.body.file.manifest_root;
-    check('the entry names node 1 as holder and has a manifest root', r.body.file && Object.keys(r.body.file.holders).length === 1 && /^[0-9a-f]{64}$/.test(r.body.file.manifest_root));
+    check('the entry names node 1 as holder and has a manifest root', r.body.file && r.body.file.hosts.length === 1 && /^[0-9a-f]{64}$/.test(r.body.file.manifest_root));
     check('node 2 and node 3 list it', !!(await c2.wait((m) => m.type === 'file_list_update' && m.files.some((f) => f.id === 'file_a'))) && !!(await c3.wait((m) => m.type === 'file_list_update' && m.files.some((f) => f.id === 'file_a'))));
     r = await upload(n1.base, t1, 'peer_one', 'file_a', fileA, { name: 'photo ünï.bin' });
     check('uploading the same file again is harmless', r.status === 200, JSON.stringify(r.body));
@@ -102,8 +102,8 @@ const check = (name, ok, detail = '') => { console.log(`${ok ? 'PASS' : 'FAIL'} 
     d = await download(n2.base, t2, 'file_a');
     check('node 2 streams the file through while fetching it from node 1', d.status === 200 && sha(d.buf) === sha(fileA), d.error || '');
     check('content length is exact', d.buf && d.buf.length === fileA.length);
-    check('node 2 keeps a copy on disk', fs.existsSync(path.join(ROOT, 'n2/files/file_a.data')));
-    const listed = await c1.wait((m) => m.type === 'file_list_update' && m.files.some((f) => f.id === 'file_a' && Object.values(f.holders).filter((h) => h.present).length === 2), 8000);
+    check('node 2 keeps a copy on disk', fs.existsSync(path.join(ROOT, 'n2/files/blobs/file_a')));
+    const listed = await c1.wait((m) => m.type === 'file_list_update' && m.files.some((f) => f.id === 'file_a' && f.hosts.length === 2), 8000);
     check('everyone learns node 2 is now a holder', !!listed);
 
     d = await download(n3.base, t3, 'file_a', 'bytes=10000000-10000099');
@@ -182,7 +182,7 @@ const check = (name, ok, detail = '') => { console.log(`${ok ? 'PASS' : 'FAIL'} 
 
     c1c.send({ type: 'delete_file', session_id: 'peer_one', file_id: 'file_a' });
     await sleep(1500);
-    check('unsharing removes the file from node 2 and node 3 disks', !fs.existsSync(path.join(ROOT, 'n2/files/file_a.data')) && !fs.existsSync(path.join(ROOT, 'n3/files/file_a.data')));
+    check('unsharing removes the file from node 2 and node 3 disks', !fs.existsSync(path.join(ROOT, 'n2/files/blobs/file_a')) && !fs.existsSync(path.join(ROOT, 'n3/files/blobs/file_a')));
     d = await download(n2.base, t2, 'file_a');
     check('and it can no longer be downloaded', d.status === 404, d.status);
 
@@ -190,7 +190,7 @@ const check = (name, ok, detail = '') => { console.log(`${ok ? 'PASS' : 'FAIL'} 
     r = await upload(n1c.base, t1c, 'peer_one', 'file_d', fileD, { name: 'd.bin' });
     check('upload for the corruption test', r.status === 201);
     await sleep(500);
-    const fd = fs.openSync(path.join(ROOT, 'n1/files/file_d.data'), 'r+');
+    const fd = fs.openSync(path.join(ROOT, 'n1/files/blobs/file_d'), 'r+');
     fs.writeSync(fd, Buffer.from([fileD[2 * MiB + 5] ^ 0xff]), 0, 1, 2 * MiB + 5);
     fs.closeSync(fd);
     d = await download(n3.base, t3, 'file_d');
