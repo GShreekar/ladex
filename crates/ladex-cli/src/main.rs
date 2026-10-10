@@ -255,6 +255,14 @@ async fn main() {
     };
     println!("Shared files are kept in {} (up to {} GiB)", data_dir.display(), args.storage_limit_gb);
 
+    let catalog = match ladex_core::catalog::shared::SharedCatalog::open(&data_dir, state::MAX_CATALOG_ENTRIES) {
+        Ok(catalog) => Arc::new(catalog),
+        Err(e) => {
+            eprintln!("Error: could not open the catalog at {}: {e:#}", data_dir.display());
+            std::process::exit(1);
+        }
+    };
+
     let state = NodeState {
         local_peers: Arc::new(RwLock::new(HashMap::new())),
         local_senders: Arc::new(RwLock::new(HashMap::new())),
@@ -273,6 +281,7 @@ async fn main() {
         auth_limiter,
         mesh_limiter,
         store: store.clone(),
+        catalog,
         transfers: Arc::new(transfer::Transfers::with_tuning(transfer::Tuning {
             stall_timeout: Duration::from_secs(args.stall_timeout_secs),
             ..Default::default()
@@ -288,6 +297,10 @@ async fn main() {
     };
 
     state::load_catalog_from_store(&state).await;
+    // Never reissue a stamp this node already signed an op with.
+    if let Some(latest) = state.catalog.latest_stamp(&node_id) {
+        state.clock.resume_from(latest.wall, latest.counter);
+    }
     if let Some(saved) = &saved {
         persist::restore(&state, saved).await;
         if saved.node_id != node_id {

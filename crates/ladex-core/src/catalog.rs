@@ -3,7 +3,11 @@
 //! An add is tagged with its publisher's stamp. A remove lists the add tags it saw, so an add made concurrently
 //! survives it. Only the publisher, or a key the publisher named in the add, can remove it; every node checks that.
 
-use std::collections::HashMap;
+mod log;
+pub mod shared;
+pub mod sync;
+
+use std::collections::{BTreeMap, HashMap};
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -12,6 +16,7 @@ use crate::hlc::{Clock, Stamp};
 use crate::identity::{self, Identity};
 use crate::revocation::hex_signature;
 use crate::trust::hex_public_key;
+use crate::types::NodeId;
 use crate::validate;
 
 const ADD_LABEL: &[u8] = b"ladex-catalog-add";
@@ -20,6 +25,8 @@ const REMOVE_LABEL: &[u8] = b"ladex-catalog-remove";
 pub const MAX_AUTHORIZED: usize = 8;
 /// The most add tags one remove may list.
 pub const MAX_OBSERVED: usize = 64;
+/// The most origin nodes one version vector may name.
+pub const MAX_VERSION_ENTRIES: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogEntry {
@@ -46,6 +53,8 @@ impl CatalogEntry {
 pub struct Add {
     /// Tags this add; unique because a node's clock never repeats a stamp.
     pub stamp: Stamp,
+    /// This op's place in its origin's run of ops: 1, 2, 3 and so on, with no gaps.
+    pub seq: u64,
     #[serde(with = "hex_public_key")]
     pub publisher: VerifyingKey,
     #[serde(with = "hex_public_keys")]
@@ -56,10 +65,10 @@ pub struct Add {
 }
 
 impl Add {
-    pub fn sign(identity: &Identity, stamp: Stamp, authorized: Vec<VerifyingKey>, entry: CatalogEntry) -> Self {
+    pub fn sign(identity: &Identity, stamp: Stamp, seq: u64, authorized: Vec<VerifyingKey>, entry: CatalogEntry) -> Self {
         let publisher = identity.public_key();
-        let signature = identity.sign(&add_signed_bytes(&stamp, &publisher, &authorized, &entry));
-        Self { stamp, publisher, authorized, entry, signature }
+        let signature = identity.sign(&add_signed_bytes(&stamp, seq, &publisher, &authorized, &entry));
+        Self { stamp, seq, publisher, authorized, entry, signature }
     }
 
     fn may_be_removed_by(&self, key: &VerifyingKey) -> bool {
@@ -67,11 +76,11 @@ impl Add {
     }
 
     fn check(&self) -> Result<(), Refusal> {
-        let signed = add_signed_bytes(&self.stamp, &self.publisher, &self.authorized, &self.entry);
+        let signed = add_signed_bytes(&self.stamp, self.seq, &self.publisher, &self.authorized, &self.entry);
         if !identity::verify(&self.publisher, &signed, &self.signature) {
             return Err(Refusal::BadSignature);
         }
-        check_stamp(&self.stamp, &self.publisher)?;
+        check_stamp(&self.stamp, self.seq, &self.publisher)?;
         if self.authorized.len() > MAX_AUTHORIZED {
             return Err(Refusal::TooManyAuthorized);
         }
@@ -86,6 +95,7 @@ impl Add {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Remove {
     pub stamp: Stamp,
+    pub seq: u64,
     #[serde(with = "hex_public_key")]
     pub remover: VerifyingKey,
     pub file_id: String,
@@ -95,10 +105,10 @@ pub struct Remove {
 }
 
 impl Remove {
-    pub fn sign(identity: &Identity, stamp: Stamp, file_id: String, observed: Vec<Stamp>) -> Self {
+    pub fn sign(identity: &Identity, stamp: Stamp, seq: u64, file_id: String, observed: Vec<Stamp>) -> Self {
         let remover = identity.public_key();
-        let signature = identity.sign(&remove_signed_bytes(&stamp, &remover, &file_id, &observed));
-        Self { stamp, remover, file_id, observed, signature }
+        let signature = identity.sign(&remove_signed_bytes(&stamp, seq, &remover, &file_id, &observed));
+        Self { stamp, seq, remover, file_id, observed, signature }
     }
 
     fn removes(&self, add: &Add) -> bool {
@@ -106,11 +116,11 @@ impl Remove {
     }
 
     fn check(&self) -> Result<(), Refusal> {
-        let signed = remove_signed_bytes(&self.stamp, &self.remover, &self.file_id, &self.observed);
+        let signed = remove_signed_bytes(&self.stamp, self.seq, &self.remover, &self.file_id, &self.observed);
         if !identity::verify(&self.remover, &signed, &self.signature) {
             return Err(Refusal::BadSignature);
         }
-        check_stamp(&self.stamp, &self.remover)?;
+        check_stamp(&self.stamp, self.seq, &self.remover)?;
         if !validate::is_valid_id(&self.file_id) || self.observed.is_empty() || self.observed.len() > MAX_OBSERVED {
             return Err(Refusal::InvalidRemove);
         }
@@ -125,6 +135,50 @@ pub enum Op {
     Remove(Remove),
 }
 
+impl Op {
+    pub fn stamp(&self) -> &Stamp {
+        match self {
+            Op::Add(add) => &add.stamp,
+            Op::Remove(remove) => &remove.stamp,
+        }
+    }
+
+    pub fn seq(&self) -> u64 {
+        match self {
+            Op::Add(add) => add.seq,
+            Op::Remove(remove) => remove.seq,
+        }
+    }
+
+    /// The node that made the op.
+    pub fn origin(&self) -> &NodeId {
+        &self.stamp().node
+    }
+}
+
+/// For each origin node, how far its run of ops is held with nothing missing before that point.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionVector(BTreeMap<NodeId, u64>);
+
+impl VersionVector {
+    pub fn get(&self, origin: &str) -> u64 {
+        self.0.get(origin).copied().unwrap_or(0)
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Whether a vector from another node is small enough and names only well-formed nodes.
+    pub fn is_plausible(&self) -> bool {
+        self.0.len() <= MAX_VERSION_ENTRIES && self.0.keys().all(|origin| validate::is_valid_id(origin))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
     Applied,
@@ -135,6 +189,9 @@ pub enum Outcome {
 pub enum Refusal {
     BadSignature,
     UnsetStamp,
+    UnsetSequence,
+    /// The node already used this sequence number for a different op.
+    SequenceReused,
     /// The stamp names a different node than the key that signed.
     StampNotFromSigner,
     TooManyAuthorized,
@@ -148,6 +205,8 @@ impl std::fmt::Display for Refusal {
         f.write_str(match self {
             Refusal::BadSignature => "its signature is invalid",
             Refusal::UnsetStamp => "it has no timestamp",
+            Refusal::UnsetSequence => "it has no sequence number",
+            Refusal::SequenceReused => "its sequence number was already used by another op",
             Refusal::StampNotFromSigner => "its timestamp belongs to a different node than its signer",
             Refusal::TooManyAuthorized => "it authorizes too many nodes",
             Refusal::InvalidEntry => "its file entry is not valid",
@@ -169,13 +228,21 @@ pub struct Catalog {
     removes: HashMap<Stamp, Remove>,
     // Add tag -> the removes that list it. A remove may arrive before its add, so this is kept apart from `adds`.
     removed_by: HashMap<Stamp, Vec<Stamp>>,
+    origins: HashMap<NodeId, OriginRun>,
     capacity: usize,
+}
+
+// One origin node's ops by sequence number; the frontier is the last number below which none is missing.
+#[derive(Default)]
+struct OriginRun {
+    stamps: BTreeMap<u64, Stamp>,
+    frontier: u64,
 }
 
 impl Catalog {
     /// `capacity` bounds the adds and the removes kept, so a misbehaving node cannot grow the catalog without limit.
     pub fn new(capacity: usize) -> Self {
-        Self { adds: HashMap::new(), removes: HashMap::new(), removed_by: HashMap::new(), capacity }
+        Self { adds: HashMap::new(), removes: HashMap::new(), removed_by: HashMap::new(), origins: HashMap::new(), capacity }
     }
 
     /// Shares a file in this node's name.
@@ -186,7 +253,7 @@ impl Catalog {
         entry: CatalogEntry,
         authorized: Vec<VerifyingKey>,
     ) -> Result<Add, Refusal> {
-        let add = Add::sign(identity, clock.now(), authorized, entry);
+        let add = Add::sign(identity, clock.now(), self.next_seq(identity.node_id()), authorized, entry);
         self.apply_add(add.clone())?;
         Ok(add)
     }
@@ -204,7 +271,7 @@ impl Catalog {
         }
         // A remove that does not fit them all leaves the rest for a second call.
         observed.truncate(MAX_OBSERVED);
-        let remove = Remove::sign(identity, clock.now(), file_id.to_string(), observed);
+        let remove = Remove::sign(identity, clock.now(), self.next_seq(identity.node_id()), file_id.to_string(), observed);
         self.apply_remove(remove.clone()).map_err(|_| UnpublishError::NotAllowed)?;
         Ok(remove)
     }
@@ -255,9 +322,11 @@ impl Catalog {
             return Ok(Outcome::AlreadyKnown);
         }
         add.check()?;
+        self.check_sequence(&add.stamp, add.seq)?;
         if self.adds.len() >= self.capacity {
             return Err(Refusal::Full);
         }
+        self.record_sequence(&add.stamp, add.seq);
         self.adds.insert(add.stamp.clone(), add);
         Ok(Outcome::Applied)
     }
@@ -267,14 +336,64 @@ impl Catalog {
             return Ok(Outcome::AlreadyKnown);
         }
         remove.check()?;
+        self.check_sequence(&remove.stamp, remove.seq)?;
         if self.removes.len() >= self.capacity {
             return Err(Refusal::Full);
         }
+        self.record_sequence(&remove.stamp, remove.seq);
         for tag in &remove.observed {
             self.removed_by.entry(tag.clone()).or_default().push(remove.stamp.clone());
         }
         self.removes.insert(remove.stamp.clone(), remove);
         Ok(Outcome::Applied)
+    }
+
+    /// What this catalog holds of each origin's run; a node sends this to ask for what it lacks.
+    pub fn version(&self) -> VersionVector {
+        VersionVector(self.origins.iter().filter(|(_, run)| run.frontier > 0).map(|(origin, run)| (origin.clone(), run.frontier)).collect())
+    }
+
+    /// The ops a node with version `theirs` lacks, each origin's in order.
+    pub fn ops_missing_from(&self, theirs: &VersionVector) -> Vec<Op> {
+        let mut origins: Vec<(&NodeId, &OriginRun)> = self.origins.iter().collect();
+        origins.sort_by_key(|(origin, _)| *origin);
+        let mut missing = Vec::new();
+        for (origin, run) in origins {
+            let first = theirs.get(origin).saturating_add(1);
+            missing.extend(run.stamps.range(first..).filter_map(|(_, stamp)| self.op_with_stamp(stamp)));
+        }
+        missing
+    }
+
+    /// The newest stamp held from a node, for its clock to resume after a restart.
+    pub fn latest_stamp(&self, origin: &str) -> Option<&Stamp> {
+        self.origins.get(origin)?.stamps.values().next_back()
+    }
+
+    fn next_seq(&self, origin: &str) -> u64 {
+        self.origins.get(origin).and_then(|run| run.stamps.keys().next_back()).map_or(1, |last| last + 1)
+    }
+
+    fn check_sequence(&self, stamp: &Stamp, seq: u64) -> Result<(), Refusal> {
+        match self.origins.get(&stamp.node).and_then(|run| run.stamps.get(&seq)) {
+            Some(held) if held != stamp => Err(Refusal::SequenceReused),
+            _ => Ok(()),
+        }
+    }
+
+    fn record_sequence(&mut self, stamp: &Stamp, seq: u64) {
+        let run = self.origins.entry(stamp.node.clone()).or_default();
+        run.stamps.insert(seq, stamp.clone());
+        while run.stamps.contains_key(&(run.frontier + 1)) {
+            run.frontier += 1;
+        }
+    }
+
+    fn op_with_stamp(&self, stamp: &Stamp) -> Option<Op> {
+        match self.adds.get(stamp) {
+            Some(add) => Some(Op::Add(add.clone())),
+            None => self.removes.get(stamp).cloned().map(Op::Remove),
+        }
     }
 
     fn live_adds(&self, file_id: &str) -> Vec<&Add> {
@@ -288,9 +407,12 @@ impl Catalog {
     }
 }
 
-fn check_stamp(stamp: &Stamp, signer: &VerifyingKey) -> Result<(), Refusal> {
+fn check_stamp(stamp: &Stamp, seq: u64, signer: &VerifyingKey) -> Result<(), Refusal> {
     if !stamp.is_set() {
         return Err(Refusal::UnsetStamp);
+    }
+    if seq == 0 {
+        return Err(Refusal::UnsetSequence);
     }
     if stamp.node != identity::node_id_for(signer) {
         return Err(Refusal::StampNotFromSigner);
@@ -298,9 +420,10 @@ fn check_stamp(stamp: &Stamp, signer: &VerifyingKey) -> Result<(), Refusal> {
     Ok(())
 }
 
-fn add_signed_bytes(stamp: &Stamp, publisher: &VerifyingKey, authorized: &[VerifyingKey], entry: &CatalogEntry) -> Vec<u8> {
+fn add_signed_bytes(stamp: &Stamp, seq: u64, publisher: &VerifyingKey, authorized: &[VerifyingKey], entry: &CatalogEntry) -> Vec<u8> {
     let mut bytes = ADD_LABEL.to_vec();
     put_stamp(&mut bytes, stamp);
+    bytes.extend_from_slice(&seq.to_be_bytes());
     bytes.extend_from_slice(publisher.as_bytes());
     put_len(&mut bytes, authorized.len());
     for key in authorized {
@@ -314,9 +437,10 @@ fn add_signed_bytes(stamp: &Stamp, publisher: &VerifyingKey, authorized: &[Verif
     bytes
 }
 
-fn remove_signed_bytes(stamp: &Stamp, remover: &VerifyingKey, file_id: &str, observed: &[Stamp]) -> Vec<u8> {
+fn remove_signed_bytes(stamp: &Stamp, seq: u64, remover: &VerifyingKey, file_id: &str, observed: &[Stamp]) -> Vec<u8> {
     let mut bytes = REMOVE_LABEL.to_vec();
     put_stamp(&mut bytes, stamp);
+    bytes.extend_from_slice(&seq.to_be_bytes());
     bytes.extend_from_slice(remover.as_bytes());
     put_text(&mut bytes, file_id);
     put_len(&mut bytes, observed.len());
@@ -430,7 +554,7 @@ mod tests {
     fn a_forged_remove_from_another_node_does_not_hide_the_file() {
         let (mut catalog, alice, mallory) = (catalog(), node(1), node(2));
         let add = publish(&mut catalog, &alice, "f1");
-        let remove = Remove::sign(&mallory.identity, mallory.clock.now(), "f1".into(), vec![add.stamp]);
+        let remove = Remove::sign(&mallory.identity, mallory.clock.now(), 1, "f1".into(), vec![add.stamp]);
         assert_eq!(catalog.apply(Op::Remove(remove)), Ok(Outcome::Applied));
         assert!(catalog.contains("f1"));
     }
@@ -454,7 +578,7 @@ mod tests {
         let (mut alice_view, alice, bob) = (catalog(), node(1), node(2));
         publish(&mut alice_view, &alice, "f1");
         let remove = alice_view.unpublish(&alice.identity, &alice.clock, "f1").unwrap();
-        let concurrent_add = Add::sign(&bob.identity, bob.clock.now(), vec![], entry("f1"));
+        let concurrent_add = Add::sign(&bob.identity, bob.clock.now(), 1, vec![], entry("f1"));
 
         let mut replica = catalog();
         replica.apply(Op::Add(concurrent_add)).unwrap();
@@ -487,7 +611,7 @@ mod tests {
     fn a_remove_does_not_hide_a_different_file_with_the_same_tag() {
         let (mut catalog, alice) = (catalog(), node(1));
         let add = publish(&mut catalog, &alice, "f1");
-        let remove = Remove::sign(&alice.identity, alice.clock.now(), "f2".into(), vec![add.stamp]);
+        let remove = Remove::sign(&alice.identity, alice.clock.now(), 2, "f2".into(), vec![add.stamp]);
         catalog.apply(Op::Remove(remove)).unwrap();
         assert!(catalog.contains("f1"));
     }
@@ -503,7 +627,7 @@ mod tests {
     #[test]
     fn an_add_with_a_changed_name_is_refused() {
         let (mut catalog, alice) = (catalog(), node(1));
-        let mut add = Add::sign(&alice.identity, alice.clock.now(), vec![], entry("f1"));
+        let mut add = Add::sign(&alice.identity, alice.clock.now(), 1, vec![], entry("f1"));
         add.entry.name = "evil.exe".into();
         assert_eq!(catalog.apply(Op::Add(add)), Err(Refusal::BadSignature));
     }
@@ -511,7 +635,7 @@ mod tests {
     #[test]
     fn an_add_with_a_changed_authorized_list_is_refused() {
         let (mut catalog, alice, mallory) = (catalog(), node(1), node(2));
-        let mut add = Add::sign(&alice.identity, alice.clock.now(), vec![], entry("f1"));
+        let mut add = Add::sign(&alice.identity, alice.clock.now(), 1, vec![], entry("f1"));
         add.authorized.push(mallory.identity.public_key());
         assert_eq!(catalog.apply(Op::Add(add)), Err(Refusal::BadSignature));
     }
@@ -520,7 +644,7 @@ mod tests {
     fn a_remove_with_a_changed_tag_list_is_refused() {
         let (mut catalog, alice) = (catalog(), node(1));
         let add = publish(&mut catalog, &alice, "f1");
-        let mut remove = Remove::sign(&alice.identity, alice.clock.now(), "f1".into(), vec![add.stamp]);
+        let mut remove = Remove::sign(&alice.identity, alice.clock.now(), 2, "f1".into(), vec![add.stamp]);
         remove.observed.push(Stamp { wall: 1, counter: 0, node: "x".into() });
         assert_eq!(catalog.apply(Op::Remove(remove)), Err(Refusal::BadSignature));
     }
@@ -528,14 +652,14 @@ mod tests {
     #[test]
     fn an_add_stamped_as_another_node_is_refused() {
         let (mut catalog, alice, mallory) = (catalog(), node(1), node(2));
-        let add = Add::sign(&mallory.identity, alice.clock.now(), vec![], entry("f1"));
+        let add = Add::sign(&mallory.identity, alice.clock.now(), 1, vec![], entry("f1"));
         assert_eq!(catalog.apply(Op::Add(add)), Err(Refusal::StampNotFromSigner));
     }
 
     #[test]
     fn an_add_without_a_stamp_is_refused() {
         let (mut catalog, alice) = (catalog(), node(1));
-        let add = Add::sign(&alice.identity, Stamp::default(), vec![], entry("f1"));
+        let add = Add::sign(&alice.identity, Stamp::default(), 1, vec![], entry("f1"));
         assert_eq!(catalog.apply(Op::Add(add)), Err(Refusal::UnsetStamp));
     }
 
@@ -543,7 +667,7 @@ mod tests {
     fn an_add_with_an_unsafe_file_name_is_refused() {
         let (mut catalog, alice) = (catalog(), node(1));
         let unsafe_entry = CatalogEntry { name: "../etc/passwd".into(), ..entry("f1") };
-        let add = Add::sign(&alice.identity, alice.clock.now(), vec![], unsafe_entry);
+        let add = Add::sign(&alice.identity, alice.clock.now(), 1, vec![], unsafe_entry);
         assert_eq!(catalog.apply(Op::Add(add)), Err(Refusal::InvalidEntry));
     }
 
@@ -551,14 +675,14 @@ mod tests {
     fn an_add_authorizing_too_many_nodes_is_refused() {
         let (mut catalog, alice) = (catalog(), node(1));
         let keys = vec![node(2).identity.public_key(); MAX_AUTHORIZED + 1];
-        let add = Add::sign(&alice.identity, alice.clock.now(), keys, entry("f1"));
+        let add = Add::sign(&alice.identity, alice.clock.now(), 1, keys, entry("f1"));
         assert_eq!(catalog.apply(Op::Add(add)), Err(Refusal::TooManyAuthorized));
     }
 
     #[test]
     fn a_remove_listing_no_adds_is_refused() {
         let (mut catalog, alice) = (catalog(), node(1));
-        let remove = Remove::sign(&alice.identity, alice.clock.now(), "f1".into(), vec![]);
+        let remove = Remove::sign(&alice.identity, alice.clock.now(), 1, "f1".into(), vec![]);
         assert_eq!(catalog.apply(Op::Remove(remove)), Err(Refusal::InvalidRemove));
     }
 
@@ -566,7 +690,7 @@ mod tests {
     fn a_full_catalog_refuses_new_adds() {
         let (mut catalog, alice) = (Catalog::new(1), node(1));
         publish(&mut catalog, &alice, "f1");
-        let second = Add::sign(&alice.identity, alice.clock.now(), vec![], entry("f2"));
+        let second = Add::sign(&alice.identity, alice.clock.now(), 2, vec![], entry("f2"));
         assert_eq!(catalog.apply(Op::Add(second)), Err(Refusal::Full));
     }
 
@@ -592,6 +716,118 @@ mod tests {
         let newer = CatalogEntry { name: "renamed.txt".into(), ..entry("f1") };
         catalog.publish(&bob.identity, &bob.clock, newer.clone(), vec![]).unwrap();
         assert_eq!(catalog.get("f1"), Some(&newer));
+    }
+
+    fn replica_with(ops: impl IntoIterator<Item = Op>) -> Catalog {
+        let mut replica = catalog();
+        for op in ops {
+            replica.apply(op).unwrap();
+        }
+        replica
+    }
+
+    fn stamps_of(ops: &[Op]) -> Vec<Stamp> {
+        ops.iter().map(|op| op.stamp().clone()).collect()
+    }
+
+    #[test]
+    fn an_empty_catalog_has_an_empty_version() {
+        assert!(catalog().version().is_empty());
+    }
+
+    #[test]
+    fn the_version_counts_each_origins_ops() {
+        let (mut catalog, alice, bob) = (catalog(), node(1), node(2));
+        publish(&mut catalog, &alice, "f1");
+        publish(&mut catalog, &alice, "f2");
+        publish(&mut catalog, &bob, "f3");
+        let version = catalog.version();
+        assert_eq!((version.get(alice.identity.node_id()), version.get(bob.identity.node_id())), (2, 1));
+    }
+
+    #[test]
+    fn a_gap_in_an_origins_ops_holds_the_version_back_until_it_is_filled() {
+        let (mut origin, alice) = (catalog(), node(1));
+        let ops: Vec<Op> = ["f1", "f2", "f3"].iter().map(|id| Op::Add(publish(&mut origin, &alice, id))).collect();
+
+        let mut replica = catalog();
+        replica.apply(ops[0].clone()).unwrap();
+        replica.apply(ops[2].clone()).unwrap();
+        assert_eq!(replica.version().get(alice.identity.node_id()), 1);
+        replica.apply(ops[1].clone()).unwrap();
+        assert_eq!(replica.version().get(alice.identity.node_id()), 3);
+    }
+
+    #[test]
+    fn a_node_is_sent_only_the_ops_beyond_its_version() {
+        let (mut origin, alice) = (catalog(), node(1));
+        let first = publish(&mut origin, &alice, "f1");
+        let second = publish(&mut origin, &alice, "f2");
+        let behind = replica_with([Op::Add(first)]);
+        assert_eq!(stamps_of(&origin.ops_missing_from(&behind.version())), vec![second.stamp]);
+    }
+
+    #[test]
+    fn a_node_that_is_up_to_date_is_sent_nothing() {
+        let (mut origin, alice) = (catalog(), node(1));
+        publish(&mut origin, &alice, "f1");
+        assert!(origin.ops_missing_from(&origin.version()).is_empty());
+    }
+
+    #[test]
+    fn a_node_with_an_empty_version_is_sent_everything_in_order() {
+        let (mut origin, alice) = (catalog(), node(1));
+        publish(&mut origin, &alice, "f1");
+        origin.unpublish(&alice.identity, &alice.clock, "f1").unwrap();
+        publish(&mut origin, &alice, "f2");
+        let sent = origin.ops_missing_from(&VersionVector::default());
+        assert_eq!(sent.iter().map(Op::seq).collect::<Vec<_>>(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn an_op_held_beyond_a_gap_is_still_sent_to_a_node_that_lacks_it() {
+        let (mut origin, alice) = (catalog(), node(1));
+        let ops: Vec<Op> = ["f1", "f2", "f3"].iter().map(|id| Op::Add(publish(&mut origin, &alice, id))).collect();
+        let gappy = replica_with([ops[0].clone(), ops[2].clone()]);
+        assert_eq!(stamps_of(&gappy.ops_missing_from(&VersionVector::default())), stamps_of(&[ops[0].clone(), ops[2].clone()]));
+    }
+
+    #[test]
+    fn a_second_op_with_a_used_sequence_number_is_refused() {
+        let (mut catalog, alice) = (catalog(), node(1));
+        publish(&mut catalog, &alice, "f1");
+        let reusing = Add::sign(&alice.identity, alice.clock.now(), 1, vec![], entry("f2"));
+        assert_eq!(catalog.apply(Op::Add(reusing)), Err(Refusal::SequenceReused));
+    }
+
+    #[test]
+    fn an_op_with_sequence_zero_is_refused() {
+        let (mut catalog, alice) = (catalog(), node(1));
+        let add = Add::sign(&alice.identity, alice.clock.now(), 0, vec![], entry("f1"));
+        assert_eq!(catalog.apply(Op::Add(add)), Err(Refusal::UnsetSequence));
+    }
+
+    #[test]
+    fn an_add_with_a_changed_sequence_number_is_refused() {
+        let (mut catalog, alice) = (catalog(), node(1));
+        let mut add = Add::sign(&alice.identity, alice.clock.now(), 1, vec![], entry("f1"));
+        add.seq = 5;
+        assert_eq!(catalog.apply(Op::Add(add)), Err(Refusal::BadSignature));
+    }
+
+    #[test]
+    fn a_vector_naming_a_malformed_node_is_not_plausible() {
+        let vector: VersionVector =
+            postcard::from_bytes(&postcard::to_stdvec(&BTreeMap::from([("../x".to_string(), 1u64)])).unwrap()).unwrap();
+        assert!(!vector.is_plausible());
+    }
+
+    #[test]
+    fn the_latest_stamp_of_a_node_is_that_of_its_last_op() {
+        let (mut catalog, alice) = (catalog(), node(1));
+        publish(&mut catalog, &alice, "f1");
+        let last = publish(&mut catalog, &alice, "f2");
+        assert_eq!(catalog.latest_stamp(alice.identity.node_id()), Some(&last.stamp));
     }
 
     // Builds a history on one catalog that sees everything, so each remove lists the adds it could have seen.
@@ -626,6 +862,32 @@ mod tests {
                 replica.apply(op).unwrap();
             }
             prop_assert_eq!(shared_ids(&replica), expected);
+        }
+
+        #[test]
+        fn two_replicas_converge_after_exchanging_what_each_lacks(
+            (ops, holders) in prop::collection::vec((0u8..3, 0u8..4, any::<bool>()), 0..40).prop_flat_map(|actions| {
+                let (ops, _) = history(&actions);
+                let count = ops.len();
+                (Just(ops), prop::collection::vec(0u8..3, count))
+            })
+        ) {
+            // 0: only the first replica holds the op, 1: only the second, 2: both.
+            let first_ops: Vec<Op> = ops.iter().zip(&holders).filter(|(_, h)| **h != 1).map(|(op, _)| op.clone()).collect();
+            let second_ops: Vec<Op> = ops.iter().zip(&holders).filter(|(_, h)| **h != 0).map(|(op, _)| op.clone()).collect();
+            let (mut first, mut second) = (replica_with(first_ops), replica_with(second_ops));
+
+            let for_second = first.ops_missing_from(&second.version());
+            let for_first = second.ops_missing_from(&first.version());
+            for op in for_second {
+                second.apply(op).unwrap();
+            }
+            for op in for_first {
+                first.apply(op).unwrap();
+            }
+            prop_assert_eq!(shared_ids(&first), shared_ids(&second));
+            prop_assert_eq!(first.op_count(), second.op_count());
+            prop_assert_eq!(first.version(), second.version());
         }
 
         #[test]

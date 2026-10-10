@@ -18,7 +18,8 @@ mod frames;
 pub mod quic;
 
 // 8: mesh messages on QUIC stream 0 are postcard-encoded instead of JSON.
-pub const PROTOCOL_VERSION: u32 = 8;
+// 9: nodes trade catalog version vectors and signed ops.
+pub const PROTOCOL_VERSION: u32 = 9;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const DATA_QUEUE_FRAMES: usize = 8;
@@ -126,6 +127,15 @@ pub enum MeshMessage {
 
     Goodbye {
         node_id: NodeId,
+    },
+
+    /// What the sender holds of the catalog; the receiver answers with the ops the sender lacks.
+    CatalogVersion {
+        version: crate::catalog::VersionVector,
+    },
+    /// Signed catalog ops: sent in answer to a version, or pushed when the sender makes one.
+    CatalogOps {
+        ops: Vec<crate::catalog::Op>,
     },
 }
 
@@ -398,6 +408,8 @@ async fn post_handshake_sync(peer_tx: &mpsc::UnboundedSender<MeshMessage>, state
         Err(e) => tracing::error!("Mesh: could not read the revocations to pass on: {e:#}"),
     }
 
+    crate::catalog::sync::offer_version(peer_tx, state);
+
     // Tombstones too: a peer that was away must learn what was unshared meanwhile.
     let files: Vec<FileMetadata> = state.files.read().await.values().cloned().collect();
     let _ = peer_tx.send(MeshMessage::CatalogSync { files });
@@ -499,6 +511,9 @@ pub(crate) async fn dispatch(msg: &MeshMessage, from_node_id: &NodeId, state: &N
         }
 
         MeshMessage::Revocations { revocations } => receive_revocations(state, from_node_id, revocations).await,
+
+        MeshMessage::CatalogVersion { version } => crate::catalog::sync::on_version(state, from_node_id, version).await,
+        MeshMessage::CatalogOps { ops } => crate::catalog::sync::on_ops(state, from_node_id, ops).await,
 
         MeshMessage::Goodbye { node_id } => {
             tracing::info!("Mesh: Goodbye from {node_id}");

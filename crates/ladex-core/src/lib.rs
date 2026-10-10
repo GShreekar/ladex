@@ -96,6 +96,9 @@ pub struct NodeState {
     pub store: Arc<store::Store>,
     pub transfers: Arc<transfer::Transfers>,
 
+    /// The signed-op catalog that replaces `files`, and is kept in step across the mesh by version vectors (see catalog.rs).
+    pub catalog: Arc<catalog::shared::SharedCatalog>,
+
     /// Which WebSocket connection holds each browser `session_id`.
     pub session_owners: Arc<RwLock<HashMap<SessionId, websocket::ConnOwner>>>,
     pub connection_counter: Arc<AtomicU64>,
@@ -162,6 +165,7 @@ impl NodeState {
                 map_interval: Duration::from_millis(100),
                 stall_timeout: Duration::from_secs(5),
             })),
+            catalog: Arc::new(catalog::shared::SharedCatalog::open(&data_dir, state::MAX_CATALOG_ENTRIES).unwrap()),
             session_owners: Arc::new(RwLock::new(HashMap::new())),
             connection_counter: Arc::new(AtomicU64::new(1)),
             clock_alert_at: Arc::new(Mutex::new(None)),

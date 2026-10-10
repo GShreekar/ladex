@@ -50,6 +50,21 @@ pub fn wall_clock_ms() -> u64 {
     chrono::Utc::now().timestamp_millis().max(0) as u64
 }
 
+/// Whether a remote stamp is set and not too far ahead of this device's clock, without taking it into account.
+pub fn check(remote: &Stamp) -> Result<(), ClockError> {
+    check_at(remote, wall_clock_ms())
+}
+
+fn check_at(remote: &Stamp, physical: u64) -> Result<(), ClockError> {
+    if !remote.is_set() {
+        return Err(ClockError::Unset);
+    }
+    if remote.wall > physical.saturating_add(MAX_DRIFT_MS) {
+        return Err(ClockError::Ahead { by_ms: remote.wall - physical });
+    }
+    Ok(())
+}
+
 pub struct Clock {
     node: NodeId,
     latest: Mutex<(u64, u32)>,
@@ -99,12 +114,7 @@ impl Clock {
     }
 
     fn observe_at(&self, remote: &Stamp, physical: u64) -> Result<(), ClockError> {
-        if !remote.is_set() {
-            return Err(ClockError::Unset);
-        }
-        if remote.wall > physical.saturating_add(MAX_DRIFT_MS) {
-            return Err(ClockError::Ahead { by_ms: remote.wall - physical });
-        }
+        check_at(remote, physical)?;
         let mut latest = self.latest.lock().unwrap();
         let (wall, counter) = *latest;
         let merged_wall = wall.max(remote.wall).max(physical);
