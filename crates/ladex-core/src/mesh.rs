@@ -50,8 +50,6 @@ pub struct MeshPeerHandle {
     pub sender: mpsc::UnboundedSender<MeshMessage>,
     /// Requests for chunks; each is answered on a stream of its own.
     pub fetches: mpsc::Sender<crate::transfer::wire::Fetch>,
-    /// Limits how many chunk requests from this peer are served at once.
-    pub serve_slots: Arc<tokio::sync::Semaphore>,
     pub last_seen: Instant,
     /// Latest measured RTT to this peer (ms); None until the first Pong.
     pub rtt_ms: Option<u32>,
@@ -227,7 +225,6 @@ async fn start_session(
         addr,
         sender: sender.clone(),
         fetches: fetches_tx,
-        serve_slots: Arc::new(tokio::sync::Semaphore::new(crate::transfer::SERVE_SLOTS)),
         last_seen: Instant::now(),
         rtt_ms: None,
         hang_up: hang_up.clone(),

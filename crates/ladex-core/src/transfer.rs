@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
+use self::peer::{Fault, Peer};
+use self::uploads::UploadSlots;
 use self::wire::{ErrorCode, Fetch, GetChunks, Reply};
 use crate::availability::Have;
 use crate::bitmap::Bitmap;
@@ -18,10 +20,12 @@ use crate::types::NodeId;
 use crate::validate;
 use crate::NodeState;
 
+pub mod peer;
+pub mod uploads;
 pub mod wire;
 
 pub const MAX_REQUEST_CHUNKS: usize = 16;
-pub const SERVE_SLOTS: usize = 8;
+pub const UPLOAD_SLOTS: usize = 8;
 // A requester that opens a stream and says nothing is cut off after this.
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(10);
 // A request waits this long for an upload slot before being told the node is busy.
@@ -34,7 +38,10 @@ const EVENT_QUEUE: usize = 32;
 const READAHEAD: u32 = 16;
 // Only this many missing chunks are weighed against each other, to keep planning cheap for huge files.
 const PLANNING_WINDOW: usize = 4096;
-const ENDGAME_CHUNKS: u32 = 4;
+// The last 1% of a file, but never fewer than this many chunks...
+const ENDGAME_MIN_CHUNKS: u32 = 4;
+// ...nor more than this many, since every one of them is requested from every source.
+const ENDGAME_MAX_CHUNKS: u32 = 64;
 const MIN_DEPTH: usize = 4;
 const MAX_DEPTH: usize = 32;
 const TARGET_IN_FLIGHT_SECS: f64 = 0.5;
@@ -57,6 +64,11 @@ impl Source {
         }
         ((self.speed_bps * TARGET_IN_FLIGHT_SECS / CHUNK_SIZE as f64).ceil() as usize).clamp(MIN_DEPTH, MAX_DEPTH)
     }
+}
+
+/// How many chunks are left when the scheduler stops being economical and asks every source for each one.
+pub fn endgame_threshold(total_chunks: u32) -> u32 {
+    (total_chunks / 100).clamp(ENDGAME_MIN_CHUNKS, ENDGAME_MAX_CHUNKS).min(total_chunks)
 }
 
 // Missing chunks, most urgent first: those just ahead of a streaming reader, then rarest first.
@@ -84,7 +96,7 @@ pub fn priority_order(have: &Bitmap, readers: &[u32], sources: &[Source]) -> Vec
     order
 }
 
-// A chunk is requested twice only in endgame, so the last few come from whichever source answers first.
+// A chunk is requested from more than one source only in the endgame, when it goes to every source that can give it.
 pub fn plan(want: &[u32], in_flight: &HashMap<u32, Vec<usize>>, sources: &[Source], endgame: bool) -> Vec<(usize, u32)> {
     let mut room: Vec<usize> = sources.iter().map(|s| s.depth().saturating_sub(s.in_flight)).collect();
     let mut assigned = vec![0usize; sources.len()];
@@ -95,13 +107,12 @@ pub fn plan(want: &[u32], in_flight: &HashMap<u32, Vec<usize>>, sources: &[Sourc
         if already.is_some() && !endgame {
             continue;
         }
-        let best = (0..sources.len()).filter(|&s| room[s] > 0 && sources[s].has(index) && !already.is_some_and(|a| a.contains(&s))).max_by(
-            |&a, &b| {
-                let score = |s: usize| sources[s].speed_bps.max(1.0) / (sources[s].in_flight + assigned[s] + 1) as f64;
-                score(a).total_cmp(&score(b)).then(b.cmp(&a))
-            },
-        );
-        if let Some(s) = best {
+        let score = |s: usize, assigned: &[usize]| sources[s].speed_bps.max(1.0) / (sources[s].in_flight + assigned[s] + 1) as f64;
+        let mut candidates: Vec<usize> =
+            (0..sources.len()).filter(|&s| room[s] > 0 && sources[s].has(index) && !already.is_some_and(|a| a.contains(&s))).collect();
+        candidates.sort_by(|&a, &b| score(b, &assigned).total_cmp(&score(a, &assigned)).then(a.cmp(&b)));
+        candidates.truncate(if endgame { usize::MAX } else { 1 });
+        for s in candidates {
             room[s] -= 1;
             assigned[s] += 1;
             requests.push((s, index));
@@ -118,6 +129,8 @@ pub struct Tuning {
     pub stall_timeout: Duration,
     /// How long a request's stream may deliver no bytes before its chunks are asked for elsewhere.
     pub stream_stall_timeout: Duration,
+    /// Uploads this node runs at once, across all the peers asking.
+    pub upload_slots: usize,
 }
 
 impl Default for Tuning {
@@ -129,6 +142,7 @@ impl Default for Tuning {
             map_interval: Duration::from_secs(2),
             stall_timeout: Duration::from_secs(60),
             stream_stall_timeout: Duration::from_secs(20),
+            upload_slots: UPLOAD_SLOTS,
         }
     }
 }
@@ -138,11 +152,13 @@ enum Event {
         from: NodeId,
         index: u32,
         data: Vec<u8>,
+        arrived: Instant,
     },
-    /// The node could not give this chunk, so it is free to be requested elsewhere.
-    ChunkError {
+    /// The node did not give these chunks, so they are free to be requested elsewhere.
+    Released {
         from: NodeId,
-        index: u32,
+        indices: Vec<u32>,
+        fault: Fault,
     },
     Manifest {
         from: NodeId,
@@ -180,6 +196,7 @@ impl Drop for Reader {
 pub struct Transfers {
     downloads: Mutex<HashMap<String, Arc<Download>>>,
     tuning: Tuning,
+    uploads: UploadSlots,
 }
 
 impl Default for Transfers {
@@ -194,7 +211,8 @@ impl Transfers {
     }
 
     pub fn with_tuning(tuning: Tuning) -> Self {
-        Self { downloads: Mutex::new(HashMap::new()), tuning }
+        let uploads = UploadSlots::new(tuning.upload_slots);
+        Self { downloads: Mutex::new(HashMap::new()), tuning, uploads }
     }
 
     fn get(&self, id: &str) -> Option<Arc<Download>> {
@@ -208,6 +226,11 @@ impl Transfers {
     /// How long a request's stream may deliver nothing before it is abandoned.
     pub fn stream_stall_timeout(&self) -> Duration {
         self.tuning.stream_stall_timeout
+    }
+
+    /// The node-wide upload slots.
+    pub fn uploads(&self) -> &UploadSlots {
+        &self.uploads
     }
 
     pub fn is_downloading(&self, id: &str) -> bool {
@@ -336,11 +359,10 @@ where
     let Some(indices) = indices else {
         return refuse(&mut writer, ErrorCode::Malformed).await;
     };
-    let slots = match state.mesh_peers.read().await.get(from) {
-        Some(peer) => peer.serve_slots.clone(),
-        None => return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "not a connected peer")),
-    };
-    let Ok(Ok(_slot)) = tokio::time::timeout(SLOT_WAIT, slots.acquire_owned()).await else {
+    if !state.mesh_peers.read().await.contains_key(from) {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "not a connected peer"));
+    }
+    let Ok(_slot) = tokio::time::timeout(SLOT_WAIT, state.transfers.uploads.acquire(from)).await else {
         return refuse(&mut writer, ErrorCode::Busy).await;
     };
     let Some(blob) = state.store.get(&request.file_id) else {
@@ -373,27 +395,33 @@ async fn request_chunks(fetches: mpsc::Sender<Fetch>, events: mpsc::Sender<Event
     let (replies_tx, mut replies) = mpsc::channel(2);
     let request = GetChunks::for_indices(&file_id, &indices);
     let mut outstanding: HashSet<u32> = indices.into_iter().collect();
-    let mut released = Vec::new();
-
+    let mut missing = Vec::new();
+    let mut fault = Fault::Failed;
     if fetches.send(Fetch { request, replies: replies_tx }).await.is_ok() {
         while let Some(reply) = replies.recv().await {
             match reply {
                 // Answers for chunks nobody asked for are ignored, so a peer can't push data at us.
                 Reply::ChunkData { index, bytes } if outstanding.remove(&index) => {
-                    if events.send(Event::Chunk { from: from.clone(), index, data: bytes }).await.is_err() {
+                    let chunk = Event::Chunk { from: from.clone(), index, data: bytes, arrived: Instant::now() };
+                    if events.send(chunk).await.is_err() {
                         return;
                     }
                 }
-                Reply::Missing { index } if outstanding.remove(&index) => released.push(index),
-                Reply::Error(_) => break,
+                Reply::Missing { index } if outstanding.remove(&index) => missing.push(index),
+                Reply::Error(code) => {
+                    if code == ErrorCode::Busy {
+                        fault = Fault::Busy;
+                    }
+                    break;
+                }
                 _ => {}
             }
         }
     }
     // Whatever was not answered, whether the stream ended, failed or stalled, is free to be asked for elsewhere.
-    released.extend(outstanding);
-    for index in released {
-        if events.send(Event::ChunkError { from: from.clone(), index }).await.is_err() {
+    let unanswered: Vec<u32> = outstanding.into_iter().collect();
+    for (indices, fault) in [(missing, Fault::Missing), (unanswered, fault)] {
+        if !indices.is_empty() && events.send(Event::Released { from: from.clone(), indices, fault }).await.is_err() {
             return;
         }
     }
@@ -404,30 +432,6 @@ struct Link {
     control: mpsc::UnboundedSender<MeshMessage>,
     fetches: mpsc::Sender<Fetch>,
 }
-
-struct Peer {
-    in_flight: HashSet<u32>,
-    speed_bps: f64,
-    last_arrival: Instant,
-    bad_chunks: u32,
-    banned: bool,
-}
-
-impl Peer {
-    fn new() -> Self {
-        Self { in_flight: HashSet::new(), speed_bps: 0.0, last_arrival: Instant::now(), bad_chunks: 0, banned: false }
-    }
-
-    fn record_arrival(&mut self, bytes: usize) {
-        let now = Instant::now();
-        let seconds = now.duration_since(self.last_arrival).as_secs_f64().max(0.001);
-        let sample = bytes as f64 / seconds;
-        self.speed_bps = if self.speed_bps == 0.0 { sample } else { 0.7 * self.speed_bps + 0.3 * sample };
-        self.last_arrival = now;
-    }
-}
-
-const BAN_AFTER_BAD_CHUNKS: u32 = 2;
 
 async fn run(state: NodeState, download: Arc<Download>, mut events: mpsc::Receiver<Event>) {
     let blob = download.blob.clone();
@@ -454,20 +458,21 @@ async fn run(state: NodeState, download: Arc<Download>, mut events: mpsc::Receiv
         }
         for event in batch {
             match event {
-                Event::Chunk { from, index, data } => {
+                Event::Chunk { from, index, data, arrived } => {
                     let len = data.len();
-                    let peer = peers.entry(from.clone()).or_insert_with(Peer::new);
+                    let peer = peers.entry(from.clone()).or_insert_with(|| Peer::new(arrived));
                     peer.in_flight.remove(&index);
+                    peer.cancellable.remove(&index);
                     match blob.write_chunk_verified(index, data).await {
                         Ok(()) => {
-                            peer.record_arrival(len);
+                            peer.delivered(arrived, len);
                             last_progress = Instant::now();
+                            call_off_duplicates(&mut peers, &from, index);
                         }
                         Err(WriteError::HashMismatch) => {
-                            peer.bad_chunks += 1;
                             tracing::warn!("Transfer: {from} sent a corrupted chunk {index} of {id}");
-                            if peer.bad_chunks >= BAN_AFTER_BAD_CHUNKS {
-                                peer.banned = true;
+                            peer.sent_bad_chunk();
+                            if peer.is_banned() {
                                 tracing::warn!("Transfer: not fetching {id} from {from} any more");
                             }
                         }
@@ -475,10 +480,16 @@ async fn run(state: NodeState, download: Arc<Download>, mut events: mpsc::Receiv
                         Err(e) => tracing::warn!("Transfer: could not store chunk {index} of {id}: {e:?}"),
                     }
                 }
-                Event::ChunkError { from, index } => {
+                Event::Released { from, indices, fault } => {
                     if let Some(peer) = peers.get_mut(&from) {
-                        peer.in_flight.remove(&index);
-                        peer.speed_bps *= 0.5;
+                        for index in &indices {
+                            peer.in_flight.remove(index);
+                            peer.cancellable.remove(index);
+                        }
+                        peer.released(fault);
+                        if peer.is_banned() {
+                            tracing::warn!("Transfer: not fetching {id} from {from} any more ({fault:?})");
+                        }
                     }
                 }
                 Event::Manifest { from, hashes } => {
@@ -486,7 +497,7 @@ async fn run(state: NodeState, download: Arc<Download>, mut events: mpsc::Receiv
                         let root = blob.expected_root().unwrap_or_default();
                         if let Err(why) = blob.set_manifest(hashes, &root) {
                             tracing::warn!("Transfer: bad manifest for {id} from {from}: {why}");
-                            peers.entry(from).or_insert_with(Peer::new).banned = true;
+                            peers.entry(from).or_insert_with(|| Peer::new(Instant::now())).ban();
                         }
                     }
                 }
@@ -519,11 +530,11 @@ async fn run(state: NodeState, download: Arc<Download>, mut events: mpsc::Receiv
             .map(|(n, h)| (n.clone(), Link { control: h.sender.clone(), fetches: h.fetches.clone() }))
             .collect();
         let holders: HashSet<NodeId> = state.availability.hosts(&id).into_iter().collect();
-        peers.retain(|node, p| connected.contains_key(node) || p.banned);
+        peers.retain(|node, p| connected.contains_key(node) || p.is_banned());
 
         if !blob.has_manifest() {
             if manifest_asked.is_none_or(|t| t.elapsed() > tuning.manifest_retry) {
-                let holder = holders.iter().find(|n| connected.contains_key(*n) && !peers.get(*n).is_some_and(|p| p.banned));
+                let holder = holders.iter().find(|n| connected.contains_key(*n) && !peers.get(*n).is_some_and(Peer::is_banned));
                 if let Some(node) = holder {
                     let _ = connected[node].control.send(MeshMessage::GetManifest { file_id: id.clone() });
                     manifest_asked = Some(Instant::now());
@@ -534,8 +545,8 @@ async fn run(state: NodeState, download: Arc<Download>, mut events: mpsc::Receiv
             let mut sources: Vec<Source> = Vec::new();
             let mut source_nodes: Vec<NodeId> = Vec::new();
             for node in connected.keys() {
-                let peer = peers.entry(node.clone()).or_insert_with(Peer::new);
-                if peer.banned {
+                let peer = peers.entry(node.clone()).or_insert_with(|| Peer::new(Instant::now()));
+                if peer.is_banned() {
                     continue;
                 }
                 let has = match state.availability.get(node, &id) {
@@ -555,25 +566,29 @@ async fn run(state: NodeState, download: Arc<Download>, mut events: mpsc::Receiv
             }
             let readers: Vec<u32> = download.readers.lock().unwrap().values().copied().collect();
             let want = priority_order(&have, &readers, &sources);
-            let endgame = have.len() - have.count() <= ENDGAME_CHUNKS.min(chunk_count(blob.size()));
+            let endgame = have.len() - have.count() <= endgame_threshold(chunk_count(blob.size()));
             let mut per_source: HashMap<usize, Vec<u32>> = HashMap::new();
             for (s, index) in plan(&want, &in_flight, &sources, endgame) {
                 per_source.entry(s).or_default().push(index);
             }
             for (s, indices) in per_source {
                 let node = &source_nodes[s];
-                for group in indices.chunks(MAX_REQUEST_CHUNKS) {
+                // With several sources, each endgame request asks for one chunk so it can be called off alone.
+                let group_size = if endgame && source_nodes.len() > 1 { 1 } else { MAX_REQUEST_CHUNKS };
+                for group in indices.chunks(group_size) {
                     let peer = peers.get_mut(node).unwrap();
-                    for index in group {
-                        peer.in_flight.insert(*index);
-                    }
-                    tokio::spawn(request_chunks(
+                    peer.request_started(Instant::now());
+                    peer.in_flight.extend(group);
+                    let request = tokio::spawn(request_chunks(
                         connected[node].fetches.clone(),
                         download.events.clone(),
                         node.clone(),
                         id.clone(),
                         group.to_vec(),
                     ));
+                    if let [index] = group {
+                        peer.cancellable.insert(*index, request.abort_handle());
+                    }
                 }
             }
         }
@@ -589,6 +604,17 @@ async fn run(state: NodeState, download: Arc<Download>, mut events: mpsc::Receiv
         if download.readers.lock().unwrap().is_empty() && last_progress.elapsed() > tuning.idle_exit {
             tracing::info!("Transfer: giving up on {id} for now (no progress)");
             return finish(&state, &id, &download);
+        }
+    }
+}
+
+// A chunk arrived, so requests for it still running at other nodes are dropped, which stops those nodes sending it.
+fn call_off_duplicates(peers: &mut HashMap<NodeId, Peer>, delivered_by: &NodeId, index: u32) {
+    for (node, peer) in peers.iter_mut().filter(|(node, _)| *node != delivered_by) {
+        if let Some(request) = peer.cancellable.remove(&index) {
+            request.abort();
+            peer.in_flight.remove(&index);
+            tracing::trace!("Transfer: called off chunk {index} at {node}");
         }
     }
 }
@@ -733,7 +759,6 @@ mod tests {
                 addr: "127.0.0.1:1".parse().unwrap(),
                 sender: control_tx,
                 fetches: fetches_tx,
-                serve_slots: Arc::new(tokio::sync::Semaphore::new(SERVE_SLOTS)),
                 last_seen: Instant::now(),
                 rtt_ms: None,
                 hang_up: Default::default(),
@@ -967,8 +992,10 @@ mod tests {
         let [a, b] = nodes(["node_a", "node_b"]);
         link(&a, &b, None).await;
         share(&a, &[], "file_x", &data_pattern(100, 14)).await;
-        let slots = a.mesh_peers.read().await["node_b"].serve_slots.clone();
-        let _taken = slots.acquire_many_owned(SERVE_SLOTS as u32).await.unwrap();
+        let mut taken = Vec::new();
+        for _ in 0..UPLOAD_SLOTS {
+            taken.push(a.transfers.uploads().acquire(&"node_c".to_string()).await);
+        }
 
         let replies = ask(&a, "node_b", GetChunks::for_indices("file_x", &[0])).await;
 
@@ -1015,7 +1042,84 @@ mod tests {
         asking.await.unwrap();
 
         assert!(matches!(events.recv().await, Some(Event::Chunk { index: 1, .. })));
-        assert!(matches!(events.recv().await, Some(Event::ChunkError { index: 2, .. })));
+        let Some(Event::Released { indices, fault, .. }) = events.recv().await else { panic!("no release") };
+        assert_eq!((indices, fault), (vec![2], Fault::Failed));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn chunks_a_peer_says_it_lacks_are_released_as_missing() {
+        let (fetches_tx, mut fetches) = mpsc::channel::<Fetch>(1);
+        let (events_tx, mut events) = mpsc::channel(8);
+        let asking = tokio::spawn(request_chunks(fetches_tx, events_tx, "node_a".into(), "file_x".into(), vec![1]));
+
+        let fetch = fetches.recv().await.unwrap();
+        fetch.replies.send(Reply::Missing { index: 1 }).await.unwrap();
+        drop(fetch);
+        asking.await.unwrap();
+
+        let Some(Event::Released { indices, fault, .. }) = events.recv().await else { panic!("no release") };
+        assert_eq!((indices, fault), (vec![1], Fault::Missing));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_busy_peer_releases_its_chunks_as_busy_not_failed() {
+        let (fetches_tx, mut fetches) = mpsc::channel::<Fetch>(1);
+        let (events_tx, mut events) = mpsc::channel(8);
+        let asking = tokio::spawn(request_chunks(fetches_tx, events_tx, "node_a".into(), "file_x".into(), vec![1, 2]));
+
+        let fetch = fetches.recv().await.unwrap();
+        fetch.replies.send(Reply::Error(ErrorCode::Busy)).await.unwrap();
+        asking.await.unwrap();
+
+        let Some(Event::Released { fault, .. }) = events.recv().await else { panic!("no release") };
+        assert_eq!(fault, Fault::Busy);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_first_copy_of_a_chunk_calls_off_the_requests_for_it_at_other_nodes() {
+        let pending = tokio::spawn(std::future::pending::<()>());
+        let mut peers: HashMap<NodeId, Peer> = HashMap::new();
+        let mut slow = Peer::new(Instant::now());
+        slow.in_flight.insert(7);
+        slow.cancellable.insert(7, pending.abort_handle());
+        peers.insert("slow".to_string(), slow);
+        peers.insert("fast".to_string(), Peer::new(Instant::now()));
+
+        call_off_duplicates(&mut peers, &"fast".to_string(), 7);
+
+        assert!(pending.await.unwrap_err().is_cancelled());
+        assert!(peers["slow"].in_flight.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_node_that_delivered_a_chunk_is_not_called_off() {
+        let pending = tokio::spawn(std::future::pending::<()>());
+        let mut fast = Peer::new(Instant::now());
+        fast.cancellable.insert(7, pending.abort_handle());
+        let mut peers: HashMap<NodeId, Peer> = HashMap::from([("fast".to_string(), fast)]);
+
+        call_off_duplicates(&mut peers, &"fast".to_string(), 7);
+
+        assert!(!pending.is_finished());
+        pending.abort();
+    }
+
+    #[test]
+    fn the_endgame_is_the_last_percent_of_a_file_within_limits() {
+        assert_eq!(endgame_threshold(2), 2);
+        assert_eq!(endgame_threshold(100), 4);
+        assert_eq!(endgame_threshold(1000), 10);
+        assert_eq!(endgame_threshold(100_000), 64);
+    }
+
+    #[test]
+    fn in_the_endgame_every_source_that_can_is_asked_for_each_chunk() {
+        let sources = [source("a", None, 10, 0, 0.0), source("b", None, 10, 0, 0.0), source("c", Some(&[1]), 10, 0, 0.0)];
+
+        let mut got = plan(&[0, 1], &HashMap::new(), &sources, true);
+        got.sort();
+
+        assert_eq!(got, [(0, 0), (0, 1), (1, 0), (1, 1), (2, 1)]);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1080,7 +1184,7 @@ mod tests {
         assert_eq!(read_all(&blob).await, content);
         let (n_a, n_c) = (from_a.load(Ordering::Relaxed), from_c.load(Ordering::Relaxed));
         assert!(n_a > 0 && n_c > 0, "both sources should have served chunks (a: {n_a}, c: {n_c})");
-        assert!((24..=24 + ENDGAME_CHUNKS as usize).contains(&(n_a + n_c)), "frames: {}", n_a + n_c);
+        assert!((24..=24 + endgame_threshold(24) as usize).contains(&(n_a + n_c)), "frames: {}", n_a + n_c);
     }
 
     #[tokio::test(flavor = "multi_thread")]

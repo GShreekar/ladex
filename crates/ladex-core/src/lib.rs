@@ -178,6 +178,7 @@ impl NodeState {
                 map_interval: Duration::from_millis(100),
                 stall_timeout: Duration::from_secs(5),
                 stream_stall_timeout: Duration::from_secs(10),
+                upload_slots: transfer::UPLOAD_SLOTS,
             })),
             catalog: Arc::new(catalog::shared::SharedCatalog::open(&data_dir, state::MAX_CATALOG_ENTRIES).unwrap()),
             session_owners: Arc::new(RwLock::new(HashMap::new())),

@@ -273,12 +273,17 @@ where
     let mut reader = StallGuard::new(reader, stall_timeout);
     write_request(&mut writer, request).await?;
     writer.shutdown().await?;
-    while let Some(reply) = read_reply(&mut reader).await? {
+    // Once the receiver is gone, returning drops the stream, which tells the serving node to stop.
+    loop {
+        let reply = tokio::select! {
+            reply = read_reply(&mut reader) => reply?,
+            () = replies.closed() => return Ok(()),
+        };
+        let Some(reply) = reply else { return Ok(()) };
         if replies.send(reply).await.is_err() {
-            break;
+            return Ok(());
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -445,6 +450,20 @@ mod tests {
 
         fetched.unwrap();
         assert_eq!(rx.recv().await, Some(Reply::ChunkData { index: 0, bytes: vec![9; 100] }));
+    }
+
+    #[tokio::test]
+    async fn fetching_stops_as_soon_as_the_receiver_is_gone() {
+        let (server_end, client_end) = tokio::io::duplex(1024);
+        let (reader, writer) = tokio::io::split(client_end);
+        let (tx, rx) = mpsc::channel(1);
+        let fetching =
+            tokio::spawn(async move { fetch_stream(reader, writer, &request("f", &[(0, 1)]), tx, Duration::from_secs(60)).await });
+
+        drop(rx);
+
+        assert!(fetching.await.unwrap().is_ok());
+        drop(server_end);
     }
 
     #[tokio::test]
