@@ -117,6 +117,16 @@ fn write_all_at(file: &File, mut buf: &[u8], mut offset: u64) -> io::Result<()> 
     Ok(())
 }
 
+// Hashing a 1 MiB chunk is real work, so it runs on the blocking pool and the network tasks never wait for it.
+async fn hash_off_thread(data: Vec<u8>) -> Result<(Vec<u8>, ChunkHash), WriteError> {
+    tokio::task::spawn_blocking(move || {
+        let hash = hash_chunk(&data);
+        (data, hash)
+    })
+    .await
+    .map_err(|e| WriteError::Io(e.to_string()))
+}
+
 struct State {
     have: Bitmap,
     hashes: Vec<ChunkHash>,
@@ -376,7 +386,7 @@ impl Blob {
     /// Upload path: the sender is the source of truth, so the hash is computed here.
     pub async fn write_chunk_hashing(&self, index: u32, data: Vec<u8>) -> Result<ChunkHash, WriteError> {
         self.check_chunk(index, data.len())?;
-        let hash = hash_chunk(&data);
+        let (data, hash) = hash_off_thread(data).await?;
         self.write_at(index, data, hash).await?;
         Ok(hash)
     }
@@ -394,7 +404,7 @@ impl Blob {
             }
             state.hashes[index as usize]
         };
-        let hash = hash_chunk(&data);
+        let (data, hash) = hash_off_thread(data).await?;
         if hash != expected {
             return Err(WriteError::HashMismatch);
         }

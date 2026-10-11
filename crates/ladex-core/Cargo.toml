@@ -54,5 +54,6 @@ rustls.workspace = true
 ladex-core = { path = ".", features = ["test-support"] }
 proptest.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 warp = { workspace = true, features = ["test"] }

@@ -172,12 +172,12 @@ impl NodeState {
             availability: Arc::new(availability::Availability::default()),
             store: Arc::new(store::Store::open(&data_dir, 1 << 40).unwrap()),
             transfers: Arc::new(transfer::Transfers::with_tuning(transfer::Tuning {
-                request_timeout: Duration::from_millis(400),
                 manifest_retry: Duration::from_millis(400),
                 tick: Duration::from_millis(20),
                 idle_exit: Duration::from_secs(30),
                 map_interval: Duration::from_millis(100),
                 stall_timeout: Duration::from_secs(5),
+                stream_stall_timeout: Duration::from_secs(10),
             })),
             catalog: Arc::new(catalog::shared::SharedCatalog::open(&data_dir, state::MAX_CATALOG_ENTRIES).unwrap()),
             session_owners: Arc::new(RwLock::new(HashMap::new())),

@@ -1,12 +1,15 @@
 //! Moves file chunks between nodes, verified against the manifest and fetched from every holder in parallel.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
+use self::wire::{ErrorCode, Fetch, GetChunks, Reply};
 use crate::availability::Have;
 use crate::bitmap::Bitmap;
 use crate::mesh::MeshMessage;
@@ -15,29 +18,18 @@ use crate::types::NodeId;
 use crate::validate;
 use crate::NodeState;
 
-const FRAME_CHUNK: u8 = 1;
+pub mod wire;
+
 pub const MAX_REQUEST_CHUNKS: usize = 16;
 pub const SERVE_SLOTS: usize = 8;
-
-pub fn encode_chunk_frame(file_id: &str, index: u32, data: &[u8]) -> Vec<u8> {
-    let mut frame = Vec::with_capacity(data.len() + file_id.len() + 6);
-    frame.push(FRAME_CHUNK);
-    frame.push(file_id.len() as u8);
-    frame.extend_from_slice(file_id.as_bytes());
-    frame.extend_from_slice(&index.to_be_bytes());
-    frame.extend_from_slice(data);
-    frame
-}
-
-pub fn decode_chunk_frame(frame: &[u8]) -> Option<(&str, u32, &[u8])> {
-    if *frame.first()? != FRAME_CHUNK {
-        return None;
-    }
-    let id_len = *frame.get(1)? as usize;
-    let id = std::str::from_utf8(frame.get(2..2 + id_len)?).ok()?;
-    let index = u32::from_be_bytes(frame.get(2 + id_len..6 + id_len)?.try_into().ok()?);
-    Some((id, index, &frame[6 + id_len..]))
-}
+// A requester that opens a stream and says nothing is cut off after this.
+const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(10);
+// A request waits this long for an upload slot before being told the node is busy.
+const SLOT_WAIT: Duration = Duration::from_secs(5);
+// A requester that stops reading for this long loses its stream and the upload slot it held.
+const SERVE_STALL_TIMEOUT: Duration = Duration::from_secs(60);
+// Chunks are 1 MiB each, so this bounds the memory held by chunks that arrived but are not yet written.
+const EVENT_QUEUE: usize = 32;
 
 const READAHEAD: u32 = 16;
 // Only this many missing chunks are weighed against each other, to keep planning cheap for huge files.
@@ -119,31 +111,43 @@ pub fn plan(want: &[u32], in_flight: &HashMap<u32, Vec<usize>>, sources: &[Sourc
 }
 
 pub struct Tuning {
-    pub request_timeout: Duration,
     pub manifest_retry: Duration,
     pub tick: Duration,
     pub idle_exit: Duration,
     pub map_interval: Duration,
     pub stall_timeout: Duration,
+    /// How long a request's stream may deliver no bytes before its chunks are asked for elsewhere.
+    pub stream_stall_timeout: Duration,
 }
 
 impl Default for Tuning {
     fn default() -> Self {
         Self {
-            request_timeout: Duration::from_secs(20),
             manifest_retry: Duration::from_secs(10),
             tick: Duration::from_millis(250),
             idle_exit: Duration::from_secs(600),
             map_interval: Duration::from_secs(2),
             stall_timeout: Duration::from_secs(60),
+            stream_stall_timeout: Duration::from_secs(20),
         }
     }
 }
 
 enum Event {
-    Chunk { from: NodeId, index: u32, data: Vec<u8> },
-    ChunkError { from: NodeId, index: u32 },
-    Manifest { from: NodeId, hashes: Vec<ChunkHash> },
+    Chunk {
+        from: NodeId,
+        index: u32,
+        data: Vec<u8>,
+    },
+    /// The node could not give this chunk, so it is free to be requested elsewhere.
+    ChunkError {
+        from: NodeId,
+        index: u32,
+    },
+    Manifest {
+        from: NodeId,
+        hashes: Vec<ChunkHash>,
+    },
     Wake,
 }
 
@@ -201,6 +205,11 @@ impl Transfers {
         self.tuning.stall_timeout
     }
 
+    /// How long a request's stream may deliver nothing before it is abandoned.
+    pub fn stream_stall_timeout(&self) -> Duration {
+        self.tuning.stream_stall_timeout
+    }
+
     pub fn is_downloading(&self, id: &str) -> bool {
         self.downloads.lock().unwrap().contains_key(id)
     }
@@ -249,7 +258,7 @@ pub async fn ensure_file(state: &NodeState, id: &str) -> Result<Arc<Blob>, Fetch
         return Ok(blob);
     }
 
-    let (events, receiver) = mpsc::channel(512);
+    let (events, receiver) = mpsc::channel(EVENT_QUEUE);
     let download = Arc::new(Download {
         blob: blob.clone(),
         events,
@@ -294,19 +303,6 @@ pub fn sources_changed(state: &NodeState) {
     }
 }
 
-pub fn on_binary_frame(state: &NodeState, from: &NodeId, frame: &[u8]) {
-    let Some((file_id, index, data)) = decode_chunk_frame(frame) else { return };
-    if let Some(download) = state.transfers.get(file_id) {
-        let _ = download.events.try_send(Event::Chunk { from: from.clone(), index, data: data.to_vec() });
-    }
-}
-
-pub fn on_chunk_error(state: &NodeState, from: &NodeId, file_id: &str, index: u32) {
-    if let Some(download) = state.transfers.get(file_id) {
-        let _ = download.events.try_send(Event::ChunkError { from: from.clone(), index });
-    }
-}
-
 pub fn on_manifest(state: &NodeState, from: &NodeId, file_id: &str, hashes_hex: &str) {
     let Some(download) = state.transfers.get(file_id) else { return };
     let Ok(raw) = hex::decode(hashes_hex) else { return };
@@ -327,47 +323,90 @@ pub async fn serve_manifest(state: &NodeState, to: &NodeId, file_id: &str) {
     }
 }
 
-// Each frame goes through the peer's bounded queue, so this waits whenever the link is behind.
-pub async fn serve_chunks(state: &NodeState, to: &NodeId, file_id: &str, indices: Vec<u32>) {
-    if !validate::is_valid_id(file_id) || indices.len() > MAX_REQUEST_CHUNKS {
-        return;
-    }
-    let (control, data, slots) = match state.mesh_peers.read().await.get(to) {
-        Some(peer) => (peer.sender.clone(), peer.data.clone(), peer.serve_slots.clone()),
-        None => return,
+/// Answers one request stream from a peer: every requested chunk that is held, then the end of the stream.
+pub async fn serve_stream<R, W>(state: &NodeState, from: &NodeId, mut reader: R, mut writer: W) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let read = tokio::time::timeout(REQUEST_READ_TIMEOUT, wire::read_request(&mut reader)).await;
+    let request = read.map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))??;
+
+    let indices = request.indices(MAX_REQUEST_CHUNKS).filter(|_| validate::is_valid_id(&request.file_id));
+    let Some(indices) = indices else {
+        return refuse(&mut writer, ErrorCode::Malformed).await;
     };
-    let reject = |reason: &str, indices: &[u32]| {
-        for &index in indices {
-            let _ = control.send(MeshMessage::ChunkError { file_id: file_id.to_string(), index, reason: reason.to_string() });
-        }
+    let slots = match state.mesh_peers.read().await.get(from) {
+        Some(peer) => peer.serve_slots.clone(),
+        None => return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "not a connected peer")),
     };
-    let Ok(permit) = slots.try_acquire_owned() else {
-        return reject("busy", &indices);
+    let Ok(Ok(_slot)) = tokio::time::timeout(SLOT_WAIT, slots.acquire_owned()).await else {
+        return refuse(&mut writer, ErrorCode::Busy).await;
     };
-    let Some(blob) = state.store.get(file_id) else {
-        return reject("not found", &indices);
+    let Some(blob) = state.store.get(&request.file_id) else {
+        return refuse(&mut writer, ErrorCode::NotFound).await;
     };
 
-    let file_id = file_id.to_string();
-    tokio::spawn(async move {
-        let _permit = permit;
-        for index in indices {
-            match blob.read_chunk_verified(index).await {
-                Ok(bytes) => {
-                    if data.send(encode_chunk_frame(&file_id, index, &bytes)).await.is_err() {
+    for index in indices {
+        let held = if index < blob.chunk_count() { blob.read_chunk_verified(index).await.ok() } else { None };
+        let reply = match held {
+            Some(bytes) => Reply::ChunkData { index, bytes },
+            None => Reply::Missing { index },
+        };
+        within_stall_limit(wire::write_reply(&mut writer, &reply)).await?;
+    }
+    within_stall_limit(writer.shutdown()).await
+}
+
+// A requester that stops reading would otherwise hold an upload slot forever.
+async fn within_stall_limit<T>(write: impl Future<Output = std::io::Result<T>>) -> std::io::Result<T> {
+    tokio::time::timeout(SERVE_STALL_TIMEOUT, write).await.map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))?
+}
+
+async fn refuse<W: AsyncWrite + Unpin>(writer: &mut W, code: ErrorCode) -> std::io::Result<()> {
+    wire::write_reply(writer, &Reply::Error(code)).await?;
+    writer.shutdown().await
+}
+
+/// Asks a peer for chunks over a stream of its own and turns what comes back into download events.
+async fn request_chunks(fetches: mpsc::Sender<Fetch>, events: mpsc::Sender<Event>, from: NodeId, file_id: String, indices: Vec<u32>) {
+    let (replies_tx, mut replies) = mpsc::channel(2);
+    let request = GetChunks::for_indices(&file_id, &indices);
+    let mut outstanding: HashSet<u32> = indices.into_iter().collect();
+    let mut released = Vec::new();
+
+    if fetches.send(Fetch { request, replies: replies_tx }).await.is_ok() {
+        while let Some(reply) = replies.recv().await {
+            match reply {
+                // Answers for chunks nobody asked for are ignored, so a peer can't push data at us.
+                Reply::ChunkData { index, bytes } if outstanding.remove(&index) => {
+                    if events.send(Event::Chunk { from: from.clone(), index, data: bytes }).await.is_err() {
                         return;
                     }
                 }
-                Err(_) => {
-                    let _ = control.send(MeshMessage::ChunkError { file_id: file_id.clone(), index, reason: "not available".into() });
-                }
+                Reply::Missing { index } if outstanding.remove(&index) => released.push(index),
+                Reply::Error(_) => break,
+                _ => {}
             }
         }
-    });
+    }
+    // Whatever was not answered, whether the stream ended, failed or stalled, is free to be asked for elsewhere.
+    released.extend(outstanding);
+    for index in released {
+        if events.send(Event::ChunkError { from: from.clone(), index }).await.is_err() {
+            return;
+        }
+    }
+}
+
+// How the scheduler reaches a connected peer: control messages, and streams for chunk requests.
+struct Link {
+    control: mpsc::UnboundedSender<MeshMessage>,
+    fetches: mpsc::Sender<Fetch>,
 }
 
 struct Peer {
-    in_flight: HashMap<u32, Instant>,
+    in_flight: HashSet<u32>,
     speed_bps: f64,
     last_arrival: Instant,
     bad_chunks: u32,
@@ -376,7 +415,7 @@ struct Peer {
 
 impl Peer {
     fn new() -> Self {
-        Self { in_flight: HashMap::new(), speed_bps: 0.0, last_arrival: Instant::now(), bad_chunks: 0, banned: false }
+        Self { in_flight: HashSet::new(), speed_bps: 0.0, last_arrival: Instant::now(), bad_chunks: 0, banned: false }
     }
 
     fn record_arrival(&mut self, bytes: usize) {
@@ -418,9 +457,7 @@ async fn run(state: NodeState, download: Arc<Download>, mut events: mpsc::Receiv
                 Event::Chunk { from, index, data } => {
                     let len = data.len();
                     let peer = peers.entry(from.clone()).or_insert_with(Peer::new);
-                    if peer.in_flight.remove(&index).is_none() {
-                        continue;
-                    }
+                    peer.in_flight.remove(&index);
                     match blob.write_chunk_verified(index, data).await {
                         Ok(()) => {
                             peer.record_arrival(len);
@@ -474,8 +511,13 @@ async fn run(state: NodeState, download: Arc<Download>, mut events: mpsc::Receiv
             return finish(&state, &id, &download);
         }
 
-        let connected: HashMap<NodeId, mpsc::UnboundedSender<MeshMessage>> =
-            state.mesh_peers.read().await.iter().map(|(n, h)| (n.clone(), h.sender.clone())).collect();
+        let connected: HashMap<NodeId, Link> = state
+            .mesh_peers
+            .read()
+            .await
+            .iter()
+            .map(|(n, h)| (n.clone(), Link { control: h.sender.clone(), fetches: h.fetches.clone() }))
+            .collect();
         let holders: HashSet<NodeId> = state.availability.hosts(&id).into_iter().collect();
         peers.retain(|node, p| connected.contains_key(node) || p.banned);
 
@@ -483,19 +525,11 @@ async fn run(state: NodeState, download: Arc<Download>, mut events: mpsc::Receiv
             if manifest_asked.is_none_or(|t| t.elapsed() > tuning.manifest_retry) {
                 let holder = holders.iter().find(|n| connected.contains_key(*n) && !peers.get(*n).is_some_and(|p| p.banned));
                 if let Some(node) = holder {
-                    let _ = connected[node].send(MeshMessage::GetManifest { file_id: id.clone() });
+                    let _ = connected[node].control.send(MeshMessage::GetManifest { file_id: id.clone() });
                     manifest_asked = Some(Instant::now());
                 }
             }
         } else {
-            for peer in peers.values_mut() {
-                let before = peer.in_flight.len();
-                peer.in_flight.retain(|_, asked| asked.elapsed() < tuning.request_timeout);
-                if peer.in_flight.len() < before {
-                    peer.speed_bps *= 0.5;
-                }
-            }
-
             let have = blob.bitmap();
             let mut sources: Vec<Source> = Vec::new();
             let mut source_nodes: Vec<NodeId> = Vec::new();
@@ -515,7 +549,7 @@ async fn run(state: NodeState, download: Arc<Download>, mut events: mpsc::Receiv
 
             let mut in_flight: HashMap<u32, Vec<usize>> = HashMap::new();
             for (s, node) in source_nodes.iter().enumerate() {
-                for index in peers[node].in_flight.keys() {
+                for index in &peers[node].in_flight {
                     in_flight.entry(*index).or_default().push(s);
                 }
             }
@@ -531,9 +565,15 @@ async fn run(state: NodeState, download: Arc<Download>, mut events: mpsc::Receiv
                 for group in indices.chunks(MAX_REQUEST_CHUNKS) {
                     let peer = peers.get_mut(node).unwrap();
                     for index in group {
-                        peer.in_flight.insert(*index, Instant::now());
+                        peer.in_flight.insert(*index);
                     }
-                    let _ = connected[node].send(MeshMessage::GetChunks { file_id: id.clone(), indices: group.to_vec() });
+                    tokio::spawn(request_chunks(
+                        connected[node].fetches.clone(),
+                        download.events.clone(),
+                        node.clone(),
+                        id.clone(),
+                        group.to_vec(),
+                    ));
                 }
             }
         }
@@ -541,8 +581,8 @@ async fn run(state: NodeState, download: Arc<Download>, mut events: mpsc::Receiv
         let have = blob.bitmap();
         if have.count() != last_map.1 && last_map.0.elapsed() >= tuning.map_interval {
             last_map = (Instant::now(), have.count());
-            for sender in connected.values() {
-                let _ = sender.send(MeshMessage::Have { file_id: id.clone(), chunks: have.len(), bitmap: have.to_hex() });
+            for link in connected.values() {
+                let _ = link.control.send(MeshMessage::Have { file_id: id.clone(), chunks: have.len(), bitmap: have.to_hex() });
             }
         }
 
@@ -568,6 +608,7 @@ mod tests {
     use crate::identity::Identity;
     use crate::manifest::root_of;
     use crate::mesh::{dispatch, MeshPeerHandle};
+    use crate::transfer::wire::{ChunkRange, ErrorCode};
 
     #[test]
     fn a_download_gives_up_after_sixty_seconds_without_progress() {
@@ -592,16 +633,6 @@ mod tests {
             map.set(*c);
         }
         map
-    }
-
-    #[test]
-    fn chunk_frames_round_trip() {
-        let frame = encode_chunk_frame("file_abc", 70_000, b"payload");
-        assert_eq!(decode_chunk_frame(&frame), Some(("file_abc", 70_000, &b"payload"[..])));
-        assert_eq!(decode_chunk_frame(&encode_chunk_frame("f", 0, b"")), Some(("f", 0, &b""[..])));
-        for bad in [&[][..], &[2, 1, b'a', 0, 0, 0, 0][..], &[1, 9, b'a'][..], &[1, 1, 0xff, 0, 0, 0, 0][..], &[1][..]] {
-            assert_eq!(decode_chunk_frame(bad), None, "{bad:?}");
-        }
     }
 
     #[test]
@@ -681,52 +712,77 @@ mod tests {
         assert_eq!((to_a, planned.len() - to_a), (4, 4));
     }
 
-    type Tamper = Arc<dyn Fn(&mut Vec<u8>) -> bool + Send + Sync>;
+    // Sees every reply a node serves; returning false withholds it and leaves the requester waiting in silence.
+    type Tamper = Arc<dyn Fn(&mut Reply) -> bool + Send + Sync>;
+
+    const STALL: Duration = Duration::from_secs(2);
 
     fn data_pattern(len: usize, seed: u8) -> Vec<u8> {
         (0..len).map(|i| ((i * 7) as u8).wrapping_add(seed).wrapping_add((i >> 16) as u8)).collect()
     }
 
-    async fn connect_one_way(from: &NodeState, to: &NodeState, tamper: Option<Tamper>) {
+    // Makes `client` reach `server` through in-process streams that run the real request and serving code.
+    async fn connect_one_way(client: &NodeState, server: &NodeState, tamper: Option<Tamper>) {
         let (control_tx, mut control_rx) = mpsc::unbounded_channel::<MeshMessage>();
-        let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(8);
-        from.mesh_peers.write().await.insert(
-            to.node_id.clone(),
+        let (fetches_tx, mut fetches_rx) = mpsc::channel::<Fetch>(16);
+        client.mesh_peers.write().await.insert(
+            server.node_id.clone(),
             MeshPeerHandle {
-                node_id: to.node_id.clone(),
-                node_name: to.node_name.clone(),
+                node_id: server.node_id.clone(),
+                node_name: server.node_name.clone(),
                 addr: "127.0.0.1:1".parse().unwrap(),
                 sender: control_tx,
-                data: data_tx,
+                fetches: fetches_tx,
                 serve_slots: Arc::new(tokio::sync::Semaphore::new(SERVE_SLOTS)),
                 last_seen: Instant::now(),
                 rtt_ms: None,
                 hang_up: Default::default(),
-                dialer: from.node_id.clone(),
+                dialer: client.node_id.clone(),
             },
         );
-        let (receiver, from_id) = (to.clone(), from.node_id.clone());
         tokio::spawn({
-            let (receiver, from_id) = (receiver.clone(), from_id.clone());
+            let (server, client_id) = (server.clone(), client.node_id.clone());
             async move {
                 while let Some(message) = control_rx.recv().await {
-                    dispatch(&message, &from_id, &receiver).await;
+                    dispatch(&message, &client_id, &server).await;
                 }
             }
         });
+        let (server, client_id) = (server.clone(), client.node_id.clone());
         tokio::spawn(async move {
-            while let Some(mut frame) = data_rx.recv().await {
-                if tamper.as_ref().is_some_and(|t| !t(&mut frame)) {
-                    continue;
-                }
-                on_binary_frame(&receiver, &from_id, &frame);
+            while let Some(fetch) = fetches_rx.recv().await {
+                tokio::spawn(stream_through(server.clone(), client_id.clone(), fetch, tamper.clone()));
             }
         });
     }
 
+    async fn stream_through(server: NodeState, client_id: NodeId, fetch: Fetch, tamper: Option<Tamper>) {
+        let (client_end, server_end) = tokio::io::duplex(256 * 1024);
+        let (server_reader, server_writer) = tokio::io::split(server_end);
+        let (client_reader, client_writer) = tokio::io::split(client_end);
+        tokio::spawn(async move { serve_stream(&server, &client_id, server_reader, server_writer).await });
+        let (served_tx, mut served) = mpsc::channel(2);
+        tokio::spawn(async move { wire::fetch_stream(client_reader, client_writer, &fetch.request, served_tx, STALL).await });
+        let mut withheld = false;
+        while let Some(mut reply) = served.recv().await {
+            if tamper.as_ref().is_some_and(|tamper| !tamper(&mut reply)) {
+                withheld = true;
+                continue;
+            }
+            if fetch.replies.send(reply).await.is_err() {
+                return;
+            }
+        }
+        if withheld {
+            // The requester gives up on a stream that stays silent, which closes it from this end.
+            tokio::time::sleep(STALL).await;
+        }
+    }
+
+    // `a` serves `b`, and chunks `a` sends pass through `tamper_a_to_b`.
     async fn link(a: &NodeState, b: &NodeState, tamper_a_to_b: Option<Tamper>) {
-        connect_one_way(a, b, tamper_a_to_b).await;
-        connect_one_way(b, a, None).await;
+        connect_one_way(b, a, tamper_a_to_b).await;
+        connect_one_way(a, b, None).await;
     }
 
     // Lists the entry in each node's catalog, as the mesh would after a publisher's add reached them.
@@ -799,6 +855,169 @@ mod tests {
         names.map(|n| NodeState::for_tests_node(n, None))
     }
 
+    // What `server` answers `client_id` when it asks over one stream, ending when the stream does.
+    async fn ask(server: &NodeState, client_id: &str, request: GetChunks) -> Vec<Reply> {
+        let (client_end, server_end) = tokio::io::duplex(64 * 1024);
+        let (server_reader, server_writer) = tokio::io::split(server_end);
+        let (client_reader, client_writer) = tokio::io::split(client_end);
+        let (replies_tx, mut replies) = mpsc::channel(64);
+        let asking = wire::fetch_stream(client_reader, client_writer, &request, replies_tx, Duration::from_secs(60));
+        let client_id = client_id.to_string();
+        let serving = serve_stream(server, &client_id, server_reader, server_writer);
+        let (asked, _) = tokio::join!(asking, serving);
+        asked.unwrap();
+        let mut got = Vec::new();
+        while let Ok(reply) = replies.try_recv() {
+            got.push(reply);
+        }
+        got
+    }
+
+    fn chunk_of(content: &[u8], index: u32) -> Vec<u8> {
+        let start = index as usize * CHUNK_SIZE as usize;
+        content[start..(start + CHUNK_SIZE as usize).min(content.len())].to_vec()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_request_is_answered_with_each_chunk_asked_for_in_order() {
+        let [a, b] = nodes(["node_a", "node_b"]);
+        link(&a, &b, None).await;
+        let content = data_pattern(4 * CHUNK_SIZE as usize + 10, 9);
+        share(&a, &[], "file_x", &content).await;
+
+        let replies = ask(&a, "node_b", GetChunks::for_indices("file_x", &[4, 1, 2])).await;
+
+        let chunk = |index| Reply::ChunkData { index, bytes: chunk_of(&content, index) };
+        assert_eq!(replies, [chunk(1), chunk(2), chunk(4)]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn chunks_a_node_does_not_hold_yet_are_reported_missing_while_the_rest_are_served() {
+        let [a, b] = nodes(["node_a", "node_b"]);
+        link(&a, &b, None).await;
+        let content = data_pattern(3 * CHUNK_SIZE as usize, 10);
+        let partial = a.store.create_with("file_x", content.len() as u64, Origin::Cached).unwrap();
+        partial.write_chunk_hashing(1, chunk_of(&content, 1)).await.unwrap();
+
+        let replies = ask(&a, "node_b", GetChunks::for_indices("file_x", &[0, 1, 2])).await;
+
+        assert_eq!(
+            replies,
+            [Reply::Missing { index: 0 }, Reply::ChunkData { index: 1, bytes: chunk_of(&content, 1) }, Reply::Missing { index: 2 }]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_chunk_past_the_end_of_the_file_is_reported_missing() {
+        let [a, b] = nodes(["node_a", "node_b"]);
+        link(&a, &b, None).await;
+        share(&a, &[], "file_x", &data_pattern(100, 11)).await;
+
+        let replies = ask(&a, "node_b", GetChunks::for_indices("file_x", &[5])).await;
+
+        assert_eq!(replies, [Reply::Missing { index: 5 }]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_request_for_a_file_this_node_lacks_is_answered_not_found() {
+        let [a, b] = nodes(["node_a", "node_b"]);
+        link(&a, &b, None).await;
+
+        let replies = ask(&a, "node_b", GetChunks::for_indices("file_nope", &[0])).await;
+
+        assert_eq!(replies, [Reply::Error(ErrorCode::NotFound)]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_request_for_too_many_chunks_is_answered_malformed() {
+        let [a, b] = nodes(["node_a", "node_b"]);
+        link(&a, &b, None).await;
+        share(&a, &[], "file_x", &data_pattern(100, 12)).await;
+        let too_many = GetChunks { file_id: "file_x".into(), ranges: vec![ChunkRange { start: 0, count: MAX_REQUEST_CHUNKS as u32 + 1 }] };
+
+        assert_eq!(ask(&a, "node_b", too_many).await, [Reply::Error(ErrorCode::Malformed)]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_request_naming_an_invalid_file_id_is_answered_malformed() {
+        let [a, b] = nodes(["node_a", "node_b"]);
+        link(&a, &b, None).await;
+
+        let replies = ask(&a, "node_b", GetChunks::for_indices("../etc/passwd", &[0])).await;
+
+        assert_eq!(replies, [Reply::Error(ErrorCode::Malformed)]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_node_that_is_not_a_connected_peer_is_not_served() {
+        let [a] = nodes(["node_a"]);
+        share(&a, &[], "file_x", &data_pattern(100, 13)).await;
+        let (client_end, server_end) = tokio::io::duplex(64 * 1024);
+        let (server_reader, server_writer) = tokio::io::split(server_end);
+        let (_client_reader, mut client_writer) = tokio::io::split(client_end);
+        wire::write_request(&mut client_writer, &GetChunks::for_indices("file_x", &[0])).await.unwrap();
+
+        let served = serve_stream(&a, &"node_stranger".to_string(), server_reader, server_writer).await;
+
+        assert_eq!(served.unwrap_err().kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_request_that_finds_every_upload_slot_taken_is_answered_busy() {
+        let [a, b] = nodes(["node_a", "node_b"]);
+        link(&a, &b, None).await;
+        share(&a, &[], "file_x", &data_pattern(100, 14)).await;
+        let slots = a.mesh_peers.read().await["node_b"].serve_slots.clone();
+        let _taken = slots.acquire_many_owned(SERVE_SLOTS as u32).await.unwrap();
+
+        let replies = ask(&a, "node_b", GetChunks::for_indices("file_x", &[0])).await;
+
+        assert_eq!(replies, [Reply::Error(ErrorCode::Busy)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_that_never_sends_its_request_is_cut_off() {
+        let [a, b] = nodes(["node_a", "node_b"]);
+        link(&a, &b, None).await;
+        let (_client_end, server_end) = tokio::io::duplex(64 * 1024);
+        let (server_reader, server_writer) = tokio::io::split(server_end);
+
+        let served = serve_stream(&a, &"node_b".to_string(), server_reader, server_writer).await;
+
+        assert_eq!(served.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn chunks_that_were_not_asked_for_are_ignored() {
+        let (fetches_tx, mut fetches) = mpsc::channel::<Fetch>(1);
+        let (events_tx, mut events) = mpsc::channel(8);
+        let asking = tokio::spawn(request_chunks(fetches_tx, events_tx, "node_a".into(), "file_x".into(), vec![1]));
+
+        let fetch = fetches.recv().await.unwrap();
+        fetch.replies.send(Reply::ChunkData { index: 9, bytes: vec![0; 4] }).await.unwrap();
+        fetch.replies.send(Reply::ChunkData { index: 1, bytes: vec![1; 4] }).await.unwrap();
+        drop(fetch);
+        asking.await.unwrap();
+
+        assert!(matches!(events.recv().await, Some(Event::Chunk { index: 1, .. })));
+        assert!(events.recv().await.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn chunks_a_peer_never_answered_are_released_when_its_stream_ends() {
+        let (fetches_tx, mut fetches) = mpsc::channel::<Fetch>(1);
+        let (events_tx, mut events) = mpsc::channel(8);
+        let asking = tokio::spawn(request_chunks(fetches_tx, events_tx, "node_a".into(), "file_x".into(), vec![1, 2]));
+
+        let fetch = fetches.recv().await.unwrap();
+        fetch.replies.send(Reply::ChunkData { index: 1, bytes: vec![1; 4] }).await.unwrap();
+        drop(fetch);
+        asking.await.unwrap();
+
+        assert!(matches!(events.recv().await, Some(Event::Chunk { index: 1, .. })));
+        assert!(matches!(events.recv().await, Some(Event::ChunkError { index: 2, .. })));
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_node_fetches_a_file_from_the_node_that_holds_it() {
         let [a, b] = nodes(["node_a", "node_b"]);
@@ -841,8 +1060,10 @@ mod tests {
         let from_a = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let from_c = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = |n: Arc<std::sync::atomic::AtomicUsize>| -> Tamper {
-            Arc::new(move |_| {
-                n.fetch_add(1, Ordering::Relaxed);
+            Arc::new(move |reply| {
+                if matches!(reply, Reply::ChunkData { .. }) {
+                    n.fetch_add(1, Ordering::Relaxed);
+                }
                 true
             })
         };
@@ -869,10 +1090,12 @@ mod tests {
         let corrupted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let flip: Tamper = {
             let corrupted = corrupted.clone();
-            Arc::new(move |frame| {
-                let last = frame.len() - 1;
-                frame[last] ^= 0xff;
-                corrupted.fetch_add(1, Ordering::Relaxed);
+            Arc::new(move |reply| {
+                if let Reply::ChunkData { bytes, .. } = reply {
+                    let last = bytes.len() - 1;
+                    bytes[last] ^= 0xff;
+                    corrupted.fetch_add(1, Ordering::Relaxed);
+                }
                 true
             })
         };

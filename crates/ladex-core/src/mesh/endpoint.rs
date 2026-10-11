@@ -29,6 +29,9 @@ pub const ALPN: &[u8] = b"ladex-mesh";
 const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const KEEP_ALIVE: Duration = Duration::from_secs(3);
 
+// Stream 0 plus one stream per outstanding request for chunks; a peer can't open more than this at once.
+const MAX_CONCURRENT_STREAMS: u32 = 64;
+
 /// Close code for a connection a node ended on purpose, so the other node doesn't redial it.
 pub const HUNG_UP: quinn::VarInt = quinn::VarInt::from_u32(1);
 
@@ -146,6 +149,7 @@ fn transport_config() -> Arc<quinn::TransportConfig> {
     let mut transport = quinn::TransportConfig::default();
     transport.max_idle_timeout(Some(IDLE_TIMEOUT.try_into().expect("10 s fits a QUIC idle timeout")));
     transport.keep_alive_interval(Some(KEEP_ALIVE));
+    transport.max_concurrent_bidi_streams(MAX_CONCURRENT_STREAMS.into());
     Arc::new(transport)
 }
 

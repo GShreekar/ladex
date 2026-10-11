@@ -4,8 +4,8 @@
 //!
 //! Stream 0 starts with an [`Opening`] from the dialer. A dialer that trusts the listener asks to resume; the listener agrees
 //! only if it trusts the dialer too, and otherwise both fall back to the full handshake on the same stream. TLS has already
-//! proven each side's key, so resuming needs no passphrase. After that, stream 0 carries postcard-encoded [`MeshMessage`]s
-//! and chunk frames, each a length-prefixed frame that starts with a kind byte.
+//! proven each side's key, so resuming needs no passphrase. After that, stream 0 carries postcard-encoded [`MeshMessage`]s,
+//! one per length-prefixed frame. Chunks never use stream 0: each request for chunks opens a stream of its own (`transfer::wire`).
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -15,6 +15,7 @@ use anyhow::Context;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 use super::endpoint::{Accepting, MeshEndpoint, PeerConnection, HUNG_UP};
 use super::frames::{FrameSender, FramedStream};
@@ -23,6 +24,7 @@ use super::{
     start_session, AuthFailure, Intro, MeshMessage, Session, MAX_MESH_MESSAGE_BYTES, PROTOCOL_VERSION,
 };
 use crate::handshake::{self, Failure, Reason};
+use crate::transfer::wire::Fetch;
 use crate::trust::Standing;
 use crate::types::NodeId;
 use crate::{validate, NodeState};
@@ -35,9 +37,6 @@ const REFUSAL_LINGER: Duration = Duration::from_secs(2);
 // A peer hanging up on purpose closes the connection right after ending stream 0, so its close code arrives within this.
 const CLOSE_CODE_WAIT: Duration = Duration::from_secs(1);
 const CONNECTION_LOST: quinn::VarInt = quinn::VarInt::from_u32(0);
-
-const KIND_MESSAGE: u8 = 0;
-const KIND_CHUNKS: u8 = 1;
 
 /// The dialer's first frame on stream 0.
 #[derive(Debug, Serialize, Deserialize)]
@@ -275,14 +274,18 @@ async fn begin(state: &NodeState, connection: PeerConnection, peer: handshake::P
         connection.connection.close(HUNG_UP, b"already connected");
         return;
     };
-    stream.allow_frames_up_to(MAX_MESH_MESSAGE_BYTES + 1);
+    stream.allow_frames_up_to(MAX_MESH_MESSAGE_BYTES);
     tokio::spawn(control_loop(state.clone(), connection, peer.node_id, stream, session));
 }
 
 async fn control_loop(state: NodeState, connection: PeerConnection, peer_node_id: NodeId, stream: FramedStream, session: Session) {
     let FramedStream { sender, mut receiver } = stream;
-    let Session { sender: peer_tx, messages, data, hang_up } = session;
-    let writer = tokio::spawn(write_frames(sender, messages, data));
+    let Session { sender: peer_tx, messages, fetches, hang_up } = session;
+    let writer = tokio::spawn(write_frames(sender, messages));
+    let chunk_streams = [
+        tokio::spawn(open_chunk_streams(connection.connection.clone(), fetches, state.transfers.stream_stall_timeout())),
+        tokio::spawn(serve_chunk_streams(state.clone(), connection.clone())),
+    ];
     let we_hung_up = loop {
         let frame = tokio::select! {
             frame = receiver.recv() => frame,
@@ -298,6 +301,7 @@ async fn control_loop(state: NodeState, connection: PeerConnection, peer_node_id
         }
     };
     writer.abort();
+    chunk_streams.iter().for_each(JoinHandle::abort);
     let deliberate = we_hung_up || peer_hung_up(&connection.connection).await;
     connection.connection.close(if deliberate { HUNG_UP } else { CONNECTION_LOST }, b"connection ended");
     if connection_ended(&state, &peer_node_id, &peer_tx).await && !deliberate {
@@ -312,21 +316,9 @@ async fn peer_hung_up(connection: &quinn::Connection) -> bool {
     matches!(reason, Ok(quinn::ConnectionError::ApplicationClosed(close)) if close.error_code == HUNG_UP)
 }
 
-async fn write_frames(mut sender: FrameSender, mut messages: mpsc::UnboundedReceiver<MeshMessage>, mut data: mpsc::Receiver<Vec<u8>>) {
-    loop {
-        // Control messages (heartbeats, catalog) always go before chunk data.
-        let frame = tokio::select! {
-            biased;
-            message = messages.recv() => match message {
-                Some(message) => message_frame(&message),
-                None => break,
-            },
-            chunks = data.recv() => match chunks {
-                Some(chunks) => [&[KIND_CHUNKS][..], &chunks].concat(),
-                None => break,
-            },
-        };
-        if sender.send(&frame).await.is_err() {
+async fn write_frames(mut sender: FrameSender, mut messages: mpsc::UnboundedReceiver<MeshMessage>) {
+    while let Some(message) = messages.recv().await {
+        if sender.send(&message_frame(&message)).await.is_err() {
             break;
         }
     }
@@ -334,8 +326,33 @@ async fn write_frames(mut sender: FrameSender, mut messages: mpsc::UnboundedRece
 }
 
 fn message_frame(message: &MeshMessage) -> Vec<u8> {
-    let frame = vec![KIND_MESSAGE];
-    postcard::to_extend(message, frame).expect("mesh messages always serialize")
+    postcard::to_stdvec(message).expect("mesh messages always serialize")
+}
+
+/// Opens a stream for each request for chunks the download engine makes of this peer.
+async fn open_chunk_streams(connection: quinn::Connection, mut fetches: mpsc::Receiver<Fetch>, stall_timeout: Duration) {
+    while let Some(fetch) = fetches.recv().await {
+        let connection = connection.clone();
+        tokio::spawn(async move {
+            // Dropping the reply channel on any failure tells the download its chunks are free to ask for elsewhere.
+            let Ok((send, recv)) = connection.open_bi().await else { return };
+            if let Err(e) = crate::transfer::wire::fetch_stream(recv, send, &fetch.request, fetch.replies, stall_timeout).await {
+                tracing::debug!("Mesh: chunk stream to {} failed: {e}", connection.remote_address());
+            }
+        });
+    }
+}
+
+/// Answers the chunk requests the peer opens streams for.
+async fn serve_chunk_streams(state: NodeState, connection: PeerConnection) {
+    while let Ok((send, recv)) = connection.connection.accept_bi().await {
+        let (state, from) = (state.clone(), connection.node_id.clone());
+        tokio::spawn(async move {
+            if let Err(e) = crate::transfer::serve_stream(&state, &from, recv, send).await {
+                tracing::debug!("Mesh: chunk stream from {from} ended early: {e}");
+            }
+        });
+    }
 }
 
 fn decode_message(bytes: &[u8]) -> Result<MeshMessage, postcard::Error> {
@@ -348,13 +365,9 @@ fn decode_message(bytes: &[u8]) -> Result<MeshMessage, postcard::Error> {
 }
 
 async fn handle_frame(state: &NodeState, peer_node_id: &NodeId, frame: &[u8]) {
-    match frame.split_first() {
-        Some((&KIND_MESSAGE, bytes)) => match decode_message(bytes) {
-            Ok(message) => dispatch(&message, peer_node_id, state).await,
-            Err(e) => tracing::warn!("Mesh: unreadable message from {peer_node_id}: {e}"),
-        },
-        Some((&KIND_CHUNKS, chunks)) => crate::transfer::on_binary_frame(state, peer_node_id, chunks),
-        _ => tracing::warn!("Mesh: unknown frame from {peer_node_id} — ignored"),
+    match decode_message(frame) {
+        Ok(message) => dispatch(&message, peer_node_id, state).await,
+        Err(e) => tracing::warn!("Mesh: unreadable message from {peer_node_id}: {e}"),
     }
 }
 
@@ -420,7 +433,7 @@ mod tests {
     }
 
     fn encode(message: &MeshMessage) -> Vec<u8> {
-        message_frame(message)[1..].to_vec()
+        message_frame(message)
     }
 
     /// Decodes the message and checks it encodes back to the same bytes, so no field was lost or changed.
@@ -429,11 +442,6 @@ mod tests {
         let decoded = decode_message(&bytes).unwrap_or_else(|e| panic!("{message:?} did not decode: {e}"));
         assert_eq!(encode(&decoded), bytes);
         decoded
-    }
-
-    #[test]
-    fn a_message_frame_starts_with_the_message_kind() {
-        assert_eq!(message_frame(&MeshMessage::Ping { ts: 1 })[0], KIND_MESSAGE);
     }
 
     #[test]
@@ -473,11 +481,9 @@ mod tests {
     fn transfer_requests_survive_postcard() {
         assert_survives_postcard(MeshMessage::GetManifest { file_id: "file_1".into() });
         assert_survives_postcard(MeshMessage::Manifest { file_id: "file_1".into(), size: 3, hashes: "cd".repeat(32) });
-        assert_survives_postcard(MeshMessage::GetChunks { file_id: "file_1".into(), indices: vec![0, 5, 300] });
         assert_survives_postcard(MeshMessage::Have { file_id: "file_1".into(), chunks: 9, bitmap: "ff01".into() });
         assert_survives_postcard(MeshMessage::HaveAll { file_ids: vec!["file_1".into(), "file_2".into()] });
         assert_survives_postcard(MeshMessage::Lost { file_ids: vec!["file_1".into()] });
-        assert_survives_postcard(MeshMessage::ChunkError { file_id: "file_1".into(), index: 2, reason: "gone".into() });
     }
 
     #[test]

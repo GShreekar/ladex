@@ -20,10 +20,11 @@ pub mod quic;
 // 8: mesh messages on QUIC stream 0 are postcard-encoded instead of JSON.
 // 9: nodes trade catalog version vectors and signed ops.
 // 10: holders are told with `Have` messages instead of being listed in the catalog.
-pub const PROTOCOL_VERSION: u32 = 10;
+// 11: chunks travel on a stream per request (see `transfer::wire`), and stream 0 frames are bare postcard messages.
+pub const PROTOCOL_VERSION: u32 = 11;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
-const DATA_QUEUE_FRAMES: usize = 8;
+const FETCH_QUEUE: usize = 16;
 // Mesh messages carry whole catalog and chat snapshots, so they may be far larger than a tab's.
 const MAX_MESH_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 const CLOCK_SKEW_WARN_MS: i64 = 2 * 60 * 1000;
@@ -47,8 +48,8 @@ pub struct MeshPeerHandle {
     /// Where the peer's QUIC endpoint can be dialed.
     pub addr: SocketAddr,
     pub sender: mpsc::UnboundedSender<MeshMessage>,
-    /// Binary chunk frames; bounded so a slow link holds the sender back.
-    pub data: mpsc::Sender<Vec<u8>>,
+    /// Requests for chunks; each is answered on a stream of its own.
+    pub fetches: mpsc::Sender<crate::transfer::wire::Fetch>,
     /// Limits how many chunk requests from this peer are served at once.
     pub serve_slots: Arc<tokio::sync::Semaphore>,
     pub last_seen: Instant,
@@ -98,17 +99,6 @@ pub enum MeshMessage {
         size: u64,
         hashes: String,
     },
-    /// Ask for chunks; they come back as binary frames, not as messages.
-    GetChunks {
-        file_id: String,
-        indices: Vec<u32>,
-    },
-    ChunkError {
-        file_id: String,
-        index: u32,
-        reason: String,
-    },
-
     /// Routes a WebRTC signal between browser tabs on different nodes.
     SignalRelay {
         to_node_id: NodeId,
@@ -216,7 +206,7 @@ pub async fn remove_mesh_peer(state: &NodeState, peer_node_id: &NodeId) {
 struct Session {
     sender: mpsc::UnboundedSender<MeshMessage>,
     messages: mpsc::UnboundedReceiver<MeshMessage>,
-    data: mpsc::Receiver<Vec<u8>>,
+    fetches: mpsc::Receiver<crate::transfer::wire::Fetch>,
     hang_up: Arc<Notify>,
 }
 
@@ -229,14 +219,14 @@ async fn start_session(
     dialer: NodeId,
 ) -> Option<Session> {
     let (sender, messages) = mpsc::unbounded_channel::<MeshMessage>();
-    let (data_tx, data) = mpsc::channel::<Vec<u8>>(DATA_QUEUE_FRAMES);
+    let (fetches_tx, fetches) = mpsc::channel(FETCH_QUEUE);
     let hang_up = Arc::new(Notify::new());
     let handle = MeshPeerHandle {
         node_id: peer_node_id.clone(),
         node_name: peer_node_name.to_string(),
         addr,
         sender: sender.clone(),
-        data: data_tx,
+        fetches: fetches_tx,
         serve_slots: Arc::new(tokio::sync::Semaphore::new(crate::transfer::SERVE_SLOTS)),
         last_seen: Instant::now(),
         rtt_ms: None,
@@ -250,7 +240,7 @@ async fn start_session(
     crate::transfer::sources_changed(state);
     post_handshake_sync(&sender, state).await;
     spawn_heartbeat(state.clone(), peer_node_id.clone(), sender.clone());
-    Some(Session { sender, messages, data, hang_up })
+    Some(Session { sender, messages, fetches, hang_up })
 }
 
 /// Registers a connection, hanging up the open one with the peer if the new one replaces it; false if the open one stays.
@@ -454,8 +444,6 @@ pub(crate) async fn dispatch(msg: &MeshMessage, from_node_id: &NodeId, state: &N
 
         MeshMessage::GetManifest { file_id } => crate::transfer::serve_manifest(state, from_node_id, file_id).await,
         MeshMessage::Manifest { file_id, hashes, .. } => crate::transfer::on_manifest(state, from_node_id, file_id, hashes),
-        MeshMessage::GetChunks { file_id, indices } => crate::transfer::serve_chunks(state, from_node_id, file_id, indices.clone()).await,
-        MeshMessage::ChunkError { file_id, index, .. } => crate::transfer::on_chunk_error(state, from_node_id, file_id, *index),
         MeshMessage::Have { file_id, chunks, bitmap } => crate::availability::on_have(state, from_node_id, file_id, *chunks, bitmap).await,
         MeshMessage::HaveAll { file_ids } => crate::availability::on_have_all(state, from_node_id, file_ids).await,
         MeshMessage::Lost { file_ids } => crate::availability::on_lost(state, from_node_id, file_ids).await,

@@ -1,8 +1,11 @@
 //! Real nodes joining each other over QUIC, the way discovery connects them.
 
 use ladex_core::mesh::{self, AuthFailure};
+use ladex_core::store::{hash_chunk, CHUNK_SIZE};
 use ladex_core::testing::{converged, eventually, fully_connected, spawn_node, NodeConfig, NodeHandle};
+use ladex_core::transfer::wire::{ErrorCode, Fetch, GetChunks, Reply};
 use ladex_core::{transfer, NodeState};
+use tokio::sync::mpsc;
 
 async fn spawn_pair(passphrase: Option<&str>) -> Vec<NodeHandle> {
     let config = |name: &str| NodeConfig { passphrase: passphrase.map(String::from), ..NodeConfig::named(name) };
@@ -160,4 +163,71 @@ async fn a_node_told_to_join_its_own_address_refuses() {
     let failure = node.connect(node.addr).await.unwrap_err();
     assert!(failure.to_string().contains("itself"), "{failure}");
     assert!(node.mesh_peers().await.is_empty());
+}
+
+/// Sends `request` to `of` over its own QUIC stream and collects every reply.
+async fn ask(from: &NodeHandle, of: &NodeHandle, request: GetChunks) -> Vec<Reply> {
+    let fetches = from.state.mesh_peers.read().await[of.node_id()].fetches.clone();
+    let (replies_tx, mut replies) = mpsc::channel(32);
+    fetches.send(Fetch { request, replies: replies_tx }).await.unwrap();
+    let mut got = Vec::new();
+    while let Some(reply) = replies.recv().await {
+        got.push(reply);
+    }
+    got
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn chunks_asked_for_over_a_stream_arrive_intact() {
+    let nodes = spawn_joined_pair("pw").await;
+    let (a, b) = (&nodes[0], &nodes[1]);
+    let content: Vec<u8> = (0..(3 * CHUNK_SIZE as usize + 99)).map(|i| (i % 253) as u8).collect();
+    a.share_file("big", &content).await;
+
+    let replies = ask(b, a, GetChunks::for_indices("big", &[3, 0, 1])).await;
+
+    let [Reply::ChunkData { index: 0, bytes: first }, Reply::ChunkData { index: 1, .. }, Reply::ChunkData { index: 3, bytes: last }] =
+        replies.as_slice()
+    else {
+        panic!("unexpected replies: {} of them", replies.len());
+    };
+    assert_eq!(first[..], content[..CHUNK_SIZE as usize]);
+    assert_eq!(hash_chunk(last), hash_chunk(&content[3 * CHUNK_SIZE as usize..]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_for_a_file_the_peer_lacks_is_refused_over_a_stream() {
+    let nodes = spawn_joined_pair("pw").await;
+    let replies = ask(&nodes[1], &nodes[0], GetChunks::for_indices("file_nope", &[0])).await;
+    assert_eq!(replies, [Reply::Error(ErrorCode::NotFound)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn many_requests_in_flight_at_once_are_each_answered_on_their_own_stream() {
+    let nodes = spawn_joined_pair("pw").await;
+    let (a, b) = (&nodes[0], &nodes[1]);
+    let content: Vec<u8> = (0..(6 * CHUNK_SIZE as usize)).map(|i| (i % 241) as u8).collect();
+    a.share_file("big", &content).await;
+
+    let requests = (0..6).map(|index| ask(b, a, GetChunks::for_indices("big", &[index])));
+    let answers = futures_util::future::join_all(requests).await;
+
+    for (index, replies) in answers.iter().enumerate() {
+        let start = index * CHUNK_SIZE as usize;
+        let expected = Reply::ChunkData { index: index as u32, bytes: content[start..start + CHUNK_SIZE as usize].to_vec() };
+        assert_eq!(replies, &[expected]);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn requests_beyond_the_upload_slots_wait_their_turn_instead_of_failing() {
+    let nodes = spawn_joined_pair("pw").await;
+    let (a, b) = (&nodes[0], &nodes[1]);
+    let content: Vec<u8> = (0..(2 * CHUNK_SIZE as usize)).map(|i| (i % 239) as u8).collect();
+    a.share_file("big", &content).await;
+
+    let requests = (0..24).map(|_| ask(b, a, GetChunks::for_indices("big", &[0, 1])));
+    let answers = futures_util::future::join_all(requests).await;
+
+    assert!(answers.iter().all(|replies| replies.len() == 2 && replies.iter().all(|r| matches!(r, Reply::ChunkData { .. }))));
 }
