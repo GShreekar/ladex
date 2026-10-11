@@ -19,6 +19,20 @@ const MAX_PARTIALS_ANNOUNCED: usize = 256;
 /// The most files one node may claim to have, so a misbehaving peer cannot grow this without limit.
 pub const MAX_FILES_PER_NODE: usize = 10_000;
 
+/// The most `(start, count)` runs one `HaveChunks` message carries.
+pub const MAX_RUNS_PER_MESSAGE: usize = 1024;
+
+/// What became of a `HaveChunks` update.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Merge {
+    Applied {
+        became_host: bool,
+    },
+    /// Nothing was told about this file before, so the chunks have nothing to be added to.
+    NoBase,
+    Invalid,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Have {
     Complete,
@@ -57,6 +71,26 @@ impl Availability {
         }
     }
 
+    /// `node` also has these runs of chunks of a file it told a map of before.
+    pub fn add_chunks(&self, node: &str, file_id: &str, chunks: u32, runs: &[(u32, u32)]) -> Merge {
+        let mut by_node = self.by_node.lock().unwrap();
+        let Some(have) = by_node.get_mut(node).and_then(|files| files.get_mut(file_id)) else { return Merge::NoBase };
+        match have {
+            Have::Complete => Merge::Applied { became_host: false },
+            Have::Partial(map) if map.len() != chunks => Merge::Invalid,
+            Have::Partial(map) => {
+                if !map.insert_runs(runs) {
+                    return Merge::Invalid;
+                }
+                let became_host = map.is_full();
+                if became_host {
+                    *have = Have::Complete;
+                }
+                Merge::Applied { became_host }
+            }
+        }
+    }
+
     /// `node` no longer has these files.
     pub fn lose(&self, node: &str, file_ids: &[String]) {
         if let Some(files) = self.by_node.lock().unwrap().get_mut(node) {
@@ -72,6 +106,15 @@ impl Availability {
 
     pub fn get(&self, node: &str, file_id: &str) -> Option<Have> {
         self.by_node.lock().unwrap().get(node)?.get(file_id).cloned()
+    }
+
+    /// The nodes that have any of the file, those with all of it first, each group in a stable order.
+    pub fn holders(&self, file_id: &str) -> Vec<NodeId> {
+        let by_node = self.by_node.lock().unwrap();
+        let mut holders: Vec<(bool, NodeId)> =
+            by_node.iter().filter_map(|(node, files)| Some((files.get(file_id)? != &Have::Complete, node.clone()))).collect();
+        holders.sort();
+        holders.into_iter().map(|(_, node)| node).collect()
     }
 
     /// The nodes that have the whole file, in a stable order.
@@ -95,6 +138,31 @@ pub fn announce_all(peer_tx: &mpsc::UnboundedSender<MeshMessage>, state: &NodeSt
     for blob in partials.take(MAX_PARTIALS_ANNOUNCED) {
         let map = blob.bitmap();
         let _ = peer_tx.send(MeshMessage::Have { file_id: blob.id().to_string(), chunks: map.len(), bitmap: map.to_hex() });
+    }
+}
+
+/// Tells every connected peer which chunks of a file this node has, sending only what is new since `told`.
+pub async fn announce_progress(state: &NodeState, file_id: &str, have: &Bitmap, told: Option<&Bitmap>) {
+    let messages: Vec<MeshMessage> = match told {
+        Some(told) => have
+            .runs_added_since(told)
+            .chunks(MAX_RUNS_PER_MESSAGE)
+            .map(|runs| MeshMessage::HaveChunks { file_id: file_id.to_string(), chunks: have.len(), runs: runs.to_vec() })
+            .collect(),
+        None => vec![MeshMessage::Have { file_id: file_id.to_string(), chunks: have.len(), bitmap: have.to_hex() }],
+    };
+    for handle in state.mesh_peers.read().await.values() {
+        for message in &messages {
+            let _ = handle.sender.send(message.clone());
+        }
+    }
+}
+
+/// Asks peers what they hold of these files: every connected peer, or just `only`.
+pub async fn ask_for_maps(state: &NodeState, file_ids: &[String], only: Option<&NodeId>) {
+    let peers = state.mesh_peers.read().await;
+    for handle in peers.iter().filter(|(node, _)| only.is_none_or(|only| only == *node)).map(|(_, handle)| handle) {
+        let _ = handle.sender.send(MeshMessage::WantHave { file_ids: file_ids.to_vec() });
     }
 }
 
@@ -148,6 +216,42 @@ pub async fn on_have(state: &NodeState, from: &NodeId, file_id: &str, chunks: u3
         hosts_changed(state).await;
     } else {
         transfer::sources_changed(state);
+    }
+}
+
+/// A peer says it has more chunks of a file than it told before.
+pub async fn on_have_chunks(state: &NodeState, from: &NodeId, file_id: &str, chunks: u32, runs: &[(u32, u32)]) {
+    if !validate::is_valid_id(file_id) || runs.len() > MAX_RUNS_PER_MESSAGE {
+        return;
+    }
+    let Some(size) = state::known_size(state, file_id) else { return };
+    if chunks != chunk_count(size) {
+        return;
+    }
+    match state.availability.add_chunks(from, file_id, chunks, runs) {
+        Merge::Applied { became_host: true } => hosts_changed(state).await,
+        Merge::Applied { became_host: false } => transfer::sources_changed(state),
+        // The map this adds to never arrived, so the peer is asked for the whole of it.
+        Merge::NoBase => ask_for_maps(state, &[file_id.to_string()], Some(from)).await,
+        Merge::Invalid => tracing::warn!("Availability: {from} sent chunk runs that do not fit {file_id}"),
+    }
+}
+
+/// A peer asks what this node holds of these files, and is told whatever it holds.
+pub async fn on_want_have(state: &NodeState, from: &NodeId, file_ids: &[String]) {
+    let Some(file_ids) = well_formed_ids(file_ids) else { return };
+    let Some(peer) = state.mesh_peers.read().await.get(from).map(|handle| handle.sender.clone()) else { return };
+    let mut complete = Vec::new();
+    for blob in file_ids.iter().filter_map(|id| state.store.get(id)) {
+        let map = blob.bitmap();
+        if blob.is_complete() {
+            complete.push(blob.id().to_string());
+        } else if map.count() > 0 {
+            let _ = peer.send(MeshMessage::Have { file_id: blob.id().to_string(), chunks: map.len(), bitmap: map.to_hex() });
+        }
+    }
+    if !complete.is_empty() {
+        let _ = peer.send(MeshMessage::HaveAll { file_ids: complete });
     }
 }
 
@@ -229,6 +333,57 @@ mod tests {
         availability.set_complete("b", &ids(&["f1"]));
         availability.set_complete("a", &ids(&["f1"]));
         assert_eq!(availability.hosts("f1"), vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn announced_chunks_are_added_to_the_map_told_before() {
+        let availability = Availability::default();
+        availability.set_partial("a", "f1", map(8, &[0]));
+
+        let merged = availability.add_chunks("a", "f1", 8, &[(2, 2)]);
+
+        assert_eq!(merged, Merge::Applied { became_host: false });
+        assert_eq!(availability.get("a", "f1"), Some(Have::Partial(map(8, &[0, 2, 3]))));
+    }
+
+    #[test]
+    fn announced_chunks_that_fill_the_map_make_the_node_a_host() {
+        let availability = Availability::default();
+        availability.set_partial("a", "f1", map(4, &[0, 1]));
+
+        let merged = availability.add_chunks("a", "f1", 4, &[(2, 2)]);
+
+        assert_eq!(merged, Merge::Applied { became_host: true });
+        assert_eq!(availability.hosts("f1"), vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn announced_chunks_for_a_file_never_told_have_no_map_to_join() {
+        let availability = Availability::default();
+
+        assert_eq!(availability.add_chunks("a", "f1", 8, &[(0, 1)]), Merge::NoBase);
+        assert_eq!(availability.get("a", "f1"), None);
+    }
+
+    #[test]
+    fn announced_chunks_that_do_not_fit_the_map_are_refused() {
+        let availability = Availability::default();
+        availability.set_partial("a", "f1", map(8, &[0]));
+
+        assert_eq!(availability.add_chunks("a", "f1", 8, &[(7, 3)]), Merge::Invalid);
+        assert_eq!(availability.add_chunks("a", "f1", 9, &[(1, 1)]), Merge::Invalid);
+        assert_eq!(availability.get("a", "f1"), Some(Have::Partial(map(8, &[0]))));
+    }
+
+    #[test]
+    fn holders_list_whole_copies_before_partial_ones() {
+        let availability = Availability::default();
+        availability.set_partial("a", "f1", map(4, &[0]));
+        availability.set_complete("c", &ids(&["f1"]));
+        availability.set_partial("b", "f1", map(4, &[1]));
+        availability.set_complete("d", &ids(&["f2"]));
+
+        assert_eq!(availability.holders("f1"), ["c", "a", "b"]);
     }
 
     #[test]

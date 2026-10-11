@@ -139,7 +139,7 @@ impl Default for Tuning {
             manifest_retry: Duration::from_secs(10),
             tick: Duration::from_millis(250),
             idle_exit: Duration::from_secs(600),
-            map_interval: Duration::from_secs(2),
+            map_interval: Duration::from_millis(250),
             stall_timeout: Duration::from_secs(60),
             stream_stall_timeout: Duration::from_secs(20),
             upload_slots: UPLOAD_SLOTS,
@@ -297,12 +297,15 @@ pub async fn ensure_file(state: &NodeState, id: &str) -> Result<Arc<Blob>, Fetch
         downloads.insert(id.to_string(), download.clone());
     }
     tokio::spawn(run(state.clone(), download, receiver));
+    // Maps told before this node knew the file were dropped, so every peer is asked again.
+    crate::availability::ask_for_maps(state, &[id.to_string()], None).await;
     Ok(blob)
 }
 
+// A node with only some of the chunks counts, since a download can start from it and take the rest from others.
 async fn someone_online_has(state: &NodeState, id: &str) -> bool {
     let peers = state.mesh_peers.read().await;
-    state.availability.hosts(id).iter().any(|node| peers.contains_key(node))
+    state.availability.holders(id).iter().any(|node| peers.contains_key(node))
 }
 
 pub fn open_reader(state: &NodeState, blob: &Blob) -> Option<Reader> {
@@ -442,7 +445,8 @@ async fn run(state: NodeState, download: Arc<Download>, mut events: mpsc::Receiv
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut manifest_asked: Option<Instant> = None;
     let mut last_progress = Instant::now();
-    let mut last_map: (Instant, u32) = (Instant::now(), 0);
+    // The chunks the mesh was last told this node has; None until the first announcement.
+    let mut told: Option<(Instant, Bitmap)> = None;
 
     loop {
         let first = tokio::select! {
@@ -529,7 +533,7 @@ async fn run(state: NodeState, download: Arc<Download>, mut events: mpsc::Receiv
             .iter()
             .map(|(n, h)| (n.clone(), Link { control: h.sender.clone(), fetches: h.fetches.clone() }))
             .collect();
-        let holders: HashSet<NodeId> = state.availability.hosts(&id).into_iter().collect();
+        let holders: Vec<NodeId> = state.availability.holders(&id);
         peers.retain(|node, p| connected.contains_key(node) || p.is_banned());
 
         if !blob.has_manifest() {
@@ -594,11 +598,13 @@ async fn run(state: NodeState, download: Arc<Download>, mut events: mpsc::Receiv
         }
 
         let have = blob.bitmap();
-        if have.count() != last_map.1 && last_map.0.elapsed() >= tuning.map_interval {
-            last_map = (Instant::now(), have.count());
-            for link in connected.values() {
-                let _ = link.control.send(MeshMessage::Have { file_id: id.clone(), chunks: have.len(), bitmap: have.to_hex() });
-            }
+        let due = match &told {
+            None => have.count() > 0,
+            Some((at, map)) => have.count() > map.count() && at.elapsed() >= tuning.map_interval,
+        };
+        if due {
+            crate::availability::announce_progress(&state, &id, &have, told.as_ref().map(|(_, map)| map)).await;
+            told = Some((Instant::now(), have));
         }
 
         if download.readers.lock().unwrap().is_empty() && last_progress.elapsed() > tuning.idle_exit {
@@ -629,6 +635,7 @@ fn finish(state: &NodeState, id: &str, download: &Arc<Download>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::availability::Have;
     use crate::catalog::{Add, CatalogEntry, EntryKind, Op};
     use crate::hlc::Stamp;
     use crate::identity::Identity;
@@ -1073,6 +1080,118 @@ mod tests {
 
         let Some(Event::Released { fault, .. }) = events.recv().await else { panic!("no release") };
         assert_eq!(fault, Fault::Busy);
+    }
+
+    // A node holding only the first `chunks` chunks of a file and telling its peers so; `seed.finish` adds the rest.
+    struct PartialHolder {
+        node: NodeState,
+        blob: Arc<Blob>,
+        content: Vec<u8>,
+    }
+
+    impl PartialHolder {
+        async fn new(node: NodeState, entry: &CatalogEntry, hashes: Vec<ChunkHash>, content: Vec<u8>, chunks: u32) -> Self {
+            let blob = node.store.create(&entry.file_id, entry.size).unwrap();
+            blob.set_manifest(hashes, &entry.manifest_root).unwrap();
+            let holder = Self { node, blob, content };
+            holder.write(0..chunks).await;
+            crate::availability::announce_progress(&holder.node, &entry.file_id, &holder.blob.bitmap(), None).await;
+            holder
+        }
+
+        async fn write(&self, indices: std::ops::Range<u32>) {
+            for index in indices {
+                let start = index as usize * CHUNK_SIZE as usize;
+                let end = (start + CHUNK_SIZE as usize).min(self.content.len());
+                self.blob.write_chunk_verified(index, self.content[start..end].to_vec()).await.unwrap();
+            }
+        }
+
+        async fn finish(&self) {
+            self.write(self.blob.bitmap().iter_missing().collect::<Vec<u32>>().first().copied().unwrap_or(0)..self.blob.chunk_count())
+                .await;
+            self.blob.seal().unwrap();
+            crate::availability::announce_complete(&self.node, &[self.blob.id().to_string()]).await;
+        }
+    }
+
+    async fn wait_until(seconds: u64, mut condition: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(seconds);
+        while Instant::now() < deadline {
+            if condition() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
+    }
+
+    // The whole file on a node of its own, which the nodes under test never talk to.
+    async fn whole_file(content: &[u8]) -> (CatalogEntry, Vec<ChunkHash>) {
+        let [origin] = nodes(["node_origin"]);
+        let entry = share(&origin, &[], "file_x", content).await;
+        (entry, origin.store.get("file_x").unwrap().hashes().unwrap().to_vec())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_node_still_downloading_serves_the_chunks_it_has_to_a_node_that_cannot_reach_the_source() {
+        let [a, b, c] = nodes(["node_a", "node_b", "node_c"]);
+        link(&a, &b, None).await;
+        link(&b, &c, None).await;
+        let content = data_pattern(12 * CHUNK_SIZE as usize, 5);
+        let (entry, hashes) = whole_file(&content).await;
+        list(&[&a, &b, &c], &entry);
+        let seed = PartialHolder::new(a, &entry, hashes, content.clone(), 3).await;
+        assert!(wait_until(10, || b.availability.get("node_a", "file_x").is_some()).await);
+
+        let at_b = ensure_file(&b, "file_x").await.unwrap();
+        assert!(wait_until(10, || at_b.bitmap().count() == 3).await);
+        let at_c = ensure_file(&c, "file_x").await.unwrap();
+
+        assert!(wait_until(10, || at_c.bitmap().count() == 3).await, "c has {} chunks", at_c.bitmap().count());
+        assert!(!at_b.is_complete(), "nobody had the rest yet");
+        seed.finish().await;
+        assert!(wait_complete(&at_c, 20).await);
+        assert_eq!(read_all(&at_c).await, content);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_node_is_told_new_chunks_as_they_are_verified_not_only_the_whole_file() {
+        let [a, b, c] = nodes(["node_a", "node_b", "node_c"]);
+        link(&a, &b, None).await;
+        link(&b, &c, None).await;
+        let content = data_pattern(8 * CHUNK_SIZE as usize, 6);
+        let (entry, hashes) = whole_file(&content).await;
+        list(&[&a, &b, &c], &entry);
+        let seed = PartialHolder::new(a, &entry, hashes, content, 2).await;
+        assert!(wait_until(10, || b.availability.get("node_a", "file_x").is_some()).await);
+        let at_b = ensure_file(&b, "file_x").await.unwrap();
+        let told = |count: u32| matches!(c.availability.get("node_b", "file_x"), Some(Have::Partial(map)) if map.count() == count);
+
+        assert!(wait_until(10, || at_b.bitmap().count() == 2).await);
+        assert!(wait_until(10, || told(2)).await);
+        seed.finish().await;
+        assert!(wait_complete(&at_b, 20).await);
+        assert!(is_known_host(&c, &b, "file_x").await);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn chunks_announced_before_their_map_are_answered_by_asking_for_the_map() {
+        let [a, b] = nodes(["node_a", "node_b"]);
+        link(&a, &b, None).await;
+        let content = data_pattern(4 * CHUNK_SIZE as usize, 7);
+        let entry = share(&b, &[], "file_x", &content).await;
+        list(&[&a], &entry);
+        let partial = a.store.create("file_x", content.len() as u64).unwrap();
+        for index in 0..2 {
+            let start = index as usize * CHUNK_SIZE as usize;
+            partial.write_chunk_hashing(index, content[start..start + CHUNK_SIZE as usize].to_vec()).await.unwrap();
+        }
+
+        crate::availability::on_have_chunks(&b, &"node_a".to_string(), "file_x", 4, &[(1, 1)]).await;
+
+        let learned = wait_until(10, || matches!(b.availability.get("node_a", "file_x"), Some(Have::Partial(map)) if map.count() == 2));
+        assert!(learned.await);
     }
 
     #[tokio::test(flavor = "multi_thread")]

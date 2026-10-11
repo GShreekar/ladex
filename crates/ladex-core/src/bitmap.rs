@@ -77,6 +77,37 @@ impl Bitmap {
         (0..self.len).filter(|i| !self.get(*i))
     }
 
+    /// The chunks present here but not in `older`, as `(start, count)` runs in ascending order.
+    pub fn runs_added_since(&self, older: &Bitmap) -> Vec<(u32, u32)> {
+        let mut runs: Vec<(u32, u32)> = Vec::new();
+        for (word_index, word) in self.words.iter().enumerate() {
+            let mut added = word & !older.words.get(word_index).copied().unwrap_or(0);
+            while added != 0 {
+                let index = word_index as u32 * 64 + added.trailing_zeros();
+                added &= added - 1;
+                match runs.last_mut() {
+                    Some((start, count)) if *start + *count == index => *count += 1,
+                    _ => runs.push((index, 1)),
+                }
+            }
+        }
+        runs
+    }
+
+    /// Adds every run, or changes nothing and returns false if any run is empty or reaches past the end.
+    pub fn insert_runs(&mut self, runs: &[(u32, u32)]) -> bool {
+        let fits = |&(start, count): &(u32, u32)| count > 0 && start.checked_add(count).is_some_and(|end| end <= self.len);
+        if !runs.iter().all(fits) {
+            return false;
+        }
+        for &(start, count) in runs {
+            for index in start..start + count {
+                self.set(index);
+            }
+        }
+        true
+    }
+
     /// Little-endian bit order inside each byte: chunk 0 is the lowest bit of byte 0.
     pub fn to_hex(&self) -> String {
         let bytes: Vec<u8> = (0..(self.len as usize).div_ceil(8))
@@ -137,6 +168,50 @@ mod tests {
         assert_eq!(map.iter_missing().collect::<Vec<_>>(), [3, 5, 6, 7, 8, 9]);
         assert_eq!(Bitmap::full(10).first_missing_from(0), None);
         assert!(Bitmap::full(10).is_full());
+    }
+
+    fn map_of(len: u32, present: &[u32]) -> Bitmap {
+        let mut map = Bitmap::new(len);
+        for index in present {
+            map.set(*index);
+        }
+        map
+    }
+
+    #[test]
+    fn new_chunks_are_listed_as_runs_across_word_boundaries() {
+        let older = map_of(200, &[5, 70]);
+        let newer = map_of(200, &[5, 62, 63, 64, 65, 70, 150]);
+
+        assert_eq!(newer.runs_added_since(&older), [(62, 4), (150, 1)]);
+    }
+
+    #[test]
+    fn nothing_new_gives_no_runs() {
+        let map = map_of(10, &[1, 2]);
+
+        assert!(map.runs_added_since(&map).is_empty());
+    }
+
+    #[test]
+    fn inserting_runs_sets_those_chunks() {
+        let mut map = Bitmap::new(100);
+
+        assert!(map.insert_runs(&[(0, 2), (98, 2)]));
+
+        assert_eq!(map.iter_missing().count(), 96);
+        assert!(map.get(1) && map.get(99) && !map.get(2));
+    }
+
+    #[test]
+    fn runs_that_do_not_fit_change_nothing() {
+        let mut map = Bitmap::new(10);
+
+        assert!(!map.insert_runs(&[(0, 2), (9, 2)]));
+        assert!(!map.insert_runs(&[(u32::MAX, 2)]));
+        assert!(!map.insert_runs(&[(3, 0)]));
+
+        assert_eq!(map.count(), 0);
     }
 
     #[test]

@@ -21,7 +21,8 @@ pub mod quic;
 // 9: nodes trade catalog version vectors and signed ops.
 // 10: holders are told with `Have` messages instead of being listed in the catalog.
 // 11: chunks travel on a stream per request (see `transfer::wire`), and stream 0 frames are bare postcard messages.
-pub const PROTOCOL_VERSION: u32 = 11;
+// 12: `HaveChunks` adds chunks to a map already told, and `WantHave` asks a peer to tell its map.
+pub const PROTOCOL_VERSION: u32 = 12;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const FETCH_QUEUE: usize = 16;
@@ -130,6 +131,16 @@ pub enum MeshMessage {
     },
     /// The sender no longer has these files.
     Lost {
+        file_ids: Vec<String>,
+    },
+    /// The sender now also has these chunks (`(start, count)` runs) of a file it told a map of before.
+    HaveChunks {
+        file_id: String,
+        chunks: u32,
+        runs: Vec<(u32, u32)>,
+    },
+    /// The sender wants to know what the receiver holds of these files; answered with `Have` or `HaveAll`.
+    WantHave {
         file_ids: Vec<String>,
     },
 }
@@ -442,6 +453,10 @@ pub(crate) async fn dispatch(msg: &MeshMessage, from_node_id: &NodeId, state: &N
         MeshMessage::GetManifest { file_id } => crate::transfer::serve_manifest(state, from_node_id, file_id).await,
         MeshMessage::Manifest { file_id, hashes, .. } => crate::transfer::on_manifest(state, from_node_id, file_id, hashes),
         MeshMessage::Have { file_id, chunks, bitmap } => crate::availability::on_have(state, from_node_id, file_id, *chunks, bitmap).await,
+        MeshMessage::HaveChunks { file_id, chunks, runs } => {
+            crate::availability::on_have_chunks(state, from_node_id, file_id, *chunks, runs).await
+        }
+        MeshMessage::WantHave { file_ids } => crate::availability::on_want_have(state, from_node_id, file_ids).await,
         MeshMessage::HaveAll { file_ids } => crate::availability::on_have_all(state, from_node_id, file_ids).await,
         MeshMessage::Lost { file_ids } => crate::availability::on_lost(state, from_node_id, file_ids).await,
         MeshMessage::PeerSync { peers } => {
