@@ -14,7 +14,7 @@ A fast, secure, serverless file-sharing tool built with Rust for local networks,
 - **Folder Support**: share a whole folder; download it into a real folder (Chrome, Edge) or as a streamed zip (everything else)
 - **Cross-Platform**: Works on Linux, macOS, and Windows
 - **Web Interface**: Modern, responsive web UI accessible from any browser
-- **Session Security**: Server restart invalidates old authentication cookies
+- **Session Security**: every device gets its own random, revocable login session; logging out ends only that device's session
 - **Brute-Force Resistant**: Wrong guesses are throttled per device, and the passphrase is never sent over the network
 
 ## Supported Platforms
@@ -81,16 +81,33 @@ When a passphrase is set:
 4. **Per-device sessions**: every device that logs in gets its own session (24 hours, or until the node restarts). Logging out ends only that device's session
 5. **Signed-in devices**: the shield button lists the devices that are signed in. Any device can sign itself out; the machine running LADEX (opened at `http://localhost`) can sign out any of them, which also closes their open connection
 
+### Security Status
+
+LADEX is built for networks you partly trust, such as home, a classroom or an office, and not for the open internet. What has been done:
+
+- A passphrase, numeric or not, always means a browser login. Only a node started with no passphrase is open.
+- A device on the LAN that records all traffic can't join the mesh or use the web UI. The passphrase is never sent, and the mesh handshake is a SPAKE2 exchange that gives an attacker one guess per connection and nothing to crack offline.
+- Wrong login guesses are throttled per address with exponential lockout: 1,000 wrong guesses from one address take over a month.
+
+What to keep in mind:
+
+- Without a passphrase (open mode), anyone on the network can read or change what you share; with `--no-tls`, so can anyone who can watch the traffic between a browser and its node.
+- The passphrase protects joining. Everyone who has it can see and download everything shared on the mesh.
+- The TLS certificate is self-signed, so the first visit from each browser shows a warning.
+- LADEX has not had an independent security audit.
+
 ### Security Model
 
-- **Mesh handshake**: nodes prove they know the passphrase with a SPAKE2 password-authenticated key exchange. The passphrase, and anything derived from it, never crosses the network, so recording traffic or discovery announcements reveals nothing that can be cracked offline. An attacker gets at most one guess per connection.
-- **Man-in-the-middle protection**: the handshake is bound to the TLS certificate each node actually connected to. Someone relaying or terminating the connection with their own certificate can't complete it without the passphrase.
+- **Mesh handshake**: nodes prove they know the passphrase with a SPAKE2 password-authenticated key exchange. The passphrase, and anything derived from it, never crosses the network, so recording traffic or discovery announcements reveals nothing that can be cracked offline. An attacker gets at most one guess per connection. Each node also proves it holds the private key behind its node id, and a node that has been revoked is refused even if it knows the passphrase.
+- **Pairing**: two nodes can also be paired without sharing a passphrase. Open *Pair a device* (the link icon) on both machines at `http://localhost`, enter one device's address on the other, and confirm only if both screens show the same six words. A device in the middle would make the words differ. Paired nodes then reconnect on their keys alone; incoming pairings are accepted only while the panel is open.
+- **Revoking a node**: *Trusted nodes* (the key icon, at `http://localhost`) lists the nodes this one trusts. *Revoke* disconnects a lost or stolen device and sends a revocation, signed with this node's key, to the whole mesh; every node then refuses that key, and nodes that join later learn of it when they connect. A node trusted only by passphrase cannot revoke one that was paired.
+- **Man-in-the-middle protection**: nodes talk over QUIC and prove their keys in the TLS handshake, and the mesh handshake is bound to that very session. A node reached through discovery must hold the key behind the id it announced, and someone relaying or terminating the connection with their own key can't complete the handshake without the passphrase.
 - **Wrong guesses are throttled** at both the browser login and the mesh handshake.
 - **Each browser connection is one device.** A connection can only act as the device it joined as, so one signed-in device can't delete another's files or answer another's downloads. The node, not the browser, decides who uploaded a file and who hosts it.
 - **Nothing from another device is trusted.** File names, sizes and types are cleaned on the node and again on the receiving browser (no path tricks, no look-alike extensions via invisible characters, no Windows device names). A sender can't write more data than it announced, a received folder never overwrites existing files in the folder you chose (clashes become `name (1).ext`), and a resumed download can only continue from bytes you really have.
 - **Clocks can be wrong.** Shared files and devices are ordered with logical clocks, so a device with a wrong clock can't win conflicts or bring back something that was unshared. Updates stamped more than an hour ahead of a device's clock are ignored, and LADEX warns when a peer's clock is more than two minutes off.
 - **Open mode** (no passphrase) has none of these protections. Use it only on networks you trust.
-- **`--no-tls`** turns off encryption and the man-in-the-middle protection; the passphrase itself is still never sent.
+- **`--no-tls`** turns off encryption between browsers and nodes. Nodes always talk to each other over mutually authenticated QUIC, and the passphrase itself is never sent.
 
 ### Basic Operations
 
@@ -99,20 +116,44 @@ When a passphrase is set:
 3. **Connect peers** by sharing the URL and passphrase with other devices
 4. **Send files** by dragging and dropping or using the file picker
 5. **Send folders** by selecting entire directories
-6. **Send messages** using the text input field
-7. **Monitor transfers** with the real-time progress indicators
-8. **Logout** when finished (passphrase mode only)
+6. **Send a file to one device** by clicking that device (or dropping a file on it). It is asked to accept or decline first, and the file is never listed for anyone else
+7. **Send messages** using the text input field
+8. **Monitor transfers** with the real-time progress indicators
+9. **Logout** when finished (passphrase mode only)
 
 ## Where files are kept
 
-Shared files are stored on the node they were shared through, in `~/.ladex/files` (change with `--data-dir`), up to 20 GiB (`--storage-limit-gb`). A node also keeps a copy of any file it fetches for a download, so that it can serve it to others; unsharing a file deletes every copy. Files left half-received are deleted after a day. The node also remembers its identity, chat history, logged-in devices and the nodes it was connected to in `node.state` in the same folder, so a restart doesn't sign everyone out or make the node look new to the mesh; changing the passphrase signs everyone out. Don't share with LADEX what you wouldn't want copied onto the machines of the people on your network: anyone signed in can download any shared file, which stores it on their node.
+Shared files are stored on the node they were shared through, in `~/.ladex/files` (change with `--data-dir`), up to 20 GiB (`--storage-limit-gb`). A node also keeps a copy of any file it fetches for a download, so that it can serve it to others; when the limit is reached, the copies it fetched are removed starting with the least recently used, but files shared from the node are never removed to make room. Unsharing a file deletes every copy. Files left half-received are deleted after a day. Each node has its own key, made on first run, and its node ID is derived from it; the key is kept in the OS keychain (macOS Keychain, Windows Credential Manager, the Secret Service on Linux), or in `identity.key` in the same folder where there is none. The node also remembers its chat history, logged-in devices and the nodes it was connected to in `node.state` in the same folder, so a restart doesn't sign everyone out or make the node look new to the mesh; changing the passphrase signs everyone out. Don't share with LADEX what you wouldn't want copied onto the machines of the people on your network: anyone signed in can download any shared file, which stores it on their node.
+
+## Commands
+
+With a node running, the same `ladex` program controls it from another terminal on the same machine:
+
+```bash
+ladex send report.pdf photos/        # share files and folders with everyone
+ladex send report.pdf --to Bob       # send to one device; it is asked to accept first
+ladex ls                             # list what is shared (--all also lists files inside folders)
+ladex get report.pdf -o ~/Downloads  # download by name or id (default: the current directory)
+ladex seed photos/ --watch           # share a folder, and share it again whenever it changes
+ladex devices                        # list connected devices and nodes
+ladex invite                         # the address for another device, as text and a QR code
+ladex doctor                         # check that the node is running and reachable
+```
+
+- Add `--json` to any command for output a script can read. A command exits with 0 on success and 1 on failure.
+- Add `--data-dir DIR` if the node was started with one; that is how a command finds its node.
+- `get` never overwrites: a second copy is saved as `name (1).ext`. A folder is saved as real directories.
+- `send` and `seed` copy what they share into the node's store, so a shared file takes its size twice on disk.
+- `send --to` takes a device's name or its id from `ladex devices`, and only sends files, not folders. Ctrl-C while it waits leaves the offer open.
+- `seed --watch` shares the whole folder afresh when it changes and takes the earlier version down, so downloads of the earlier version stop.
+- Commands reach the node through a port on `127.0.0.1` and a token in `control.json` in the data folder, which only your user can read.
 
 ## Testing
 
 ```bash
 cargo test                         # unit tests: storage, scheduling, merging, sessions, handshake, zip, ...
 node --test tests/js/*.test.js    # browser-side name handling; shares test cases with the Rust side
-cargo build && for t in data folder client; do node tests/e2e/$t.test.js; done   # real nodes, real HTTP
+cargo build && for t in data folder client restart push cli; do node tests/e2e/$t.test.js; done   # real nodes, real HTTP
 ```
 
 ## Command Line Options
@@ -123,7 +164,9 @@ ladex -s, --secure     # Launch with a generated passphrase
 ladex                  # Launch without a passphrase (open access, prints a warning)
 ladex --local-port N   # Port for the localhost-only HTTP listener (default: port + 1)
 ladex --data-dir DIR   # Where shared files are stored (default: ~/.ladex/files)
+ladex <command> --help # send, get, seed, ls, devices, invite, doctor (see Commands)
 ladex --storage-limit-gb N   # Most disk this node may use for shared files (default: 20)
+ladex --no-keychain    # Keep the node's key in a file in the data folder, not the OS keychain
 ```
 
 ## Build from Source
@@ -161,13 +204,7 @@ cargo test
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request. For major changes, please open an issue first to discuss what you would like to change.
-
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/new-feature`)
-3. Commit your changes (`git commit -m 'Add some new feature'`)
-4. Push to the branch (`git push origin feature/new-feature`)
-5. Open a Pull Request
+Contributions are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) covers setting up, the checks CI runs and how the tests are organised. For a large change, open an issue first. Please report security problems privately, as described in [SECURITY.md](SECURITY.md).
 
 ## License
 

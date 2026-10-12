@@ -1,0 +1,60 @@
+[package]
+name = "ladex-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+test-support = ["dep:tempfile"]
+
+[dependencies]
+warp.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+postcard.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+socket2.workspace = true
+chrono.workspace = true
+futures-util.workspace = true
+mime_guess.workspace = true
+rand.workspace = true
+ring.workspace = true
+hex.workspace = true
+rcgen.workspace = true
+tokio-rustls.workspace = true
+if-addrs.workspace = true
+gethostname.workspace = true
+mdns-sd.workspace = true
+spake2.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+tower-service.workspace = true
+subtle.workspace = true
+fs4.workspace = true
+cap-std.workspace = true
+bytes.workspace = true
+tempfile = { workspace = true, optional = true }
+http-body-util.workspace = true
+percent-encoding.workspace = true
+crc32fast.workspace = true
+blake3.workspace = true
+rayon.workspace = true
+ed25519-dalek.workspace = true
+keyring.workspace = true
+data-encoding.workspace = true
+redb.workspace = true
+quinn.workspace = true
+rustls.workspace = true
+
+[dev-dependencies]
+# Turns on the testing module for this crate's own integration tests in tests/.
+ladex-core = { path = ".", features = ["test-support"] }
+proptest.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+warp = { workspace = true, features = ["test"] }

@@ -1,0 +1,42 @@
+name: Bug report
+description: Something doesn't work as it should.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: For a security problem, please don't use this form; see SECURITY.md instead.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce it
+      placeholder: |
+        1. Start two nodes with `ladex mypassphrase`
+        2. Share a 2 GB file from the first
+        3. ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: LADEX version
+      description: Shown by `ladex --version`, or the release you downloaded.
+    validations:
+      required: true
+  - type: textarea
+    id: setup
+    attributes:
+      label: Devices and network
+      description: Operating systems and browsers involved, how many nodes, and the kind of network (home Wi-Fi, office, hotspot...).
+  - type: textarea
+    id: logs
+    attributes:
+      label: Node logs
+      description: The terminal output of the affected nodes, if you have it. Remove anything private first.
+      render: text

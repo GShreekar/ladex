@@ -9,7 +9,7 @@
     <meta http-equiv="Pragma" content="no-cache">
     <meta http-equiv="Expires" content="0">
     <style>
-        /* BUG-11 fix: self-hosted, same as style.css — see its comment. */
+        /* Self-hosted so the page works without an internet connection. */
         @font-face {
             font-family: 'Orbitron';
             font-style: normal;
@@ -208,7 +208,6 @@
             text-shadow: 0 0 10px rgba(120, 219, 226, 0.3);
         }
 
-        /* Animated background elements */
         .bg-element {
             position: absolute;
             border-radius: 50%;
@@ -254,7 +253,6 @@
             }
         }
 
-        /* Responsive design */
         @media (max-width: 768px) {
             .login-container {
                 padding: 2rem;

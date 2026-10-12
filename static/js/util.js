@@ -1,6 +1,4 @@
-// Small pure helpers for the page: sizes, durations, HTML escaping, device
-// names and random ids. No DOM access, so they are unit tested in Node
-// (tests/js/util.test.js).
+// Small pure helpers for the page, unit tested in Node (tests/js/util.test.js).
 
 (function (root) {
     'use strict';
@@ -13,7 +11,7 @@
         return (bytes / Math.pow(1024, Math.max(i, 0))).toFixed(2) + ' ' + UNITS[Math.max(i, 0)];
     }
 
-    // "42s left", "3m 5s left", "1h 2m left"
+    /** "42s left", "3m 5s left", "1h 2m left" */
     function formatTimeLeft(seconds) {
         const s = Math.round(seconds);
         if (s < 60) return `${s}s left`;
@@ -21,7 +19,7 @@
         return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m left`;
     }
 
-    // Safe inside HTML text and inside quoted attribute values.
+    /** Safe inside HTML text and inside quoted attribute values. */
     function escapeHtml(text) {
         return String(text)
             .replace(/&/g, '&amp;')
@@ -31,7 +29,7 @@
             .replace(/'/g, '&#39;');
     }
 
-    // "Pixel 8 · Chrome" from a User-Agent string, or null when it says nothing useful.
+    /** "Pixel 8 · Chrome" from a User-Agent string, or null when it says nothing useful. */
     function friendlyDeviceName(userAgent) {
         if (!userAgent) return null;
         const ua = userAgent;

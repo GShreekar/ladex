@@ -1,9 +1,4 @@
-// How this page treats names that come from other devices when it writes a
-// downloaded folder to disk: file and folder names are made safe on every
-// platform, and a path can never climb out of the folder. The node cleans
-// names too, but can't be relied on to have done it. The rules mirror
-// src/validate.rs and are tested against the same cases
-// (tests/filename_cases.json).
+// Makes names from other devices safe before writing a downloaded folder; the rules mirror src/validate.rs (tests/filename_cases.json).
 
 (function (root) {
     'use strict';
@@ -20,8 +15,7 @@
         'LPT1', 'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9',
     ]);
     const FORBIDDEN_IN_NAMES = new Set(['<', '>', ':', '"', '/', '\\', '|', '?', '*']);
-    // Control characters plus invisible and bidirectional-override characters
-    // that let "photo\u202Egpj.exe" display as "photoexe.jpg".
+    // Control, invisible and bidi-override characters, which can make "photo\u202Egpj.exe" display as "photoexe.jpg".
     const STRIPPED = /[\u0000-\u001F\u007F-\u009F\u00AD\u061C\u200B-\u200F\u2028\u2029\u202A-\u202E\u2060-\u206F\uFEFF\uFFF9-\uFFFB]/;
 
     function utf8Length(ch) {
@@ -53,7 +47,7 @@
         return (kept || 'unnamed') + extension;
     }
 
-    // Safe as a single file name on Windows, macOS and Linux.
+    /** Safe as a single file name on Windows, macOS and Linux. */
     function sanitizeFileName(input) {
         let cleaned = '';
         for (const ch of String(input ?? '')) {
@@ -71,8 +65,7 @@
         return truncateToBytes(name);
     }
 
-    // A path inside a received folder: "a/b/c.txt". Empty, "." and ".." parts
-    // are dropped, so it can never point outside the folder. null if nothing usable is left.
+    /** A path inside a received folder; "." and ".." parts are dropped so it never leaves the folder. */
     function sanitizeRelativePath(path) {
         if (typeof path !== 'string') return null;
         const segments = [];
@@ -85,7 +78,7 @@
         return byteLength(joined) > MAX_PATH_BYTES ? null : joined;
     }
 
-    // "report.pdf" -> "report (1).pdf", ".bashrc" -> ".bashrc (1)"
+    /** "report.pdf" -> "report (1).pdf", ".bashrc" -> ".bashrc (1)" */
     function numberedName(name, n) {
         const dot = name.lastIndexOf('.');
         const stem = dot > 0 ? name.slice(0, dot) : name;

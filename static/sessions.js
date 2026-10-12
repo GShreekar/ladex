@@ -1,9 +1,4 @@
-// Logout, and the list of devices signed in with the passphrase.
-//
-// Every device that logs in gets its own session. Any device can sign itself
-// out; the machine running LADEX (opened as http://localhost) can also sign
-// out the others. Everything here is built with textContent, never HTML, since
-// device names come from other devices' User-Agent strings.
+// Logout, and the list of signed-in devices; built with textContent since names come from other devices.
 
 (function () {
     'use strict';
@@ -96,7 +91,6 @@
         } catch (_) {
             return; // node unreachable; the app's own reconnect logic handles that
         }
-        // Without a passphrase there are no sessions to manage or end.
         if (!status.auth_required || !status.authenticated) return;
 
         logoutBtn.style.display = 'block';
