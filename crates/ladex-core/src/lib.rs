@@ -10,6 +10,7 @@ pub mod auth;
 pub mod availability;
 pub mod bitmap;
 pub mod catalog;
+pub mod control;
 pub mod discovery;
 pub mod files_api;
 pub mod handlers;

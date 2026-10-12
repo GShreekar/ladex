@@ -10,15 +10,37 @@ use warp::Filter;
 use include_dir::{include_dir, Dir};
 use ladex_core::types::{self, *};
 use ladex_core::{
-    auth, discovery, files_api, handlers, hlc, identity, mdns, mesh, pairing, persist, ratelimit, server, sessions, state, store, tls,
-    transfer, trust, websocket, NodeState,
+    auth, control, discovery, files_api, handlers, hlc, identity, mdns, mesh, pairing, persist, ratelimit, server, sessions, state, store,
+    tls, transfer, trust, websocket, NodeState,
 };
 
 static STATIC_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/../../static");
 
+mod commands;
+mod doctor;
+mod output;
+
 #[derive(Parser)]
 #[command(name = "ladex", version)]
 #[command(about = "LADEX - Local Area Data Exchange", long_about = None)]
+struct Cli {
+    /// Without a command, starts a node; a command talks to the node already running on this machine.
+    #[command(subcommand)]
+    command: Option<commands::Command>,
+
+    #[command(flatten)]
+    node: Args,
+
+    /// Where the node keeps its files and settings. Default: ~/.ladex/files
+    #[arg(long, global = true)]
+    data_dir: Option<std::path::PathBuf>,
+
+    /// Print the result as JSON, for scripts.
+    #[arg(long, global = true)]
+    json: bool,
+}
+
+#[derive(clap::Args)]
 struct Args {
     /// Passphrase for browser logins and for joining the mesh; without one, anyone on the network can do both.
     passphrase: Option<String>,
@@ -54,10 +76,6 @@ struct Args {
     /// Port for a plain-HTTP listener on 127.0.0.1, free of certificate warnings (default: main port + 1; unused with --no-tls).
     #[arg(long)]
     local_port: Option<u16>,
-
-    /// Where shared files are stored on this machine. Default: ~/.ladex/files
-    #[arg(long)]
-    data_dir: Option<std::path::PathBuf>,
 
     /// How long a download may wait for the next piece of a file before giving up.
     #[arg(long, default_value = "60")]
@@ -152,9 +170,16 @@ async fn serve_login_page() -> Result<Box<dyn warp::Reply>, warp::Rejection> {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    let cli = Cli::parse();
+    let data_dir = cli.data_dir.unwrap_or_else(|| tls::config_dir().join("files"));
+    match cli.command {
+        Some(command) => std::process::exit(commands::run(command, &data_dir, cli.json).await),
+        None => run_node(cli.node, data_dir).await,
+    }
+}
 
-    let args = Args::parse();
+async fn run_node(args: Args, data_dir: std::path::PathBuf) {
+    tracing_subscriber::fmt::init();
 
     let passphrase: Option<String> = if args.secure {
         let generated = auth::generate_passphrase();
@@ -179,7 +204,6 @@ async fn main() {
         ),
     }
 
-    let data_dir = args.data_dir.clone().unwrap_or_else(|| tls::config_dir().join("files"));
     let (identity, key_location) = match identity::load_or_create(&data_dir, !args.no_keychain) {
         Ok(loaded) => loaded,
         Err(e) => {
@@ -315,6 +339,15 @@ async fn main() {
     transfer::remember_interrupted(&state);
     let saver = persist::spawn_saver(state.clone(), &data_dir, saved.as_ref());
     tokio::spawn(mesh::quic::accept_loop(state.clone(), mesh_endpoint.clone()));
+
+    match control::server::open(&data_dir).await {
+        Ok((listener, endpoint)) => {
+            let settings =
+                control::Settings { data_dir: data_dir.clone(), discovery_port: (!args.no_discovery).then_some(args.discovery_port) };
+            tokio::spawn(control::server::serve(state.clone(), settings, listener, endpoint));
+        }
+        Err(e) => eprintln!("Note: commands such as `ladex send` will not reach this node ({e})."),
+    }
 
     if !args.manual_peers.is_empty() {
         for peer_addr_str in &args.manual_peers {
@@ -617,7 +650,7 @@ async fn main() {
         );
     }
     if primary_local_ip.is_some() {
-        print_qr_code(&format!("{scheme}://{local_ip}:{}", args.port));
+        output::print_qr_code(&format!("{scheme}://{local_ip}:{}", args.port));
     }
 
     let service = warp::service(routes);
@@ -646,6 +679,7 @@ async fn main() {
             mesh_endpoint.close();
             let _ = tokio::time::timeout(Duration::from_secs(1), mesh_endpoint.wait_idle()).await;
             saver.flush().await;
+            control::server::close(&data_dir);
             if let Some(handle) = mdns_handle {
                 mdns::shutdown(handle).await;
             }
@@ -659,17 +693,6 @@ fn get_local_ip() -> Option<IpAddr> {
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect("8.8.8.8:80").ok()?;
     socket.local_addr().ok().map(|addr| addr.ip())
-}
-
-fn print_qr_code(url: &str) {
-    use qrcode::{render::unicode, QrCode};
-    match QrCode::new(url) {
-        Ok(code) => {
-            let qr = code.render::<unicode::Dense1x2>().quiet_zone(false).build();
-            println!("\nScan to open on your phone:\n{qr}");
-        }
-        Err(e) => tracing::warn!("QR code: failed to encode {url}: {e}"),
-    }
 }
 
 #[cfg(test)]

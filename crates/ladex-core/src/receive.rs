@@ -51,6 +51,8 @@ impl std::fmt::Display for SaveError {
     }
 }
 
+impl std::error::Error for SaveError {}
+
 impl From<io::Error> for SaveError {
     fn from(e: io::Error) -> Self {
         if store::is_disk_full(&e) {

@@ -25,7 +25,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 for t in tests/js/*.test.js; do node "$t"; done
-cargo build && for t in data folder client restart; do node tests/e2e/$t.test.js; done
+cargo build && for t in data folder client restart push cli; do node tests/e2e/$t.test.js; done
 ```
 
 CI also runs `cargo deny check` (licenses, banned and duplicate crates, advisories) and `cargo audit`, and a Linux job that runs real nodes over lossy links (`tests/netem`, needs root).

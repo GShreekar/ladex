@@ -336,7 +336,7 @@ async fn handle_client_message(
     Ok(())
 }
 
-async fn cleanup_peer(state: &NodeState, session_id: &SessionId) {
+pub(crate) async fn cleanup_peer(state: &NodeState, session_id: &SessionId) {
     let peers_count = {
         let mut peers = state.local_peers.write().await;
         peers.remove(session_id);

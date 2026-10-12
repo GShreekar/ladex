@@ -1408,11 +1408,14 @@ dependencies = [
 name = "ladex"
 version = "2.1.0"
 dependencies = [
+ "anyhow",
  "clap",
  "include_dir",
  "ladex-core",
  "mime_guess",
  "qrcode",
+ "serde",
+ "serde_json",
  "tokio",
  "tokio-rustls",
  "tracing",

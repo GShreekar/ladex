@@ -125,12 +125,35 @@ What to keep in mind:
 
 Shared files are stored on the node they were shared through, in `~/.ladex/files` (change with `--data-dir`), up to 20 GiB (`--storage-limit-gb`). A node also keeps a copy of any file it fetches for a download, so that it can serve it to others; when the limit is reached, the copies it fetched are removed starting with the least recently used, but files shared from the node are never removed to make room. Unsharing a file deletes every copy. Files left half-received are deleted after a day. Each node has its own key, made on first run, and its node ID is derived from it; the key is kept in the OS keychain (macOS Keychain, Windows Credential Manager, the Secret Service on Linux), or in `identity.key` in the same folder where there is none. The node also remembers its chat history, logged-in devices and the nodes it was connected to in `node.state` in the same folder, so a restart doesn't sign everyone out or make the node look new to the mesh; changing the passphrase signs everyone out. Don't share with LADEX what you wouldn't want copied onto the machines of the people on your network: anyone signed in can download any shared file, which stores it on their node.
 
+## Commands
+
+With a node running, the same `ladex` program controls it from another terminal on the same machine:
+
+```bash
+ladex send report.pdf photos/        # share files and folders with everyone
+ladex send report.pdf --to Bob       # send to one device; it is asked to accept first
+ladex ls                             # list what is shared (--all also lists files inside folders)
+ladex get report.pdf -o ~/Downloads  # download by name or id (default: the current directory)
+ladex seed photos/ --watch           # share a folder, and share it again whenever it changes
+ladex devices                        # list connected devices and nodes
+ladex invite                         # the address for another device, as text and a QR code
+ladex doctor                         # check that the node is running and reachable
+```
+
+- Add `--json` to any command for output a script can read. A command exits with 0 on success and 1 on failure.
+- Add `--data-dir DIR` if the node was started with one; that is how a command finds its node.
+- `get` never overwrites: a second copy is saved as `name (1).ext`. A folder is saved as real directories.
+- `send` and `seed` copy what they share into the node's store, so a shared file takes its size twice on disk.
+- `send --to` takes a device's name or its id from `ladex devices`, and only sends files, not folders. Ctrl-C while it waits leaves the offer open.
+- `seed --watch` shares the whole folder afresh when it changes and takes the earlier version down, so downloads of the earlier version stop.
+- Commands reach the node through a port on `127.0.0.1` and a token in `control.json` in the data folder, which only your user can read.
+
 ## Testing
 
 ```bash
 cargo test                         # unit tests: storage, scheduling, merging, sessions, handshake, zip, ...
 node --test tests/js/*.test.js    # browser-side name handling; shares test cases with the Rust side
-cargo build && for t in data folder client; do node tests/e2e/$t.test.js; done   # real nodes, real HTTP
+cargo build && for t in data folder client restart push cli; do node tests/e2e/$t.test.js; done   # real nodes, real HTTP
 ```
 
 ## Command Line Options
@@ -141,6 +164,7 @@ ladex -s, --secure     # Launch with a generated passphrase
 ladex                  # Launch without a passphrase (open access, prints a warning)
 ladex --local-port N   # Port for the localhost-only HTTP listener (default: port + 1)
 ladex --data-dir DIR   # Where shared files are stored (default: ~/.ladex/files)
+ladex <command> --help # send, get, seed, ls, devices, invite, doctor (see Commands)
 ladex --storage-limit-gb N   # Most disk this node may use for shared files (default: 20)
 ladex --no-keychain    # Keep the node's key in a file in the data folder, not the OS keychain
 ```

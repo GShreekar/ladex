@@ -18,6 +18,7 @@ use crate::server::{Api, BoxError, PeerAddr, ServerBody};
 use crate::sessions::SessionHandle;
 use crate::store::{chunk_len, Blob, Origin, StoreError, CHUNK_SIZE};
 use crate::transfer::{self, FetchError};
+use crate::types::FileView;
 use crate::{state, validate, zip, NodeState};
 
 const MAX_CONCURRENT_UPLOADS: usize = 8;
@@ -93,6 +94,46 @@ pub async fn read_folder_listing(state: &NodeState, blob: &Blob) -> Result<Folde
         return Err(ListingError::Damaged);
     }
     Ok(listing)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum PublishError {
+    Store(StoreError),
+    Failed(String),
+}
+
+impl std::fmt::Display for PublishError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PublishError::Store(e) => write!(f, "{e}"),
+            PublishError::Failed(why) => f.write_str(why),
+        }
+    }
+}
+
+/// Stores a folder's listing as a file and lists the folder in the catalog; its files must be listed already.
+pub async fn publish_listing(state: &NodeState, id: &str, mut listing: FolderListing, uploader: String) -> Result<FileView, PublishError> {
+    listing.children.sort_by(|a, b| a.path.cmp(&b.path));
+    let bytes = serde_json::to_vec(&listing).unwrap_or_default();
+
+    state::make_room(state, bytes.len() as u64).await;
+    let blob = state.store.create(id, bytes.len() as u64).map_err(PublishError::Store)?;
+    for (index, chunk) in bytes.chunks(CHUNK_SIZE as usize).enumerate() {
+        let stored = blob.write_chunk_hashing(index as u32, chunk.to_vec()).await;
+        stored.map_err(|_| PublishError::Failed("could not store the folder".into()))?;
+    }
+    let root = blob.seal().await.map_err(|why| PublishError::Failed(why.into()))?;
+    let entry = CatalogEntry {
+        file_id: id.to_string(),
+        name: listing.name.clone(),
+        size: bytes.len() as u64,
+        mime_type: "inode/directory".into(),
+        created_at_ms: crate::hlc::wall_clock_ms(),
+        manifest_root: root,
+        uploader_id: uploader,
+        kind: EntryKind::Folder { bytes: listing.children.iter().map(|c| c.size).sum(), files: listing.children.len() as u32 },
+    };
+    state::share_file(state, entry).await.map_err(|refusal| PublishError::Failed(format!("could not list the folder: {refusal}")))
 }
 
 /// Every file in a folder with its path made safe; None if one has left the catalog or has an unusable path.
@@ -726,38 +767,10 @@ impl FilesApi {
                 _ => return fail(StatusCode::CONFLICT, "a file in the folder was not uploaded for it"),
             }
         }
-        listing.children.sort_by(|a, b| a.path.cmp(&b.path));
-        let bytes = serde_json::to_vec(&listing).unwrap_or_default();
-
-        crate::state::make_room(state, bytes.len() as u64).await;
-        let blob = match state.store.create(id, bytes.len() as u64) {
-            Ok(blob) => blob,
-            Err(e) => return store_error(e),
-        };
-        for index in 0..blob.chunk_count() {
-            let start = index as usize * CHUNK_SIZE as usize;
-            let chunk = bytes[start..(start + CHUNK_SIZE as usize).min(bytes.len())].to_vec();
-            if blob.write_chunk_hashing(index, chunk).await.is_err() {
-                return fail(StatusCode::INTERNAL_SERVER_ERROR, "could not store the folder");
-            }
-        }
-        let root = match blob.seal().await {
-            Ok(root) => root,
-            Err(why) => return fail(StatusCode::INTERNAL_SERVER_ERROR, why),
-        };
-        let entry = CatalogEntry {
-            file_id: id.to_string(),
-            name: listing.name.clone(),
-            size: bytes.len() as u64,
-            mime_type: "inode/directory".into(),
-            created_at_ms: crate::hlc::wall_clock_ms(),
-            manifest_root: root,
-            uploader_id: device,
-            kind: EntryKind::Folder { bytes: listing.children.iter().map(|c| c.size).sum(), files: listing.children.len() as u32 },
-        };
-        match state::share_file(state, entry).await {
+        match publish_listing(state, id, listing, device).await {
             Ok(view) => json(StatusCode::CREATED, &serde_json::json!({ "success": true, "file": view })),
-            Err(refusal) => fail(StatusCode::INTERNAL_SERVER_ERROR, &format!("could not list the folder: {refusal}")),
+            Err(PublishError::Store(e)) => store_error(e),
+            Err(PublishError::Failed(why)) => fail(StatusCode::INTERNAL_SERVER_ERROR, &why),
         }
     }
 }
