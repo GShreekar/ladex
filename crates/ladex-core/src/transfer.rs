@@ -173,6 +173,8 @@ pub struct Download {
     readers: Mutex<HashMap<u64, u32>>,
     next_reader: AtomicU64,
     cancelled: AtomicBool,
+    // Set for a file sent to one device: fetched from this node alone, and never announced to the mesh.
+    only_source: Option<NodeId>,
 }
 
 pub struct Reader {
@@ -195,6 +197,8 @@ impl Drop for Reader {
 
 pub struct Transfers {
     downloads: Mutex<HashMap<String, Arc<Download>>>,
+    // Downloads a restart cut short, waiting for a node that has them to connect.
+    interrupted: Mutex<HashSet<String>>,
     tuning: Tuning,
     uploads: UploadSlots,
 }
@@ -212,7 +216,7 @@ impl Transfers {
 
     pub fn with_tuning(tuning: Tuning) -> Self {
         let uploads = UploadSlots::new(tuning.upload_slots);
-        Self { downloads: Mutex::new(HashMap::new()), tuning, uploads }
+        Self { downloads: Mutex::new(HashMap::new()), interrupted: Mutex::new(HashSet::new()), tuning, uploads }
     }
 
     fn get(&self, id: &str) -> Option<Arc<Download>> {
@@ -281,6 +285,22 @@ pub async fn ensure_file(state: &NodeState, id: &str) -> Result<Arc<Blob>, Fetch
         return Ok(blob);
     }
 
+    if start(state, &blob, None) {
+        // Maps told before this node knew the file were dropped, so every peer is asked again.
+        crate::availability::ask_for_maps(state, &[id.to_string()], None).await;
+    }
+    Ok(blob)
+}
+
+/// Fetches a file from one node alone and tells nobody: how a file sent to one device arrives.
+pub fn fetch_from(state: &NodeState, blob: &Arc<Blob>, source: NodeId) {
+    if !blob.is_complete() {
+        start(state, blob, Some(source));
+    }
+}
+
+// False if the file is already being downloaded.
+fn start(state: &NodeState, blob: &Arc<Blob>, only_source: Option<NodeId>) -> bool {
     let (events, receiver) = mpsc::channel(EVENT_QUEUE);
     let download = Arc::new(Download {
         blob: blob.clone(),
@@ -288,18 +308,17 @@ pub async fn ensure_file(state: &NodeState, id: &str) -> Result<Arc<Blob>, Fetch
         readers: Mutex::new(HashMap::new()),
         next_reader: AtomicU64::new(1),
         cancelled: AtomicBool::new(false),
+        only_source,
     });
     {
         let mut downloads = state.transfers.downloads.lock().unwrap();
-        if downloads.contains_key(id) {
-            return Ok(blob);
+        if downloads.contains_key(blob.id()) {
+            return false;
         }
-        downloads.insert(id.to_string(), download.clone());
+        downloads.insert(blob.id().to_string(), download.clone());
     }
     tokio::spawn(run(state.clone(), download, receiver));
-    // Maps told before this node knew the file were dropped, so every peer is asked again.
-    crate::availability::ask_for_maps(state, &[id.to_string()], None).await;
-    Ok(blob)
+    true
 }
 
 // A node with only some of the chunks counts, since a download can start from it and take the rest from others.
@@ -327,6 +346,25 @@ pub fn sources_changed(state: &NodeState) {
     for download in downloads {
         let _ = download.events.try_send(Event::Wake);
     }
+    if !state.transfers.interrupted.lock().unwrap().is_empty() {
+        tokio::spawn(resume_interrupted(state.clone()));
+    }
+}
+
+/// Notes the downloads a restart cut short, so they continue once a node that has them connects.
+pub fn remember_interrupted(state: &NodeState) {
+    let cut_short = state.store.all().into_iter().filter(|blob| blob.origin() == Origin::Cached && !blob.is_complete());
+    state.transfers.interrupted.lock().unwrap().extend(cut_short.map(|blob| blob.id().to_string()));
+}
+
+async fn resume_interrupted(state: NodeState) {
+    let waiting: Vec<String> = state.transfers.interrupted.lock().unwrap().iter().cloned().collect();
+    for id in waiting {
+        // With no source online yet, the file stays on the list for the next change.
+        if !matches!(ensure_file(&state, &id).await, Err(FetchError::NoOneHasIt)) {
+            state.transfers.interrupted.lock().unwrap().remove(&id);
+        }
+    }
 }
 
 pub fn on_manifest(state: &NodeState, from: &NodeId, file_id: &str, hashes_hex: &str) {
@@ -336,8 +374,13 @@ pub fn on_manifest(state: &NodeState, from: &NodeId, file_id: &str, hashes_hex: 
     let _ = download.events.try_send(Event::Manifest { from: from.clone(), hashes });
 }
 
+// A file sent to one device is served to that device's node alone, and only after the device accepted it.
+fn may_serve(state: &NodeState, blob: &Blob, to: &NodeId) -> bool {
+    blob.origin() != Origin::Pushed || state.pushes.may_fetch(blob.id(), to)
+}
+
 pub async fn serve_manifest(state: &NodeState, to: &NodeId, file_id: &str) {
-    let Some(blob) = state.store.get(file_id) else { return };
+    let Some(blob) = state.store.get(file_id).filter(|blob| may_serve(state, blob, to)) else { return };
     let Some(hashes) = blob.hashes() else { return };
     let message = MeshMessage::Manifest {
         file_id: file_id.to_string(),
@@ -368,7 +411,7 @@ where
     let Ok(_slot) = tokio::time::timeout(SLOT_WAIT, state.transfers.uploads.acquire(from)).await else {
         return refuse(&mut writer, ErrorCode::Busy).await;
     };
-    let Some(blob) = state.store.get(&request.file_id) else {
+    let Some(blob) = state.store.get(&request.file_id).filter(|blob| may_serve(state, blob, from)) else {
         return refuse(&mut writer, ErrorCode::NotFound).await;
     };
 
@@ -499,9 +542,13 @@ async fn run(state: NodeState, download: Arc<Download>, mut events: mpsc::Receiv
                 Event::Manifest { from, hashes } => {
                     if !blob.has_manifest() {
                         let root = blob.expected_root().unwrap_or_default();
-                        if let Err(why) = blob.set_manifest(hashes, &root) {
-                            tracing::warn!("Transfer: bad manifest for {id} from {from}: {why}");
-                            peers.entry(from).or_insert_with(|| Peer::new(Instant::now())).ban();
+                        match blob.set_manifest(hashes, &root) {
+                            // Saved at once, so a restart can check the chunks on disk against it.
+                            Ok(()) => blob.persist().await,
+                            Err(why) => {
+                                tracing::warn!("Transfer: bad manifest for {id} from {from}: {why}");
+                                peers.entry(from).or_insert_with(|| Peer::new(Instant::now())).ban();
+                            }
                         }
                     }
                 }
@@ -514,9 +561,9 @@ async fn run(state: NodeState, download: Arc<Download>, mut events: mpsc::Receiv
         }
 
         if blob.bitmap().is_full() && blob.has_manifest() {
-            match blob.seal() {
+            match blob.seal().await {
+                Ok(_) if download.only_source.is_some() => crate::push::on_fetched(&state, &id).await,
                 Ok(_) => {
-                    blob.persist().await;
                     crate::state::broadcast_catalog(&state).await;
                     crate::availability::announce_complete(&state, std::slice::from_ref(&id)).await;
                     tracing::info!("Transfer: {id} complete");
@@ -533,7 +580,10 @@ async fn run(state: NodeState, download: Arc<Download>, mut events: mpsc::Receiv
             .iter()
             .map(|(n, h)| (n.clone(), Link { control: h.sender.clone(), fetches: h.fetches.clone() }))
             .collect();
-        let holders: Vec<NodeId> = state.availability.holders(&id);
+        let holders: Vec<NodeId> = match &download.only_source {
+            Some(source) => vec![source.clone()],
+            None => state.availability.holders(&id),
+        };
         peers.retain(|node, p| connected.contains_key(node) || p.is_banned());
 
         if !blob.has_manifest() {
@@ -553,9 +603,11 @@ async fn run(state: NodeState, download: Arc<Download>, mut events: mpsc::Receiv
                 if peer.is_banned() {
                     continue;
                 }
-                let has = match state.availability.get(node, &id) {
-                    Some(Have::Complete) => None,
-                    Some(Have::Partial(map)) if map.len() == have.len() => Some(map),
+                let has = match (&download.only_source, state.availability.get(node, &id)) {
+                    // The one source of a file sent to a device holds all of it.
+                    (Some(source), _) if source == node => None,
+                    (None, Some(Have::Complete)) => None,
+                    (None, Some(Have::Partial(map))) if map.len() == have.len() => Some(map),
                     _ => continue,
                 };
                 sources.push(Source { has, in_flight: peer.in_flight.len(), speed_bps: peer.speed_bps });
@@ -598,10 +650,11 @@ async fn run(state: NodeState, download: Arc<Download>, mut events: mpsc::Receiv
         }
 
         let have = blob.bitmap();
-        let due = match &told {
-            None => have.count() > 0,
-            Some((at, map)) => have.count() > map.count() && at.elapsed() >= tuning.map_interval,
-        };
+        let due = download.only_source.is_none()
+            && match &told {
+                None => have.count() > 0,
+                Some((at, map)) => have.count() > map.count() && at.elapsed() >= tuning.map_interval,
+            };
         if due {
             crate::availability::announce_progress(&state, &id, &have, told.as_ref().map(|(_, map)| map)).await;
             told = Some((Instant::now(), have));
@@ -841,7 +894,7 @@ mod tests {
             size: content.len() as u64,
             mime_type: "application/octet-stream".into(),
             created_at_ms: crate::hlc::wall_clock_ms(),
-            manifest_root: blob.seal().unwrap(),
+            manifest_root: blob.seal().await.unwrap(),
             uploader_id: "peer_a".into(),
             kind: EntryKind::File { parent: None },
         };
@@ -1110,7 +1163,7 @@ mod tests {
         async fn finish(&self) {
             self.write(self.blob.bitmap().iter_missing().collect::<Vec<u32>>().first().copied().unwrap_or(0)..self.blob.chunk_count())
                 .await;
-            self.blob.seal().unwrap();
+            self.blob.seal().await.unwrap();
             crate::availability::announce_complete(&self.node, &[self.blob.id().to_string()]).await;
         }
     }
@@ -1256,6 +1309,29 @@ mod tests {
         assert!(is_known_host(&a, &b, "file_x").await, "a should be told that b now has the file");
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(b.transfers.active(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_download_cut_short_by_a_restart_continues_once_a_source_connects() {
+        let [a, b] = nodes(["node_a", "node_b"]);
+        let content = data_pattern(4 * CHUNK_SIZE as usize, 12);
+        let entry = share(&a, &[], "file_x", &content).await;
+        list(&[&b], &entry);
+        let partial = b.store.create_with("file_x", entry.size, Origin::Cached).unwrap();
+        partial.set_manifest(a.store.get("file_x").unwrap().hashes().unwrap(), &entry.manifest_root).unwrap();
+        partial.write_chunk_verified(2, chunk_of(&content, 2)).await.unwrap();
+
+        remember_interrupted(&b);
+        sources_changed(&b);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(b.transfers.active(), 0, "nothing starts while no node has the file");
+
+        link(&a, &b, None).await;
+        b.availability.set_complete(&a.node_id, &["file_x".to_string()]);
+        sources_changed(&b);
+
+        assert!(wait_complete(&partial, 10).await, "the download did not continue");
+        assert_eq!(read_all(&partial).await, content);
     }
 
     #[tokio::test(flavor = "multi_thread")]

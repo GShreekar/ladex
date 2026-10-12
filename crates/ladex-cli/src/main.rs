@@ -286,6 +286,7 @@ async fn main() {
             stall_timeout: Duration::from_secs(args.stall_timeout_secs),
             ..Default::default()
         })),
+        pushes: Arc::new(ladex_core::push::Pushes::default()),
         sessions: Arc::new(sessions::SessionStore::new()),
         clock: Arc::new(hlc::Clock::new(node_id.clone())),
         session_owners: Arc::new(RwLock::new(HashMap::new())),
@@ -311,6 +312,7 @@ async fn main() {
         println!("Listed {imported} file(s) shared by an earlier version in the signed catalog");
     }
     state::reconcile_store(&state).await;
+    transfer::remember_interrupted(&state);
     let saver = persist::spawn_saver(state.clone(), &data_dir, saved.as_ref());
     tokio::spawn(mesh::quic::accept_loop(state.clone(), mesh_endpoint.clone()));
 

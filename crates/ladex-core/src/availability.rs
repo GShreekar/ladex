@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 
 use crate::bitmap::Bitmap;
 use crate::mesh::MeshMessage;
-use crate::store::chunk_count;
+use crate::store::{chunk_count, Origin};
 use crate::types::NodeId;
 use crate::{state, transfer, validate, NodeState};
 
@@ -129,7 +129,8 @@ impl Availability {
 
 /// Tells a newly connected peer what this node holds, whole and in part.
 pub fn announce_all(peer_tx: &mpsc::UnboundedSender<MeshMessage>, state: &NodeState) {
-    let blobs = state.store.all();
+    // A file sent to one device is nobody else's business.
+    let blobs: Vec<_> = state.store.all().into_iter().filter(|blob| blob.origin() != Origin::Pushed).collect();
     let complete: Vec<String> = blobs.iter().filter(|blob| blob.is_complete()).map(|blob| blob.id().to_string()).collect();
     for file_ids in complete.chunks(MAX_IDS_PER_MESSAGE) {
         let _ = peer_tx.send(MeshMessage::HaveAll { file_ids: file_ids.to_vec() });
@@ -242,7 +243,7 @@ pub async fn on_want_have(state: &NodeState, from: &NodeId, file_ids: &[String])
     let Some(file_ids) = well_formed_ids(file_ids) else { return };
     let Some(peer) = state.mesh_peers.read().await.get(from).map(|handle| handle.sender.clone()) else { return };
     let mut complete = Vec::new();
-    for blob in file_ids.iter().filter_map(|id| state.store.get(id)) {
+    for blob in file_ids.iter().filter_map(|id| state.store.get(id)).filter(|blob| blob.origin() != Origin::Pushed) {
         let map = blob.bitmap();
         if blob.is_complete() {
             complete.push(blob.id().to_string());

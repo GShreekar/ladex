@@ -131,21 +131,26 @@
         const options = this.serverFiles
             .filter((f) => f.uploader_id === this.sessionId && !f.parent)
             .map((f) => ({ id: f.id, name: f.name, icon: f.is_folder ? '📁' : '📄' }));
-        if (options.length === 0) {
-            this.toast('You have nothing to send — upload something first', 'info');
-            return;
-        }
 
         const targetName = LadexUtil.escapeHtml(this._deviceDisplayName(targetSessionId, this.peers.get(targetSessionId)));
         const popover = document.createElement('div');
         popover.className = 'send-file-popover';
         popover.innerHTML = `
             <div class="send-file-popover-title">Send to ${targetName}</div>
+            <button class="send-file-option" data-action="choose-files">📤 Choose files from this device…</button>
+            <input type="file" multiple hidden>
+            ${options.length > 0 ? '<div class="send-file-popover-title">Or point them at something you shared</div>' : ''}
             ${options.map(o => `
                 <button class="send-file-option" data-file-id="${LadexUtil.escapeHtml(o.id)}">${o.icon} ${LadexUtil.escapeHtml(o.name)}</button>
             `).join('')}
         `;
         document.body.appendChild(popover);
+
+        const chooser = popover.querySelector('input[type="file"]');
+        chooser.addEventListener('change', () => {
+            if (chooser.files.length > 0) this.sendFilesToPeer(chooser.files, targetSessionId);
+            popover.remove();
+        });
 
         const rect = anchorEl.getBoundingClientRect();
         popover.style.left = `${Math.min(rect.left, window.innerWidth - popover.offsetWidth - 16)}px`;
@@ -154,6 +159,10 @@
         popover.addEventListener('click', (e) => {
             const btn = e.target.closest('.send-file-option');
             if (!btn) return;
+            if (btn.dataset.action === 'choose-files') {
+                chooser.click();
+                return;
+            }
             this.offerFileToPeer(btn.dataset.fileId, targetSessionId);
             popover.remove();
         });
@@ -170,9 +179,10 @@
         }, 0);
     };
 
-    /** Someone pointed us at a file; accepting just downloads it. */
+    /** Someone sent us a file, or pointed us at a shared one; nothing is fetched until it is accepted. */
     LADEXApp.prototype._showFileOfferDialog = function(msg) {
-        const file = this.serverFiles.find((f) => f.id === msg.file_id);
+        // A file sent to this device alone is in no list, so the offer says what it is.
+        const file = msg.pushed || this.serverFiles.find((f) => f.id === msg.file_id);
         const senderName = LadexUtil.escapeHtml(this._deviceDisplayName(msg.from_session_id, this.peers.get(msg.from_session_id)));
         const fileName = file ? LadexUtil.escapeHtml(file.name) : 'a file';
         const sizeStr = file ? LadexUtil.formatFileSize(file.is_folder ? file.folder_bytes : file.size) : '';
@@ -197,7 +207,12 @@
 
         document.getElementById('fod-accept').addEventListener('click', () => {
             dialog.remove();
-            this.downloadFile(msg.file_id);
+            if (!msg.pushed) {
+                this.downloadFile(msg.file_id);
+                return;
+            }
+            this.sendWS({ type: 'accept_file_offer', session_id: this.sessionId, file_id: msg.file_id });
+            this.savePushedFile(msg.file_id, msg.pushed.name);
         });
         document.getElementById('fod-decline').addEventListener('click', () => {
             dialog.remove();

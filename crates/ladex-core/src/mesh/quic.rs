@@ -487,6 +487,22 @@ mod tests {
     }
 
     #[test]
+    fn push_messages_survive_postcard() {
+        let file = crate::push::PushedFile {
+            file_id: "file_1".into(),
+            name: "notes.txt".into(),
+            size: 3,
+            mime_type: "text/plain".into(),
+            manifest_root: "ab".repeat(32),
+            from_session: "device_1".into(),
+            to_session: "device_2".into(),
+        };
+        assert_survives_postcard(MeshMessage::PushOffer { file });
+        assert_survives_postcard(MeshMessage::PushAnswer { file_id: "file_1".into(), accepted: true });
+        assert_survives_postcard(MeshMessage::PushReceived { file_id: "file_1".into() });
+    }
+
+    #[test]
     fn a_revocation_still_verifies_after_postcard() {
         let revocation = Revocation::issue(&Identity::generate(), &Identity::generate().public_key(), 5);
         let MeshMessage::Revocations { revocations } = assert_survives_postcard(MeshMessage::Revocations { revocations: vec![revocation] })
@@ -498,7 +514,7 @@ mod tests {
 
     #[test]
     fn a_relayed_signal_still_reads_as_a_server_message_after_postcard() {
-        let offer = ServerMessage::IncomingFileOffer { file_id: "file_1".into(), from_session_id: "device_1".into() };
+        let offer = ServerMessage::IncomingFileOffer { file_id: "file_1".into(), from_session_id: "device_1".into(), pushed: None };
         let relay = MeshMessage::SignalRelay {
             to_node_id: "node_b".into(),
             from_node_id: "node_a".into(),

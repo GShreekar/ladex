@@ -17,6 +17,8 @@ class LADEXApp {
         this.nickname = localStorage.getItem('ladex_nickname') || '';
         // fileId → name for deletes this tab started, so the 'file_removed' echo confirms with the right name.
         this._pendingDeletes = new Map();
+        // fileId → name for files this tab sent to one device, which are in no list to look the name up in.
+        this._sentFiles = new Map();
 
         this._progressCards = new Map();
         this._uploads = new Map();            // transferId → Set of XMLHttpRequests
@@ -149,6 +151,7 @@ class LADEXApp {
             const chip = e.target.closest('.device-chip:not(.device-chip-self)');
             if (!chip) return;
             e.preventDefault();
+            e.dataTransfer.dropEffect = 'copy';
             chip.classList.add('device-chip-dragover');
         });
         devicesList.addEventListener('dragleave', (e) => {
@@ -159,6 +162,11 @@ class LADEXApp {
             if (!chip) return;
             e.preventDefault();
             chip.classList.remove('device-chip-dragover');
+            // A file from this device goes to that device alone; the page-wide drop handler leaves it to this one.
+            if (e.dataTransfer.files.length > 0) {
+                this.sendFilesToPeer(e.dataTransfer.files, chip.dataset.sessionId);
+                return;
+            }
             const fileId = e.dataTransfer.getData('text/plain');
             if (fileId) this.offerFileToPeer(fileId, chip.dataset.sessionId);
         });

@@ -116,9 +116,10 @@ What to keep in mind:
 3. **Connect peers** by sharing the URL and passphrase with other devices
 4. **Send files** by dragging and dropping or using the file picker
 5. **Send folders** by selecting entire directories
-6. **Send messages** using the text input field
-7. **Monitor transfers** with the real-time progress indicators
-8. **Logout** when finished (passphrase mode only)
+6. **Send a file to one device** by clicking that device (or dropping a file on it). It is asked to accept or decline first, and the file is never listed for anyone else
+7. **Send messages** using the text input field
+8. **Monitor transfers** with the real-time progress indicators
+9. **Logout** when finished (passphrase mode only)
 
 ## Where files are kept
 

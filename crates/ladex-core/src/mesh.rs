@@ -143,6 +143,20 @@ pub enum MeshMessage {
     WantHave {
         file_ids: Vec<String>,
     },
+
+    /// A device on the sender wants to send a file to one device on the receiver, outside the catalog.
+    PushOffer {
+        file: crate::push::PushedFile,
+    },
+    /// What the receiving device said to a push offer; a refusal after accepting stops the transfer.
+    PushAnswer {
+        file_id: String,
+        accepted: bool,
+    },
+    /// The receiver has the whole pushed file, so the sender can drop its copy.
+    PushReceived {
+        file_id: String,
+    },
 }
 
 /// What each node tells the other during the handshake, besides its name and key.
@@ -459,6 +473,9 @@ pub(crate) async fn dispatch(msg: &MeshMessage, from_node_id: &NodeId, state: &N
         MeshMessage::WantHave { file_ids } => crate::availability::on_want_have(state, from_node_id, file_ids).await,
         MeshMessage::HaveAll { file_ids } => crate::availability::on_have_all(state, from_node_id, file_ids).await,
         MeshMessage::Lost { file_ids } => crate::availability::on_lost(state, from_node_id, file_ids).await,
+        MeshMessage::PushOffer { file } => crate::push::on_offer(state, from_node_id, file).await,
+        MeshMessage::PushAnswer { file_id, accepted } => crate::push::on_answer(state, from_node_id, file_id, *accepted).await,
+        MeshMessage::PushReceived { file_id } => crate::push::on_received(state, from_node_id, file_id).await,
         MeshMessage::PeerSync { peers } => {
             tracing::debug!("Mesh PeerSync from {from_node_id}: {} peer(s)", peers.len());
             state::apply_peer_sync(state, peers.clone(), from_node_id).await;
@@ -581,12 +598,11 @@ async fn revocations_applied(state: &NodeState, from_node_id: Option<&NodeId>, r
     }
 }
 
-/// A relay may only carry a file offer or its refusal, from a device the sending node really hosts.
+/// A relay may only carry an offer of a catalog file or its refusal, from a device the sending node really hosts.
 async fn relay_is_legitimate(state: &NodeState, msg: &ServerMessage, sender_node: &NodeId) -> bool {
     let claimed_from = match msg {
-        ServerMessage::IncomingFileOffer { from_session_id, .. } | ServerMessage::FileOfferDeclined { from_session_id, .. } => {
-            from_session_id
-        }
+        ServerMessage::IncomingFileOffer { from_session_id, pushed: None, .. }
+        | ServerMessage::FileOfferDeclined { from_session_id, .. } => from_session_id,
         _ => return false,
     };
     let peers = state.local_peers.read().await;
@@ -660,7 +676,7 @@ mod tests {
     }
 
     fn offer(from: &str) -> ServerMessage {
-        ServerMessage::IncomingFileOffer { file_id: "f".into(), from_session_id: from.into() }
+        ServerMessage::IncomingFileOffer { file_id: "f".into(), from_session_id: from.into(), pushed: None }
     }
 
     #[tokio::test]
@@ -710,6 +726,12 @@ mod tests {
             ServerMessage::FileRemoved { file_id: "f".into() },
             ServerMessage::PeerSync { peers: vec![] },
             ServerMessage::MessageHistory { messages: vec![] },
+            // A file sent to one device is offered by its node, which keeps track of it; a relay could only fake one.
+            ServerMessage::IncomingFileOffer {
+                file_id: "f".into(),
+                from_session_id: "peer_x".into(),
+                pushed: Some(OfferedFile { name: "f.bin".into(), size: 1 }),
+            },
         ] {
             assert!(!relay_is_legitimate(&state, &forged, &sender).await, "{forged:?}");
         }

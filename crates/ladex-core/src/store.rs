@@ -1,14 +1,16 @@
 //! On-disk storage for the files this node holds: 1 MiB chunks, each checked against its BLAKE3 hash before it is written.
 //!
-//! Layout under the store root: `blobs/<file_id>` (the data, preallocated), `hashes/<file_id>` (32 bytes per chunk)
-//! and `store.redb` (one record per file: progress, ownership, pin and last access).
+//! Layout under the store root: `partial/<file_id>.part` (a file still arriving, preallocated), `blobs/<file_id>` (a file
+//! that is complete), `hashes/<file_id>` (32 bytes per chunk) and `store.redb` (one record per file: progress, ownership,
+//! pin and last access). A file is renamed from `partial/` to `blobs/` only once every chunk is verified and synced.
 
 mod evict;
 mod index;
 mod legacy;
+mod recover;
 mod rehash;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -142,6 +144,12 @@ pub struct Blob {
     size: u64,
     chunks: u32,
     data: Arc<File>,
+    staged_path: PathBuf,
+    final_path: PathBuf,
+    // Whether the data is still under `partial/`, waiting to be moved into place.
+    is_staged: AtomicBool,
+    // Held while saving, so an older record is never written over a newer one.
+    saving: tokio::sync::Mutex<()>,
     hashes_file: Arc<File>,
     state: Mutex<State>,
     changed: Notify,
@@ -163,13 +171,18 @@ fn now_ms() -> u64 {
 
 struct Layout {
     root: PathBuf,
+    partial: PathBuf,
     blobs: PathBuf,
     hashes: PathBuf,
 }
 
 impl Layout {
     fn new(root: &Path) -> Self {
-        Self { root: root.to_path_buf(), blobs: root.join("blobs"), hashes: root.join("hashes") }
+        Self { root: root.to_path_buf(), partial: root.join("partial"), blobs: root.join("blobs"), hashes: root.join("hashes") }
+    }
+
+    fn staged(&self, id: &str) -> PathBuf {
+        self.partial.join(format!("{id}.part"))
     }
 
     fn data(&self, id: &str) -> PathBuf {
@@ -252,6 +265,14 @@ impl Blob {
 
     pub fn is_removed(&self) -> bool {
         self.removed.load(Ordering::Relaxed)
+    }
+
+    fn data_path(&self) -> &Path {
+        if self.is_staged.load(Ordering::Acquire) {
+            &self.staged_path
+        } else {
+            &self.final_path
+        }
     }
 
     /// Held while an upload is writing this file; None if another one is.
@@ -454,12 +475,36 @@ impl Blob {
         self.state.lock().unwrap().expected_root.get_or_insert_with(|| root.to_string());
     }
 
-    /// Once every chunk is present, fixes the manifest root and marks the file complete.
-    pub fn seal(&self) -> Result<String, &'static str> {
-        let mut state = self.state.lock().unwrap();
-        if let Some(root) = &state.sealed {
-            return Ok(root.clone());
+    /// Once every chunk is present, moves the file into place and marks it complete; a crash leaves it either partial or complete.
+    pub async fn seal(&self) -> Result<String, &'static str> {
+        let _saving = self.saving.lock().await;
+        if let Some(root) = self.manifest_root() {
+            return Ok(root);
         }
+        if self.is_removed() {
+            return Err("file was removed");
+        }
+        let root = self.complete_root()?;
+        let mut record = self.record();
+        record.sealed = Some(root.clone());
+        if let Err(e) = self.finalize(record).await {
+            tracing::warn!("Store: could not finish {}: {e}", self.id);
+            return Err("could not save the file");
+        }
+        {
+            let mut state = self.state.lock().unwrap();
+            // A chunk found damaged while the file was being saved must be fetched again first.
+            if !state.have.is_full() {
+                return Err("file is not complete");
+            }
+            state.sealed = Some(root.clone());
+        }
+        self.changed();
+        Ok(root)
+    }
+
+    fn complete_root(&self) -> Result<String, &'static str> {
+        let state = self.state.lock().unwrap();
         if !state.have.is_full() || !state.hash_known.is_full() {
             return Err("file is not complete");
         }
@@ -467,33 +512,68 @@ impl Blob {
         if state.expected_root.as_ref().is_some_and(|expected| *expected != root) {
             return Err("file does not match the catalog");
         }
-        state.sealed = Some(root.clone());
-        drop(state);
-        self.changed();
         Ok(root)
     }
 
+    // Renamed only after the data is synced, and recorded complete only after the rename.
+    async fn finalize(&self, record: Record) -> anyhow::Result<()> {
+        if self.is_staged.load(Ordering::Acquire) {
+            let (data, hashes) = (self.data.clone(), self.hashes_file.clone());
+            let (from, to) = (self.staged_path.clone(), self.final_path.clone());
+            tokio::task::spawn_blocking(move || -> io::Result<()> {
+                data.sync_all()?;
+                hashes.sync_all()?;
+                move_into_place(&from, &to)
+            })
+            .await??;
+            self.is_staged.store(false, Ordering::Release);
+        }
+        self.save(record).await
+    }
+
     pub async fn persist(&self) {
+        let _saving = self.saving.lock().await;
         self.writes_since_persist.store(0, Ordering::Relaxed);
         if self.is_removed() {
             return;
         }
         self.access_unsaved.store(false, Ordering::Relaxed);
-        let (record, index, id) = (self.record(), self.index.clone(), self.id.clone());
+        if let Err(e) = self.save(self.record()).await {
+            tracing::warn!("Store: could not save progress for {}: {e}", self.id);
+        }
+    }
+
+    async fn save(&self, record: Record) -> anyhow::Result<()> {
+        let (index, id) = (self.index.clone(), self.id.clone());
         let (data, hashes) = (self.data.clone(), self.hashes_file.clone());
-        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        tokio::task::spawn_blocking(move || {
             // Data first, so the saved progress never claims chunks that aren't on disk.
             data.sync_data()?;
             hashes.sync_data()?;
             index.put(&id, &record)
         })
-        .await;
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::warn!("Store: could not save progress for {}: {e}", self.id),
-            Err(e) => tracing::warn!("Store: could not save progress for {}: {e}", self.id),
-        }
+        .await?
     }
+}
+
+// The rename is what completes a file, so both directories are synced to make it survive a power cut.
+fn move_into_place(from: &Path, to: &Path) -> io::Result<()> {
+    std::fs::rename(from, to)?;
+    for dir in [from.parent(), to.parent()].into_iter().flatten() {
+        sync_dir(dir)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    File::open(dir)?.sync_all()
+}
+
+// Windows cannot open a directory to sync it; NTFS journals the rename itself.
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 pub struct WriteGuard(Arc<Blob>);
@@ -515,6 +595,7 @@ struct Header {
 struct OpenFiles {
     data: File,
     hashes_file: File,
+    is_staged: bool,
 }
 
 struct Registry {
@@ -534,7 +615,7 @@ impl Store {
     /// Opens the store, picking up files and partial files from earlier runs.
     pub fn open(root: &Path, quota: u64) -> io::Result<Self> {
         let layout = Layout::new(root);
-        for dir in [root, layout.blobs.as_path(), layout.hashes.as_path()] {
+        for dir in [root, layout.partial.as_path(), layout.blobs.as_path(), layout.hashes.as_path()] {
             create_private_dir(dir)?;
         }
         let index = Arc::new(Index::open(&layout.index()).map_err(io::Error::other)?);
@@ -571,11 +652,12 @@ impl Store {
     // Files left by a crash between writing them and recording them would otherwise count against the disk forever.
     fn remove_unrecorded_files(&self) -> io::Result<()> {
         let registry = self.registry.lock().unwrap();
-        for dir in [&self.layout.blobs, &self.layout.hashes] {
+        let recorded: HashSet<PathBuf> =
+            registry.blobs.values().flat_map(|blob| [blob.data_path().to_path_buf(), self.layout.hashes(&blob.id)]).collect();
+        for dir in [&self.layout.partial, &self.layout.blobs, &self.layout.hashes] {
             for entry in std::fs::read_dir(dir)? {
                 let path = entry?.path();
-                let recorded = path.file_name().and_then(|n| n.to_str()).is_some_and(|id| registry.blobs.contains_key(id));
-                if !recorded {
+                if !recorded.contains(&path) {
                     tracing::warn!("Store: removing {} (not in the index)", path.display());
                     let _ = std::fs::remove_file(path);
                 }
@@ -588,7 +670,12 @@ impl Store {
         if !validate::is_valid_id(id) {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "bad id"));
         }
-        let data = OpenOptions::new().read(true).write(true).open(self.layout.data(id))?;
+        let is_staged = record.sealed.is_none();
+        if is_staged {
+            self.stage_unfinished(id)?;
+        }
+        let data_path = if is_staged { self.layout.staged(id) } else { self.layout.data(id) };
+        let data = OpenOptions::new().read(true).write(true).open(data_path)?;
         if data.metadata()?.len() != record.size {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "data file has the wrong size"));
         }
@@ -611,7 +698,41 @@ impl Store {
         };
         let state =
             State { have, hashes, hash_known, expected_root: record.expected_root, sealed: record.sealed, legacy_entry: record.entry };
-        Ok(self.new_blob(id, header, OpenFiles { data, hashes_file }, state))
+        let blob = self.new_blob(id, header, OpenFiles { data, hashes_file, is_staged }, state);
+        if is_staged {
+            self.resume(&blob)?;
+        }
+        Ok(blob)
+    }
+
+    // An unfinished file found in `blobs/` was caught between its rename and its record, or kept there by an older version.
+    fn stage_unfinished(&self, id: &str) -> io::Result<()> {
+        let (staged, finished) = (self.layout.staged(id), self.layout.data(id));
+        if !staged.exists() && finished.exists() {
+            std::fs::rename(finished, staged)?;
+        }
+        Ok(())
+    }
+
+    // Picks up what a crash cut short: chunks written after the last save, and a download with every chunk not yet moved into place.
+    fn resume(&self, blob: &Blob) -> io::Result<()> {
+        let recovered = recover::recover_chunks(&blob.data, blob.size, &mut blob.state.lock().unwrap())?;
+        // Only a download is finished here: an upload is listed by the request that completes it.
+        let finished_root = blob.expected_root().and_then(|_| blob.complete_root().ok());
+        if recovered == 0 && finished_root.is_none() {
+            return Ok(());
+        }
+        if recovered > 0 {
+            tracing::info!("Store: found {recovered} chunks of {} on disk that were written but not yet recorded", blob.id);
+        }
+        blob.data.sync_all()?;
+        blob.hashes_file.sync_all()?;
+        if let Some(root) = finished_root {
+            move_into_place(&blob.staged_path, &blob.final_path)?;
+            blob.is_staged.store(false, Ordering::Release);
+            blob.state.lock().unwrap().sealed = Some(root);
+        }
+        self.index.put(&blob.id, &blob.record()).map_err(io::Error::other)
     }
 
     fn new_blob(&self, id: &str, header: Header, files: OpenFiles, state: State) -> Arc<Blob> {
@@ -620,6 +741,10 @@ impl Store {
             size: header.size,
             chunks: chunk_count(header.size),
             data: Arc::new(files.data),
+            staged_path: self.layout.staged(id),
+            final_path: self.layout.data(id),
+            is_staged: AtomicBool::new(files.is_staged),
+            saving: tokio::sync::Mutex::new(()),
             hashes_file: Arc::new(files.hashes_file),
             state: Mutex::new(state),
             changed: Notify::new(),
@@ -677,7 +802,7 @@ impl Store {
 
         let chunks = chunk_count(size);
         let create = |path: &Path| OpenOptions::new().read(true).write(true).create(true).truncate(true).open(path);
-        let data = create(&self.layout.data(id))?;
+        let data = create(&self.layout.staged(id))?;
         data.set_len(size)?;
         let hashes_file = create(&self.layout.hashes(id))?;
         hashes_file.set_len(chunks as u64 * 32)?;
@@ -692,7 +817,7 @@ impl Store {
         };
         let now = now_ms();
         let header = Header { size, origin, pinned: false, created_ms: now, last_access_ms: now };
-        let blob = self.new_blob(id, header, OpenFiles { data, hashes_file }, state);
+        let blob = self.new_blob(id, header, OpenFiles { data, hashes_file, is_staged: true }, state);
         if let Err(e) = self.index.put(id, &blob.record()) {
             self.delete_files(id);
             return Err(StoreError::Io(e.to_string()));
@@ -728,8 +853,9 @@ impl Store {
         }
     }
 
+    // The staged copy goes first, so a file being moved into place at this moment is still caught.
     fn delete_files(&self, id: &str) {
-        for path in [self.layout.data(id), self.layout.hashes(id)] {
+        for path in [self.layout.staged(id), self.layout.data(id), self.layout.hashes(id)] {
             let _ = std::fs::remove_file(path);
         }
     }
@@ -846,7 +972,7 @@ mod tests {
         assert!(!blob.is_complete());
 
         upload(&blob, &content).await;
-        let root = blob.seal().unwrap();
+        let root = blob.seal().await.unwrap();
 
         assert!(blob.is_complete());
         assert_eq!(blob.manifest_root(), Some(root.clone()));
@@ -871,7 +997,7 @@ mod tests {
         let content = pattern(CHUNK_SIZE as usize + 100, 3);
         let source = origin.create("file_a", content.len() as u64).unwrap();
         upload(&source, &content).await;
-        let root = source.seal().unwrap();
+        let root = source.seal().await.unwrap();
 
         let (_dir2, other) = store(1 << 40);
         let copy = other.create("file_a", content.len() as u64).unwrap();
@@ -890,9 +1016,9 @@ mod tests {
         assert!(!copy.has_chunk(0));
 
         copy.write_chunk_verified(0, content[..CHUNK_SIZE as usize].to_vec()).await.unwrap();
-        assert!(copy.seal().is_err(), "not complete yet");
+        assert!(copy.seal().await.is_err(), "not complete yet");
         copy.write_chunk_verified(1, content[CHUNK_SIZE as usize..].to_vec()).await.unwrap();
-        assert_eq!(copy.seal().unwrap(), root);
+        assert_eq!(copy.seal().await.unwrap(), root);
         assert_eq!(copy.read_chunk(1).await.unwrap(), content[CHUNK_SIZE as usize..]);
     }
 
@@ -902,7 +1028,7 @@ mod tests {
         let blob = store.create("file_a", 10).unwrap();
         blob.expect_root(&"0".repeat(64));
         blob.write_chunk_hashing(0, vec![1; 10]).await.unwrap();
-        assert!(blob.seal().is_err());
+        assert!(blob.seal().await.is_err());
         assert!(!blob.is_complete());
     }
 
@@ -933,7 +1059,7 @@ mod tests {
         assert_eq!(blob.read_chunk(1).await.unwrap(), content[CHUNK_SIZE as usize..2 * CHUNK_SIZE as usize]);
 
         blob.write_chunk_hashing(2, content[2 * CHUNK_SIZE as usize..].to_vec()).await.unwrap();
-        let root_hash = blob.seal().unwrap();
+        let root_hash = blob.seal().await.unwrap();
         blob.persist().await;
         drop((store, blob));
 
@@ -969,12 +1095,12 @@ mod tests {
         let blob = store.create("file_a", 600).unwrap();
         blob.write_chunk_hashing(0, vec![1; 600]).await.unwrap();
         blob.persist().await;
-        assert!(dir.path().join("files/blobs/file_a").exists());
+        assert!(dir.path().join("files/partial/file_a.part").exists());
 
         store.remove("file_a");
         assert!(blob.is_removed());
         assert!(store.get("file_a").is_none());
-        assert!(!dir.path().join("files/blobs/file_a").exists());
+        assert!(!dir.path().join("files/partial/file_a.part").exists());
         assert!(store.create("file_b", 900).is_ok());
         assert_eq!(blob.write_chunk_hashing(0, vec![1; 600]).await, Err(WriteError::Removed));
     }
@@ -1008,7 +1134,7 @@ mod tests {
         let (_dir, store) = store(1000);
         let blob = store.create("file_empty", 0).unwrap();
         assert_eq!(blob.chunk_count(), 0);
-        assert_eq!(blob.seal().unwrap(), manifest_root(0, &[]));
+        assert_eq!(blob.seal().await.unwrap(), manifest_root(0, &[]));
     }
 
     #[cfg(unix)]
@@ -1026,7 +1152,7 @@ mod tests {
         let content = pattern(CHUNK_SIZE as usize * 2, 4);
         let blob = store.create("file_a", content.len() as u64).unwrap();
         upload(&blob, &content).await;
-        blob.seal().unwrap();
+        blob.seal().await.unwrap();
         assert_eq!(blob.read_chunk_verified(1).await.unwrap(), content[CHUNK_SIZE as usize..]);
 
         let path = dir.path().join("files/blobs/file_a");
@@ -1040,22 +1166,22 @@ mod tests {
         assert!(blob.has_chunk(0));
 
         blob.write_chunk_verified(1, content[CHUNK_SIZE as usize..].to_vec()).await.unwrap();
-        assert_eq!(blob.seal().unwrap(), manifest_root(content.len() as u64, &blob.hashes().unwrap()));
+        assert_eq!(blob.seal().await.unwrap(), manifest_root(content.len() as u64, &blob.hashes().unwrap()));
         assert_eq!(blob.read_chunk_verified(1).await.unwrap(), content[CHUNK_SIZE as usize..]);
     }
 
     async fn complete(store: &Store, id: &str, len: usize, origin: Origin) -> Arc<Blob> {
         let blob = store.create_with(id, len as u64, origin).unwrap();
         blob.write_chunk_hashing(0, vec![1; len]).await.unwrap();
-        blob.seal().unwrap();
+        blob.seal().await.unwrap();
         tokio::time::sleep(Duration::from_millis(3)).await;
         blob
     }
 
-    #[test]
-    fn files_live_under_blobs_and_hashes_with_a_redb_index() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn files_live_under_blobs_and_hashes_with_a_redb_index() {
         let (dir, store) = store(1000);
-        store.create("file_a", 10).unwrap();
+        complete(&store, "file_a", 10, Origin::Published).await;
         let root = dir.path().join("files");
         assert_eq!(std::fs::metadata(root.join("blobs/file_a")).unwrap().len(), 10);
         assert_eq!(std::fs::metadata(root.join("hashes/file_a")).unwrap().len(), 32);
@@ -1063,6 +1189,161 @@ mod tests {
 
         store.remove("file_a");
         assert!(!root.join("blobs/file_a").exists() && !root.join("hashes/file_a").exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_file_stays_in_partial_until_it_is_sealed() {
+        let (dir, store) = store(1 << 40);
+        let root = dir.path().join("files");
+        let content = pattern(CHUNK_SIZE as usize + 10, 1);
+        let blob = store.create("file_a", content.len() as u64).unwrap();
+        blob.write_chunk_hashing(0, content[..CHUNK_SIZE as usize].to_vec()).await.unwrap();
+        assert!(root.join("partial/file_a.part").exists() && !root.join("blobs/file_a").exists());
+
+        blob.write_chunk_hashing(1, content[CHUNK_SIZE as usize..].to_vec()).await.unwrap();
+        assert!(!root.join("blobs/file_a").exists(), "every chunk is there, but the file is not sealed yet");
+
+        blob.seal().await.unwrap();
+        assert!(!root.join("partial/file_a.part").exists());
+        assert_eq!(std::fs::read(root.join("blobs/file_a")).unwrap(), content);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sealed_file_is_complete_after_a_restart_without_another_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("files");
+        let content = pattern(CHUNK_SIZE as usize * 2, 2);
+        let sealed_root = {
+            let store = Store::open(&root, 1 << 40).unwrap();
+            let blob = store.create("file_a", content.len() as u64).unwrap();
+            upload(&blob, &content).await;
+            blob.seal().await.unwrap()
+        };
+
+        let (_store, blob) = reopen(&root);
+        assert_eq!(blob.manifest_root(), Some(sealed_root));
+        assert_eq!(blob.read_chunk_verified(1).await.unwrap(), content[CHUNK_SIZE as usize..]);
+    }
+
+    // What a download looks like when the node is killed: the manifest was saved, the chunks written after it were not.
+    async fn interrupted_download(root: &Path, content: &[u8], written: std::ops::Range<u32>) {
+        let (_dir, origin) = store(1 << 40);
+        let source = origin.create("file_a", content.len() as u64).unwrap();
+        upload(&source, content).await;
+        let manifest_root = source.seal().await.unwrap();
+
+        let store = Store::open(root, 1 << 40).unwrap();
+        let blob = store.create_with("file_a", content.len() as u64, Origin::Cached).unwrap();
+        blob.set_manifest(source.hashes().unwrap(), &manifest_root).unwrap();
+        blob.persist().await;
+        for index in written {
+            let start = index as usize * CHUNK_SIZE as usize;
+            let end = (start + CHUNK_SIZE as usize).min(content.len());
+            blob.write_chunk_verified(index, content[start..end].to_vec()).await.unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn chunks_written_but_not_saved_before_a_crash_are_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("files");
+        let content = pattern(CHUNK_SIZE as usize * 4, 3);
+        interrupted_download(&root, &content, 1..3).await;
+
+        let (_store, blob) = reopen(&root);
+        assert!(!blob.has_chunk(0) && blob.has_chunk(1) && blob.has_chunk(2) && !blob.has_chunk(3));
+        assert!(!blob.is_complete());
+        assert_eq!(blob.read_chunk_verified(2).await.unwrap(), content[2 * CHUNK_SIZE as usize..3 * CHUNK_SIZE as usize]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_chunk_torn_by_a_crash_is_fetched_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("files");
+        let content = pattern(CHUNK_SIZE as usize * 3, 4);
+        interrupted_download(&root, &content, 0..2).await;
+        let path = root.join("partial/file_a.part");
+        let mut raw = std::fs::read(&path).unwrap();
+        raw[CHUNK_SIZE as usize + 9] ^= 0xff;
+        std::fs::write(&path, raw).unwrap();
+
+        let (_store, blob) = reopen(&root);
+        assert!(blob.has_chunk(0) && !blob.has_chunk(1));
+        blob.write_chunk_verified(1, content[CHUNK_SIZE as usize..2 * CHUNK_SIZE as usize].to_vec()).await.unwrap();
+        assert!(blob.has_chunk(1));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn chunks_recovered_after_a_crash_are_recorded_for_the_next_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("files");
+        let content = pattern(CHUNK_SIZE as usize * 3, 5);
+        interrupted_download(&root, &content, 0..2).await;
+        drop(reopen(&root));
+        // Damage that only a second look at the data would notice.
+        std::fs::write(root.join("partial/file_a.part"), vec![0u8; content.len()]).unwrap();
+
+        let (_store, blob) = reopen(&root);
+        assert_eq!(blob.bitmap().count(), 2, "the recovered chunks were saved, not found again");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_download_that_had_every_chunk_is_finished_on_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("files");
+        let content = pattern(CHUNK_SIZE as usize * 2 + 5, 6);
+        interrupted_download(&root, &content, 0..3).await;
+
+        let (_store, blob) = reopen(&root);
+        assert!(blob.is_complete());
+        assert_eq!(std::fs::read(root.join("blobs/file_a")).unwrap(), content);
+        assert!(!root.join("partial/file_a.part").exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_download_killed_between_its_rename_and_its_record_is_still_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("files");
+        let content = pattern(CHUNK_SIZE as usize * 2, 7);
+        interrupted_download(&root, &content, 0..2).await;
+        std::fs::rename(root.join("partial/file_a.part"), root.join("blobs/file_a")).unwrap();
+
+        let (_store, blob) = reopen(&root);
+        assert!(blob.is_complete());
+        assert_eq!(std::fs::read(root.join("blobs/file_a")).unwrap(), content);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unfinished_file_found_in_blobs_goes_back_to_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("files");
+        let content = pattern(CHUNK_SIZE as usize * 2, 8);
+        {
+            let store = Store::open(&root, 1 << 40).unwrap();
+            let blob = store.create("file_a", content.len() as u64).unwrap();
+            blob.write_chunk_hashing(0, content[..CHUNK_SIZE as usize].to_vec()).await.unwrap();
+            blob.persist().await;
+        }
+        std::fs::rename(root.join("partial/file_a.part"), root.join("blobs/file_a")).unwrap();
+
+        let (_store, blob) = reopen(&root);
+        assert!(!blob.is_complete() && blob.has_chunk(0) && !blob.has_chunk(1));
+        assert!(root.join("partial/file_a.part").exists() && !root.join("blobs/file_a").exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_upload_with_every_chunk_waits_for_its_request_to_finish_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("files");
+        let content = pattern(CHUNK_SIZE as usize * 2, 9);
+        {
+            let store = Store::open(&root, 1 << 40).unwrap();
+            upload(&store.create("file_a", content.len() as u64).unwrap(), &content).await;
+        }
+
+        let (_store, blob) = reopen(&root);
+        assert!(blob.bitmap().is_full() && !blob.is_complete());
+        assert_eq!(blob.seal().await.unwrap(), manifest_root(content.len() as u64, &blob.hashes().unwrap()));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1157,8 +1438,9 @@ mod tests {
             store.create("file_kept", 10).unwrap();
             store.create("file_lost", 10).unwrap();
         }
-        std::fs::remove_file(root.join("blobs/file_lost")).unwrap();
+        std::fs::remove_file(root.join("partial/file_lost.part")).unwrap();
         std::fs::write(root.join("blobs/file_stray"), b"left by a crash").unwrap();
+        std::fs::write(root.join("partial/file_stray.part"), b"left by a crash").unwrap();
         std::fs::write(root.join("hashes/file_stray"), b"").unwrap();
 
         let store = Store::open(&root, 1000).unwrap();
@@ -1166,6 +1448,7 @@ mod tests {
         assert!(store.get("file_lost").is_none());
         assert_eq!(store.used_bytes(), 10);
         assert!(!root.join("blobs/file_stray").exists() && !root.join("hashes/file_stray").exists());
+        assert!(!root.join("partial/file_stray.part").exists());
         assert!(!root.join("hashes/file_lost").exists());
     }
 
@@ -1186,7 +1469,7 @@ mod tests {
         let blob = store.get("file_old").unwrap();
         assert_eq!(blob.origin(), Origin::Published);
         assert_eq!(store.used_bytes(), 10);
-        assert_eq!(std::fs::read(root.join("blobs/file_old")).unwrap(), vec![7u8; 10]);
+        assert_eq!(std::fs::read(root.join("partial/file_old.part")).unwrap(), vec![7u8; 10]);
         assert!(!root.join("file_old.data").exists() && !root.join("file_old.json").exists());
     }
 }

@@ -21,6 +21,7 @@ pub mod mdns;
 pub mod mesh;
 pub mod pairing;
 pub mod persist;
+pub mod push;
 pub mod ratelimit;
 pub mod revocation;
 pub mod server;
@@ -97,6 +98,9 @@ pub struct NodeState {
     /// The files this node holds (see store.rs), and the transfers in progress (see transfer.rs).
     pub store: Arc<store::Store>,
     pub transfers: Arc<transfer::Transfers>,
+
+    /// Files being sent to one device, outside the catalog (see push.rs).
+    pub pushes: Arc<push::Pushes>,
 
     /// The signed-op catalog that replaces `files`, and is kept in step across the mesh by version vectors (see catalog.rs).
     pub catalog: Arc<catalog::shared::SharedCatalog>,
@@ -180,6 +184,7 @@ impl NodeState {
                 stream_stall_timeout: Duration::from_secs(10),
                 upload_slots: transfer::UPLOAD_SLOTS,
             })),
+            pushes: Arc::new(push::Pushes::default()),
             catalog: Arc::new(catalog::shared::SharedCatalog::open(&data_dir, state::MAX_CATALOG_ENTRIES).unwrap()),
             session_owners: Arc::new(RwLock::new(HashMap::new())),
             connection_counter: Arc::new(AtomicU64::new(1)),

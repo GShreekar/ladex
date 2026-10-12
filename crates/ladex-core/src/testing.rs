@@ -12,7 +12,7 @@ use crate::catalog::{CatalogEntry, EntryKind};
 use crate::identity::Identity;
 use crate::mesh::endpoint::MeshEndpoint;
 use crate::store::CHUNK_SIZE;
-use crate::types::{FileView, NodeId, PeerInfo, TextMessage};
+use crate::types::{FileView, NodeId, PeerInfo, ServerMessage, TextMessage};
 use crate::{mesh, ratelimit, state, NodeState};
 
 mod faulty_link;
@@ -205,7 +205,7 @@ impl NodeHandle {
             size: content.len() as u64,
             mime_type: "application/octet-stream".to_string(),
             created_at_ms: crate::hlc::wall_clock_ms(),
-            manifest_root: blob.seal().expect("seal the file"),
+            manifest_root: blob.seal().await.expect("seal the file"),
             uploader_id: self.device_id(),
             kind: EntryKind::File { parent: None },
         };
@@ -256,9 +256,24 @@ impl NodeHandle {
         device
     }
 
+    /// Connects a browser device and returns what the node sends to its tab.
+    pub async fn open_tab(&self, session_id: &str) -> tokio::sync::mpsc::UnboundedReceiver<ServerMessage> {
+        let (tab, inbox) = tokio::sync::mpsc::unbounded_channel();
+        self.state.local_senders.write().await.insert(session_id.to_string(), tab);
+        self.connect_device(session_id).await;
+        inbox
+    }
+
     /// Devices this node knows of, wherever they are hosted.
     pub async fn devices(&self) -> BTreeSet<String> {
         self.state.local_peers.read().await.keys().cloned().collect()
+    }
+
+    /// The devices known right now and still connected, without waiting for anything.
+    pub fn devices_now(&self) -> BTreeSet<String> {
+        let devices =
+            self.state.local_peers.try_read().map(|peers| peers.values().filter(|d| !d.left).map(|d| d.session_id.clone()).collect());
+        devices.unwrap_or_default()
     }
 
     /// Leaves the mesh the way a node does on Ctrl-C.

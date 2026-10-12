@@ -196,6 +196,7 @@ pub async fn collect_garbage(state: &NodeState) {
 async fn collect_garbage_with(state: &NodeState, partial_ttl: std::time::Duration, orphan_ttl_ms: u64) {
     state.store.save_access_times().await;
     make_room(state, 0).await;
+    crate::push::collect_garbage(state);
     for blob in state.store.all() {
         let abandoned =
             !blob.is_complete() && !blob.is_being_written() && !state.transfers.is_downloading(blob.id()) && blob.idle_for() >= partial_ttl;
@@ -520,7 +521,7 @@ mod tests {
         let _guard = writing.try_write_lock().unwrap();
         let complete = state.store.create("file_complete", 10).unwrap();
         complete.write_chunk_hashing(0, vec![1; 10]).await.unwrap();
-        complete.seal().unwrap();
+        complete.seal().await.unwrap();
 
         collect_garbage_with(&state, std::time::Duration::from_secs(3600), UNPUBLISHED_FOLDER_FILES_MS).await;
         assert!(state.store.get("file_partial").is_some(), "recently touched files stay");
@@ -552,7 +553,7 @@ mod tests {
     async fn hold(state: &NodeState, id: &str) {
         let blob = state.store.create(id, 10).unwrap();
         blob.write_chunk_hashing(0, vec![1; 10]).await.unwrap();
-        blob.seal().unwrap();
+        blob.seal().await.unwrap();
     }
 
     #[tokio::test]
@@ -675,7 +676,7 @@ mod tests {
         for (id, origin) in [("file_cached", Origin::Cached), ("file_mine", Origin::Published)] {
             let blob = state.store.create_with(id, 50, origin).unwrap();
             blob.write_chunk_hashing(0, vec![1; 50]).await.unwrap();
-            blob.seal().unwrap();
+            blob.seal().await.unwrap();
         }
 
         make_room(&state, 50).await;

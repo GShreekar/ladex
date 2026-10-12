@@ -155,6 +155,17 @@ pub enum ClientMessage {
     /// The offer's recipient declined it.
     #[serde(rename = "decline_file_offer")]
     DeclineFileOffer { session_id: SessionId, target_session_id: SessionId, file_id: String },
+
+    /// The recipient of a file sent to this device alone accepts it; its node then fetches the file.
+    #[serde(rename = "accept_file_offer")]
+    AcceptFileOffer { session_id: SessionId, file_id: String },
+}
+
+/// What a tab is shown of a file sent to it alone, which is in no catalog it could look the file up in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OfferedFile {
+    pub name: String,
+    pub size: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -198,11 +209,21 @@ pub enum ServerMessage {
 
     /// Someone offers to send this file directly; the tab asks for consent.
     #[serde(rename = "incoming_file_offer")]
-    IncomingFileOffer { file_id: String, from_session_id: SessionId },
+    IncomingFileOffer {
+        file_id: String,
+        from_session_id: SessionId,
+        /// Set when the file is sent to this device alone, and not when it is one from the catalog.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pushed: Option<OfferedFile>,
+    },
 
     /// The peer we offered a file to declined it.
     #[serde(rename = "file_offer_declined")]
     FileOfferDeclined { file_id: String, from_session_id: SessionId },
+
+    /// A file this tab sent to one device has arrived whole at that device's node.
+    #[serde(rename = "file_push_delivered")]
+    FilePushDelivered { file_id: String, to_session_id: SessionId },
 }
 
 /// System hostname, or a fallback label if it can't be read.

@@ -116,7 +116,16 @@
                 break;
             case 'file_offer_declined': {
                 const name = this._deviceDisplayName(msg.from_session_id, this.peers.get(msg.from_session_id));
-                this.toast(`${name} declined your file offer`, 'warning');
+                const sent = this._sentFiles.get(msg.file_id);
+                this._sentFiles.delete(msg.file_id);
+                this.toast(sent ? `${name} declined "${sent}"` : `${name} declined your file offer`, 'warning');
+                break;
+            }
+            case 'file_push_delivered': {
+                const name = this._deviceDisplayName(msg.to_session_id, this.peers.get(msg.to_session_id));
+                const sent = this._sentFiles.get(msg.file_id) || 'your file';
+                this._sentFiles.delete(msg.file_id);
+                this.toast(`${name} received "${sent}"`, 'success');
                 break;
             }
 

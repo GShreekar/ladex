@@ -17,6 +17,8 @@ pub enum Origin {
     Published,
     /// Fetched from other nodes: evicted least-recently-used first when the quota fills.
     Cached,
+    /// Being sent to or received by one device, outside the catalog: deleted when that push ends.
+    Pushed,
 }
 
 /// The catalog entry that older versions saved with each file; read once to carry it into the signed catalog.

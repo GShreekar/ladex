@@ -173,7 +173,8 @@ fn claimed_session(msg: &ClientMessage) -> &SessionId {
         | ClientMessage::TextMessage { session_id, .. }
         | ClientMessage::DeleteFile { session_id, .. }
         | ClientMessage::OfferFileTo { session_id, .. }
-        | ClientMessage::DeclineFileOffer { session_id, .. } => session_id,
+        | ClientMessage::DeclineFileOffer { session_id, .. }
+        | ClientMessage::AcceptFileOffer { session_id, .. } => session_id,
     }
 }
 
@@ -313,19 +314,23 @@ async fn handle_client_message(
                 state,
                 &from,
                 &target_session_id,
-                ServerMessage::IncomingFileOffer { file_id, from_session_id: from.clone() },
+                ServerMessage::IncomingFileOffer { file_id, from_session_id: from.clone(), pushed: None },
             )
             .await;
         }
 
         ClientMessage::DeclineFileOffer { session_id: from, target_session_id, file_id } => {
-            mesh::route_signal(
-                state,
-                &from,
-                &target_session_id,
-                ServerMessage::FileOfferDeclined { file_id, from_session_id: from.clone() },
-            )
-            .await;
+            // A file sent to this device alone is declined at its node; an offer of a catalog file just tells the other tab.
+            if !crate::push::decline(state, &from, &file_id).await {
+                let declined = ServerMessage::FileOfferDeclined { file_id, from_session_id: from.clone() };
+                mesh::route_signal(state, &from, &target_session_id, declined).await;
+            }
+        }
+
+        ClientMessage::AcceptFileOffer { session_id: _, file_id } => {
+            if let Err(refused) = crate::push::accept(state, &bound, &file_id).await {
+                send_to(state, &bound, ServerMessage::Error { message: format!("Could not receive that file: {refused}") }).await;
+            }
         }
     }
     Ok(())

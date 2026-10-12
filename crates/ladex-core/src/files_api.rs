@@ -13,9 +13,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, Semaphore};
 
 use crate::catalog::{CatalogEntry, EntryKind};
+use crate::push::{self, PushedFile};
 use crate::server::{Api, BoxError, PeerAddr, ServerBody};
 use crate::sessions::SessionHandle;
-use crate::store::{chunk_len, Blob, StoreError, CHUNK_SIZE};
+use crate::store::{chunk_len, Blob, Origin, StoreError, CHUNK_SIZE};
 use crate::transfer::{self, FetchError};
 use crate::{state, validate, zip, NodeState};
 
@@ -222,6 +223,10 @@ async fn send_range(
     true
 }
 
+fn query_value<'a>(req: &'a Request<Incoming>, key: &str) -> Option<&'a str> {
+    req.uri().query()?.split('&').find_map(|pair| pair.strip_prefix(key)?.strip_prefix('='))
+}
+
 fn busy() -> Response<ServerBody> {
     let mut response = fail(StatusCode::SERVICE_UNAVAILABLE, "this node is serving as many downloads as it can; try again in a moment");
     response.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
@@ -271,7 +276,7 @@ impl FilesApi {
         match (req.method().clone(), segments.as_slice()) {
             (Method::PUT, ["api", "files", id]) => self.upload(req, id, auth).await,
             (Method::GET, ["api", "files", id, "upload"]) => self.upload_status(req, id).await,
-            (Method::GET | Method::HEAD, ["api", "files", id]) => self.download(req, id).await,
+            (Method::GET | Method::HEAD, ["api", "files", id]) => self.download(req, id, auth).await,
             (Method::PUT, ["api", "folders", id]) => self.publish_folder(req, id, auth).await,
             (Method::GET | Method::HEAD, ["api", "folders", name]) if name.ends_with(".zip") => {
                 self.download_zip(req, &name[..name.len() - 4]).await
@@ -286,11 +291,15 @@ impl FilesApi {
         if !validate::is_valid_id(&device) {
             return Err(Box::new(fail(StatusCode::BAD_REQUEST, "missing or invalid X-Ladex-Session")));
         }
-        let owners = self.state.session_owners.read().await;
-        match owners.get(&device) {
-            Some(owner) if owner.auth_id == auth.as_ref().map(|a| a.id.clone()) => Ok(device),
-            _ => Err(Box::new(fail(StatusCode::FORBIDDEN, "that device is not connected here"))),
+        match self.owns_device(&device, auth).await {
+            true => Ok(device),
+            false => Err(Box::new(fail(StatusCode::FORBIDDEN, "that device is not connected here"))),
         }
+    }
+
+    async fn owns_device(&self, device: &str, auth: &Option<SessionHandle>) -> bool {
+        let owners = self.state.session_owners.read().await;
+        owners.get(device).is_some_and(|owner| owner.auth_id == auth.as_ref().map(|a| a.id.clone()))
     }
 
     async fn upload(&self, req: Request<Incoming>, id: &str, auth: Option<SessionHandle>) -> Response<ServerBody> {
@@ -344,12 +353,27 @@ impl FilesApi {
             Ok(device) => device,
             Err(response) => return *response,
         };
+        // Set when the file is for one device alone: it is offered to that device and never listed.
+        let recipient = match header_str(headers, "x-ladex-to") {
+            Some(to) if validate::is_valid_id(to) && to != device && parent.is_none() => Some(to.to_string()),
+            Some(_) => return fail(StatusCode::BAD_REQUEST, "invalid X-Ladex-To"),
+            None => None,
+        };
+        if let Some(to) = &recipient {
+            // Refused before the body is read, so a large file is not uploaded for nobody.
+            if push::hosting_node(state, to).await.is_none() {
+                return fail(StatusCode::NOT_FOUND, &push::Refused::NoSuchDevice.to_string());
+            }
+        }
         let Ok(_slot) = self.uploads.try_acquire() else {
             return fail(StatusCode::SERVICE_UNAVAILABLE, "too many uploads in progress; try again shortly");
         };
 
         if let Some(existing) = state.store.get(id) {
             if existing.is_complete() {
+                if recipient.is_some() && state.pushes.is_sent_by(id, &device) {
+                    return json(StatusCode::OK, &serde_json::json!({ "success": true, "complete": true }));
+                }
                 let entry = state::file_view(state, id).filter(|f| f.uploader_id == device);
                 return match entry {
                     Some(file) => json(StatusCode::OK, &serde_json::json!({ "success": true, "file": file })),
@@ -358,12 +382,16 @@ impl FilesApi {
             }
         }
         crate::state::make_room(state, size).await;
-        let blob = match state.store.create(id, size) {
+        let origin = if recipient.is_some() { Origin::Pushed } else { Origin::Published };
+        let blob = match state.store.create_with(id, size, origin) {
             Ok(blob) => blob,
             Err(e) => return store_error(e),
         };
         if blob.expected_root().is_some() {
             return fail(StatusCode::CONFLICT, "a file with this id is being fetched from other devices");
+        }
+        if blob.origin() != origin {
+            return fail(StatusCode::CONFLICT, "a file with this id already exists");
         }
         let Some(_writer) = blob.try_write_lock() else {
             return fail(StatusCode::CONFLICT, "this file is already being uploaded");
@@ -414,10 +442,21 @@ impl FilesApi {
             return json(StatusCode::OK, &serde_json::json!({ "success": true, "complete": false, "offset": done }));
         }
 
-        let root = match blob.seal() {
+        let root = match blob.seal().await {
             Ok(root) => root,
             Err(why) => return fail(StatusCode::INTERNAL_SERVER_ERROR, why),
         };
+        if let Some(to_session) = recipient {
+            let file =
+                PushedFile { file_id: id.to_string(), name, size, mime_type: mime, manifest_root: root, from_session: device, to_session };
+            return match push::offer(state, file).await {
+                Ok(()) => json(StatusCode::CREATED, &serde_json::json!({ "success": true, "complete": true })),
+                Err(refused) => {
+                    state.store.remove(id);
+                    fail(StatusCode::CONFLICT, &refused.to_string())
+                }
+            };
+        }
         let entry = CatalogEntry {
             file_id: id.to_string(),
             name,
@@ -437,24 +476,40 @@ impl FilesApi {
     }
 
     async fn upload_status(&self, req: Request<Incoming>, id: &str) -> Response<ServerBody> {
-        let size =
-            req.uri().query().and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix("size="))).and_then(|s| s.parse::<u64>().ok());
+        let size = query_value(&req, "size").and_then(|s| s.parse::<u64>().ok());
         let blob = self.state.store.get(id).filter(|b| Some(b.size()) == size && b.expected_root().is_none());
         let offset = blob.as_ref().map_or(0, |b| (b.leading_chunks() as u64 * CHUNK_SIZE).min(b.size()));
         let complete = blob.is_some_and(|b| b.is_complete());
         json(StatusCode::OK, &serde_json::json!({ "offset": offset, "complete": complete }))
     }
 
-    async fn download(&self, req: Request<Incoming>, id: &str) -> Response<ServerBody> {
+    // A file sent to one device is given to that device alone: `?to=` names it, and the login must be the one it joined with.
+    async fn pushed_file(&self, req: &Request<Incoming>, id: &str, auth: &Option<SessionHandle>) -> Option<(Arc<Blob>, String, String)> {
+        let device = query_value(req, "to").filter(|device| validate::is_valid_id(device))?;
+        if !self.owns_device(device, auth).await {
+            return None;
+        }
+        let (blob, file) = push::open(&self.state, id, device)?;
+        Some((blob, file.name, file.manifest_root))
+    }
+
+    async fn listed_file(&self, id: &str) -> Result<(Arc<Blob>, String, String), Response<ServerBody>> {
+        let blob = transfer::ensure_file(&self.state, id).await.map_err(fetch_error)?;
+        let listed = self.state.catalog.listed(id).ok_or_else(|| fail(StatusCode::NOT_FOUND, "no such file"))?;
+        Ok((blob, listed.entry.name, listed.entry.manifest_root))
+    }
+
+    async fn download(&self, req: Request<Incoming>, id: &str, auth: Option<SessionHandle>) -> Response<ServerBody> {
         let state = &self.state;
-        let blob = match transfer::ensure_file(state, id).await {
-            Ok(blob) => blob,
-            Err(e) => return fetch_error(e),
+        let found = match state.pushes.contains(id) {
+            true => self.pushed_file(&req, id, &auth).await.ok_or_else(|| fail(StatusCode::NOT_FOUND, "no such file")),
+            false => self.listed_file(id).await,
         };
-        let Some(listed) = state.catalog.listed(id) else {
-            return fail(StatusCode::NOT_FOUND, "no such file");
+        let (blob, name, manifest_root) = match found {
+            Ok(found) => found,
+            Err(response) => return response,
         };
-        let (name, etag) = (listed.entry.name, Some(format!("\"{}\"", listed.entry.manifest_root)));
+        let etag = Some(format!("\"{manifest_root}\""));
         let size = blob.size();
 
         let range_header =
@@ -661,7 +716,7 @@ impl FilesApi {
                 return fail(StatusCode::INTERNAL_SERVER_ERROR, "could not store the folder");
             }
         }
-        let root = match blob.seal() {
+        let root = match blob.seal().await {
             Ok(root) => root,
             Err(why) => return fail(StatusCode::INTERNAL_SERVER_ERROR, why),
         };

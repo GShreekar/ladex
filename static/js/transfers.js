@@ -51,7 +51,7 @@
     };
 
     /** One attempt at sending the file from `offset`; resolves, never rejects. */
-    LADEXApp.prototype._putFile = function(group, fileId, file, offset, parent, onProgress) {
+    LADEXApp.prototype._putFile = function(group, fileId, file, offset, { parent, to }, onProgress) {
         return new Promise((resolve) => {
             const xhr = new XMLHttpRequest();
             xhr.open('PUT', `/api/files/${fileId}`);
@@ -60,6 +60,7 @@
             xhr.setRequestHeader('X-Ladex-Offset', String(offset));
             xhr.setRequestHeader('X-Ladex-Name', encodeURIComponent(file.name));
             if (parent) xhr.setRequestHeader('X-Ladex-Parent', parent);
+            if (to) xhr.setRequestHeader('X-Ladex-To', to);
             xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
             xhr.upload.onprogress = (e) => { if (e.lengthComputable) onProgress(offset + e.loaded); };
             xhr.onload = () => {
@@ -77,13 +78,14 @@
         });
     };
 
-    /** Uploads one file, resuming after interruptions; resolves with the node's catalog entry. */
-    LADEXApp.prototype.uploadFile = async function(file, { parent = null, group = null, report = null } = {}) {
+    /** Uploads one file, resuming after interruptions; resolves with the node's catalog entry. With `to`, the file is for that device alone. */
+    LADEXApp.prototype.uploadFile = async function(file, { parent = null, group = null, report = null, to = null } = {}) {
         const fileId = this.generateFileId();
         const ownCard = group === null;
         group = group || `up:${fileId}`;
         const started = Date.now();
         let lastShown = 0;
+        const verb = to ? 'Sending' : 'Uploading';
         const progress = (bytes) => {
             if (report) { report(bytes); return; }
             const now = Date.now();
@@ -91,9 +93,9 @@
             lastShown = now;
             const speed = bytes / Math.max(0.001, (now - started) / 1000);
             const remaining = speed > 0 ? (file.size - bytes) / speed : null;
-            this.showProgress(group, `Uploading ${file.name}`, Math.round((bytes / Math.max(1, file.size)) * 100), speed, remaining, bytes, file.size);
+            this.showProgress(group, `${verb} ${file.name}`, Math.round((bytes / Math.max(1, file.size)) * 100), speed, remaining, bytes, file.size);
         };
-        if (ownCard) this.showProgress(group, `Uploading ${file.name}`, 0, null, null, 0, file.size);
+        if (ownCard) this.showProgress(group, `${verb} ${file.name}`, 0, null, null, 0, file.size);
 
         try {
             for (let attempt = 0; ; attempt++) {
@@ -110,7 +112,7 @@
                     continue;
                 }
 
-                const result = await this._putFile(group, fileId, file, offset, parent, progress);
+                const result = await this._putFile(group, fileId, file, offset, { parent, to }, progress);
                 if (result.aborted) throw new Error('cancelled');
                 if (result.ok) {
                     progress(file.size);
@@ -222,6 +224,8 @@
             e.preventDefault();
             dragDepth = 0;
             body.classList.remove('drag-over');
+            // Dropped on another device, the files are for it alone and not to be shared.
+            if (e.target.closest('.device-chip:not(.device-chip-self)')) return;
             const files = e.dataTransfer.files;
             if (files && files.length > 0) {
                 this.handleFileUpload(files, false);
@@ -255,6 +259,37 @@
                 this.updateFileList(this.serverFiles);
             }, 1500);
         }
+    };
+
+    /** Sends files from this device to one other device, which is asked before anything reaches it. */
+    LADEXApp.prototype.sendFilesToPeer = async function(files, targetSessionId) {
+        const name = this._deviceDisplayName(targetSessionId, this.peers.get(targetSessionId));
+        await this._runLimited(Array.from(files), this.UPLOAD_CONCURRENCY, async (file) => {
+            try {
+                const sent = await this.uploadFile(file, { to: targetSessionId });
+                this._sentFiles.set(sent.id, file.name);
+                this.toast(`Waiting for ${name} to accept "${file.name}"`, 'info');
+            } catch (err) {
+                if (err.message !== 'cancelled') this.toast(`Could not send ${file.name}: ${err.message}`, 'error', 8000);
+            }
+        });
+    };
+
+    /** Saves a file that was sent to this device alone, once its node has started fetching it. */
+    LADEXApp.prototype.savePushedFile = async function(fileId, name) {
+        const url = `/api/files/${encodeURIComponent(fileId)}?to=${encodeURIComponent(this.sessionId)}`;
+        // The node learns of the acceptance over the WebSocket, which this request can overtake.
+        for (let attempt = 0; attempt < 10; attempt++) {
+            const probe = await fetch(url, { method: 'HEAD', cache: 'no-store' }).catch(() => null);
+            if (probe?.status === 401) { window.location.href = '/login'; return; }
+            if (probe?.ok) {
+                this._saveViaBrowser(url, name);
+                this.toast(`Receiving ${name} — your browser is saving it`, 'info');
+                return;
+            }
+            await this._sleep(300);
+        }
+        this.toast(`Could not receive ${name}`, 'error', 7000);
     };
 
     LADEXApp.prototype._downloadProblem = function(status) {
