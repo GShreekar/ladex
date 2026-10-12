@@ -2,9 +2,9 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
-use super::udp_relay::{Faults, UdpRelay};
+use super::udp_relay::{Faults, Throttle, UdpRelay};
 use super::{eventually, fully_connected, spawn_node, NodeConfig, NodeHandle};
 use crate::types::NodeId;
 
@@ -49,6 +49,13 @@ impl FaultyLink {
         self.relays.iter().for_each(|relay| relay.set_faults(faults));
     }
 
+    /// Makes the link cross the cards of its two ends: a datagram leaves through its sender's `up` and arrives through its receiver's `down`.
+    fn set_cards(&self, a: &Cards, b: &Cards) {
+        // The relay in front of a node sees what goes to it as upstream and what it sends as back.
+        self.relays[0].set_throttles(vec![b.up.clone(), a.down.clone()], vec![a.up.clone(), b.down.clone()]);
+        self.relays[1].set_throttles(vec![a.up.clone(), b.down.clone()], vec![b.up.clone(), a.down.clone()]);
+    }
+
     /// Drops every datagram until `heal`; a connection across it ends once QUIC's idle timeout passes.
     pub fn partition(&self) {
         self.relays.iter().for_each(UdpRelay::go_silent);
@@ -57,6 +64,12 @@ impl FaultyLink {
     pub fn heal(&self) {
         self.relays.iter().for_each(UdpRelay::resume);
     }
+}
+
+/// One node's network card: its own speed in each direction, shared by all its links.
+struct Cards {
+    up: Arc<Throttle>,
+    down: Arc<Throttle>,
 }
 
 /// Nodes where every pair talks through its own `FaultyLink`.
@@ -88,6 +101,15 @@ impl LinkedMesh {
 
     pub fn set_faults_everywhere(&self, faults: Faults) {
         self.links.values().for_each(|link| link.set_faults(faults));
+    }
+
+    /// Gives every node a card that moves `bytes_per_second` in each direction, however many peers it talks to.
+    pub fn limit_bandwidth(&self, bytes_per_second: u64) {
+        let cards: Vec<Cards> =
+            self.nodes.iter().map(|_| Cards { up: Throttle::new(bytes_per_second), down: Throttle::new(bytes_per_second) }).collect();
+        for (&(i, j), link) in &self.links {
+            link.set_cards(&cards[i], &cards[j]);
+        }
     }
 
     /// Cuts node `i` off from all the others.

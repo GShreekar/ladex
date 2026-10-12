@@ -42,7 +42,7 @@ const PLANNING_WINDOW: usize = 4096;
 const ENDGAME_MIN_CHUNKS: u32 = 4;
 // ...nor more than this many, since every one of them is requested from every source.
 const ENDGAME_MAX_CHUNKS: u32 = 64;
-const MIN_DEPTH: usize = 4;
+const MIN_DEPTH: usize = 1;
 const MAX_DEPTH: usize = 32;
 const TARGET_IN_FLIGHT_SECS: f64 = 0.5;
 
@@ -71,8 +71,10 @@ pub fn endgame_threshold(total_chunks: u32) -> u32 {
     (total_chunks / 100).clamp(ENDGAME_MIN_CHUNKS, ENDGAME_MAX_CHUNKS).min(total_chunks)
 }
 
-// Missing chunks, most urgent first: those just ahead of a streaming reader, then rarest first.
-pub fn priority_order(have: &Bitmap, readers: &[u32], sources: &[Source]) -> Vec<u32> {
+// Missing chunks, most urgent first: those just ahead of a streaming reader, then rarest first. Equally rare chunks are taken
+// in order from `start` on, so nodes fetching the same file from the same source begin in different places and end up holding
+// different chunks to trade.
+pub fn priority_order(have: &Bitmap, readers: &[u32], sources: &[Source], start: u32) -> Vec<u32> {
     let mut order = Vec::new();
     let mut seen = HashSet::new();
     let mut positions = readers.to_vec();
@@ -84,16 +86,26 @@ pub fn priority_order(have: &Bitmap, readers: &[u32], sources: &[Source]) -> Vec
             }
         }
     }
-    let mut rest: Vec<(usize, u32)> = have
+    let total = have.len().max(1);
+    let from_start = |index: u32| (index + total - start % total) % total;
+    let mut rest: Vec<(usize, u32, u32)> = have
         .iter_missing()
         .filter(|i| !seen.contains(i))
         .take(PLANNING_WINDOW)
-        .map(|i| (sources.iter().filter(|s| s.has(i)).count(), i))
-        .filter(|(copies, _)| *copies > 0)
+        .map(|i| (sources.iter().filter(|s| s.has(i)).count(), from_start(i), i))
+        .filter(|(copies, _, _)| *copies > 0)
         .collect();
     rest.sort_unstable();
-    order.extend(rest.into_iter().map(|(_, i)| i));
+    order.extend(rest.into_iter().map(|(_, _, i)| i));
     order
+}
+
+// Where this node starts among equally rare chunks: nodes (this one and the connected ones, in id order) are spread evenly over the file.
+fn start_chunk<'a>(me: &'a NodeId, connected: impl Iterator<Item = &'a NodeId>, chunks: u32) -> u32 {
+    let mut nodes: Vec<&NodeId> = connected.chain([me]).collect();
+    nodes.sort();
+    let rank = nodes.iter().position(|n| **n == *me).unwrap_or(0) as u64;
+    (rank * chunks as u64 / nodes.len() as u64) as u32
 }
 
 // A chunk is requested from more than one source only in the endgame, when it goes to every source that can give it.
@@ -621,7 +633,7 @@ async fn run(state: NodeState, download: Arc<Download>, mut events: mpsc::Receiv
                 }
             }
             let readers: Vec<u32> = download.readers.lock().unwrap().values().copied().collect();
-            let want = priority_order(&have, &readers, &sources);
+            let want = priority_order(&have, &readers, &sources, start_chunk(&state.node_id, connected.keys(), have.len()));
             let endgame = have.len() - have.count() <= endgame_threshold(chunk_count(blob.size()));
             let mut per_source: HashMap<usize, Vec<u32>> = HashMap::new();
             for (s, index) in plan(&want, &in_flight, &sources, endgame) {
@@ -724,28 +736,39 @@ mod tests {
     #[test]
     fn chunks_just_ahead_of_a_reader_come_first_then_rarest_first() {
         let sources = [source("a", None, 100, 0, 0.0), source("b", Some(&[50, 51, 52]), 100, 0, 0.0)];
-        let order = priority_order(&have(100, &[]), &[40], &sources);
+        let order = priority_order(&have(100, &[]), &[40], &sources, 0);
         assert_eq!(&order[..16], (40..56).collect::<Vec<u32>>().as_slice(), "the reader's window first");
         assert_eq!(order[16], 0);
         assert_eq!(order.len(), 100);
     }
 
     #[test]
+    fn equally_rare_chunks_are_taken_from_where_the_node_starts() {
+        let sources = [source("a", None, 8, 0, 0.0)];
+        assert_eq!(priority_order(&have(8, &[]), &[], &sources, 5), [5, 6, 7, 0, 1, 2, 3, 4]);
+    }
+
+    #[test]
     fn rare_chunks_beat_common_ones_when_nobody_is_reading() {
         let sources =
             [source("a", Some(&[0, 1, 2, 3]), 4, 0, 0.0), source("b", Some(&[0, 1, 2]), 4, 0, 0.0), source("c", Some(&[0, 1]), 4, 0, 0.0)];
-        assert_eq!(priority_order(&have(4, &[]), &[], &sources), [3, 2, 0, 1]);
+        let order = priority_order(&have(4, &[]), &[], &sources, 0);
+        assert_eq!(order[..2], [3, 2]);
+        assert_eq!(order[2..].iter().copied().collect::<HashSet<u32>>(), HashSet::from([0, 1]));
     }
 
     #[test]
     fn chunks_nobody_has_and_chunks_we_have_are_not_planned() {
         let sources = [source("a", Some(&[0, 1]), 5, 0, 0.0)];
-        assert_eq!(priority_order(&have(5, &[1]), &[], &sources), [0]);
+        assert_eq!(priority_order(&have(5, &[1]), &[], &sources, 0), [0]);
     }
+
+    // Fast enough for a source to be given several chunks at once.
+    const DEEP: f64 = 8.0 * CHUNK_SIZE as f64;
 
     #[test]
     fn only_chunks_a_source_has_are_requested_from_it() {
-        let sources = [source("a", Some(&[0, 2]), 4, 0, 0.0), source("b", Some(&[1, 3]), 4, 0, 0.0)];
+        let sources = [source("a", Some(&[0, 2]), 4, 0, DEEP), source("b", Some(&[1, 3]), 4, 0, DEEP)];
         let mut got: Vec<(usize, u32)> = plan(&[0, 1, 2, 3], &HashMap::new(), &sources, false);
         got.sort();
         assert_eq!(got, [(0, 0), (0, 2), (1, 1), (1, 3)]);
@@ -792,7 +815,7 @@ mod tests {
 
     #[test]
     fn work_is_spread_across_equally_good_sources() {
-        let sources = [source("a", None, 20, 0, 0.0), source("b", None, 20, 0, 0.0)];
+        let sources = [source("a", None, 20, 0, DEEP), source("b", None, 20, 0, DEEP)];
         let planned = plan(&(0..8).collect::<Vec<u32>>(), &HashMap::new(), &sources, false);
         let to_a = planned.iter().filter(|(s, _)| *s == 0).count();
         assert_eq!((to_a, planned.len() - to_a), (4, 4));
@@ -1286,7 +1309,7 @@ mod tests {
 
     #[test]
     fn in_the_endgame_every_source_that_can_is_asked_for_each_chunk() {
-        let sources = [source("a", None, 10, 0, 0.0), source("b", None, 10, 0, 0.0), source("c", Some(&[1]), 10, 0, 0.0)];
+        let sources = [source("a", None, 10, 0, DEEP), source("b", None, 10, 0, DEEP), source("c", Some(&[1]), 10, 0, DEEP)];
 
         let mut got = plan(&[0, 1], &HashMap::new(), &sources, true);
         got.sort();

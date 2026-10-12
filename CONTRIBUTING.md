@@ -28,6 +28,8 @@ for t in tests/js/*.test.js; do node "$t"; done
 cargo build && for t in data folder client restart push cli; do node tests/e2e/$t.test.js; done
 ```
 
+`tests/e2e/swarm.test.js` (a source killed mid-transfer, `kill -9` on a receiver, ten receivers) moves a few hundred MiB and takes a couple of minutes, so it is not in that list; run it with `cargo build --release` and `LADEX_BIN=target/release/ladex`. The check that ten nodes get a file within about twice the time one does is `crates/ladex-core/tests/swarm.rs`, where `LinkedMesh::limit_bandwidth` gives each node a network card of fixed speed.
+
 CI also runs `cargo deny check` (licenses, banned and duplicate crates, advisories) and `cargo audit`, and a Linux job that runs real nodes over lossy links (`tests/netem`, needs root).
 
 ## Tests

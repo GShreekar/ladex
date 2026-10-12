@@ -12,6 +12,8 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 const MAX_DATAGRAM_BYTES: usize = 65_535;
+// What a throttle holds back before it starts losing datagrams, as a router's queue does, so senders slow down instead of queueing.
+const MAX_BACKLOG: Duration = Duration::from_millis(100);
 
 /// What happens to each datagram crossing a relay, in either direction.
 #[derive(Clone, Copy, Debug, Default)]
@@ -39,8 +41,40 @@ impl Faults {
     }
 }
 
+/// One direction of a node's network card: datagrams cross it one after another at a fixed speed.
+pub struct Throttle {
+    seconds_per_byte: f64,
+    free_at: Mutex<Instant>,
+}
+
+impl Throttle {
+    pub fn new(bytes_per_second: u64) -> Arc<Self> {
+        Arc::new(Self { seconds_per_byte: 1.0 / bytes_per_second as f64, free_at: Mutex::new(Instant::now()) })
+    }
+
+    /// When a datagram of `len` bytes that is ready at `ready` has fully crossed, or None if the queue ahead of it is full.
+    fn finish(&self, ready: Instant, len: usize) -> Option<Instant> {
+        let mut free_at = self.free_at.lock().unwrap();
+        let start = (*free_at).max(ready);
+        if start - ready > MAX_BACKLOG {
+            return None;
+        }
+        let done = start + Duration::from_secs_f64(self.seconds_per_byte * len as f64);
+        *free_at = done;
+        Some(done)
+    }
+}
+
+/// The cards a relay's datagrams cross: toward the node behind it (`upstream`) and back to the sender (`back`).
+#[derive(Default)]
+struct Cards {
+    upstream: Vec<Arc<Throttle>>,
+    back: Vec<Arc<Throttle>>,
+}
+
 struct Link {
     faults: Mutex<Faults>,
+    cards: Mutex<Cards>,
     is_silent: AtomicBool,
 }
 
@@ -56,7 +90,7 @@ impl UdpRelay {
         let near = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.expect("bind the relay's near side");
         let far = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.expect("bind the relay's far side");
         let addr = near.local_addr().expect("the relay has an address");
-        let link = Arc::new(Link { faults: Mutex::new(Faults::default()), is_silent: AtomicBool::new(false) });
+        let link = Arc::new(Link { faults: Mutex::new(Faults::default()), cards: Mutex::default(), is_silent: AtomicBool::new(false) });
         let task = tokio::spawn(relay(near, far, upstream, link.clone()));
         Self { addr, link, task }
     }
@@ -67,6 +101,11 @@ impl UdpRelay {
 
     pub fn set_faults(&self, faults: Faults) {
         *self.link.faults.lock().unwrap() = faults;
+    }
+
+    /// Makes datagrams cross the given throttles: `upstream` ones heading to the node behind the relay, `back` ones coming from it.
+    pub fn set_throttles(&self, upstream: Vec<Arc<Throttle>>, back: Vec<Arc<Throttle>>) {
+        *self.link.cards.lock().unwrap() = Cards { upstream, back };
     }
 
     /// Drops every packet, both ways, until [`UdpRelay::resume`].
@@ -112,8 +151,18 @@ async fn relay(near: UdpSocket, far: UdpSocket, upstream: SocketAddr, link: Arc<
             Some((way, datagram)) => {
                 let roll = link.faults.lock().unwrap().roll();
                 if let (Some(wait), false) = (roll, link.is_silent.load(Ordering::Relaxed)) {
-                    queue.insert((Instant::now() + wait, sequence), (way, datagram));
-                    sequence += 1;
+                    let due = {
+                        let cards = link.cards.lock().unwrap();
+                        let crossed = match way {
+                            Way::Upstream => &cards.upstream,
+                            Way::Back => &cards.back,
+                        };
+                        crossed.iter().try_fold(Instant::now() + wait, |due, card| card.finish(due, datagram.len()))
+                    };
+                    if let Some(due) = due {
+                        queue.insert((due, sequence), (way, datagram));
+                        sequence += 1;
+                    }
                 }
             }
             None => {

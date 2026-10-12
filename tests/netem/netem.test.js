@@ -45,6 +45,7 @@ function tearDownNetwork() {
     for (const n of nodes) {
         try { n.proc?.kill('SIGKILL'); } catch {}
         shQuiet(`ip netns del ${n.ns}`);
+        shQuiet(`ip link del ${n.hostIf}`);
     }
     shQuiet(`ip link del ${BRIDGE}`);
     shQuiet(`iptables -D FORWARD -i ${BRIDGE} -o ${BRIDGE} -j ACCEPT`);
@@ -100,6 +101,16 @@ async function upload(n, session, id, buf) {
 async function download(n, id) {
     const r = await fetch(`${n.url}/api/files/${id}`, { headers: { Cookie: `auth=${n.token}` }, signal: AbortSignal.timeout(60000) });
     return r.ok ? Buffer.from(await r.arrayBuffer()) : null;
+}
+
+// A node learns of a file from any peer but can fetch it only from a holder, which it may still be redialing after a partition.
+async function downloadOnceReachable(n, id, ms = 90000) {
+    const end = Date.now() + ms;
+    for (;;) {
+        const data = await download(n, id).catch(() => null);
+        if (data || Date.now() > end) return data;
+        await sleep(1000);
+    }
 }
 
 async function snapshot(n) {
@@ -178,7 +189,7 @@ const check = (name, ok, detail = '') => { console.log(`${ok ? 'PASS' : 'FAIL'} 
     const caughtUp = await waitUntil(three, (s) => s.files.includes('file_b') && !s.files.includes('file_c')
         && s.messages.includes('said during the partition'), 120000);
     check('node3 catches up after the partition heals, unshares included', caughtUp);
-    check('node3 then downloads the file shared while it was away', (await download(three, 'file_b'))?.equals(fileB));
+    check('node3 then downloads the file shared while it was away', (await downloadOnceReachable(three, 'file_b'))?.equals(fileB));
 
     uploader.ws.close();
     chatter.ws.close();
