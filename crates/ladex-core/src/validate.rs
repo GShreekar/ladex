@@ -54,20 +54,34 @@ fn truncate_to_bytes(name: &str) -> String {
     if name.len() <= MAX_NAME_BYTES {
         return name.to_string();
     }
-    let extension = match name.rfind('.') {
-        Some(i) if i > 0 && name.len() - i <= MAX_EXTENSION_BYTES => &name[i..],
-        _ => "",
-    };
-    let stem = &name[..name.len() - extension.len()];
+    let (stem, extension) = split_extension(name);
+    fit_stem(stem, extension)
+}
+
+fn split_extension(name: &str) -> (&str, &str) {
+    match name.rfind('.') {
+        Some(i) if i > 0 && name.len() - i <= MAX_EXTENSION_BYTES => name.split_at(i),
+        _ => (name, ""),
+    }
+}
+
+// As much of `stem` as leaves room for `ending` within the name limit.
+fn fit_stem(stem: &str, ending: &str) -> String {
     let mut kept = String::new();
     for ch in stem.chars() {
-        if kept.len() + ch.len_utf8() + extension.len() > MAX_NAME_BYTES {
+        if kept.len() + ch.len_utf8() + ending.len() > MAX_NAME_BYTES {
             break;
         }
         kept.push(ch);
     }
     let kept = kept.trim_end_matches([' ', '.']);
-    format!("{}{extension}", if kept.is_empty() { "unnamed" } else { kept })
+    format!("{}{ending}", if kept.is_empty() { "unnamed" } else { kept })
+}
+
+/// The name to try when `name` is taken: "photo.jpg" becomes "photo (1).jpg".
+pub fn numbered_file_name(name: &str, number: u32) -> String {
+    let (stem, extension) = split_extension(name);
+    fit_stem(stem, &format!(" ({number}){extension}"))
 }
 
 /// A path inside a shared folder; `.` and `..` parts are dropped so it never leaves the folder.
@@ -174,6 +188,20 @@ mod tests {
 
         let name = sanitize_file_name(&format!("a.{}", "b".repeat(300)));
         assert!(name.len() <= 255);
+    }
+
+    #[test]
+    fn a_taken_name_is_numbered_before_its_extension() {
+        assert_eq!(numbered_file_name("photo.jpg", 1), "photo (1).jpg");
+        assert_eq!(numbered_file_name("notes", 12), "notes (12)");
+        assert_eq!(numbered_file_name(".bashrc", 2), ".bashrc (2)");
+    }
+
+    #[test]
+    fn a_numbered_name_still_fits_in_255_bytes_and_keeps_its_extension() {
+        let name = numbered_file_name(&format!("{}.mp4", "a".repeat(251)), 7);
+        assert_eq!(name.len(), 255);
+        assert!(name.ends_with(" (7).mp4"));
     }
 
     #[test]

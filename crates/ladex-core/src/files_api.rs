@@ -23,6 +23,8 @@ use crate::{state, validate, zip, NodeState};
 const MAX_CONCURRENT_UPLOADS: usize = 8;
 const MAX_CONCURRENT_DOWNLOADS: usize = 64;
 const MAX_FOLDER_LISTING_BYTES: usize = 16 * 1024 * 1024;
+// A stored listing adds each file's size to what was uploaded, so it may be somewhat larger; anything beyond this is hostile.
+const MAX_STORED_LISTING_BYTES: u64 = 2 * MAX_FOLDER_LISTING_BYTES as u64;
 
 #[derive(Clone)]
 pub struct FilesApi {
@@ -65,6 +67,41 @@ pub struct ListingChild {
     pub path: String,
     pub file_id: String,
     pub size: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ListingError {
+    Unavailable,
+    Unreadable,
+    Damaged,
+}
+
+/// Reads a folder's listing out of the file it is stored as, waiting for parts still being fetched.
+pub async fn read_folder_listing(state: &NodeState, blob: &Blob) -> Result<FolderListing, ListingError> {
+    if blob.size() > MAX_STORED_LISTING_BYTES {
+        return Err(ListingError::Damaged);
+    }
+    let mut raw = Vec::with_capacity(blob.size() as usize);
+    for index in 0..blob.chunk_count() {
+        if !blob.wait_for_chunk(index, state.transfers.stall_timeout()).await {
+            return Err(ListingError::Unavailable);
+        }
+        raw.extend(blob.read_chunk_verified(index).await.map_err(|_| ListingError::Unreadable)?);
+    }
+    let listing = serde_json::from_slice::<FolderListing>(&raw).map_err(|_| ListingError::Damaged)?;
+    if listing.children.len() > validate::MAX_FOLDER_FILES as usize {
+        return Err(ListingError::Damaged);
+    }
+    Ok(listing)
+}
+
+/// Every file in a folder with its path made safe; None if one has left the catalog or has an unusable path.
+pub fn listed_children(state: &NodeState, folder_id: &str, listing: &FolderListing) -> Option<Vec<(String, CatalogEntry)>> {
+    let listed_child = |child: &ListingChild| {
+        let entry = state.catalog.listed(&child.file_id).map(|l| l.entry).filter(|e| e.parent() == Some(folder_id))?;
+        Some((validate::sanitize_relative_path(&child.path)?, entry))
+    };
+    listing.children.iter().map(listed_child).collect()
 }
 
 #[derive(Deserialize)]
@@ -573,32 +610,20 @@ impl FilesApi {
             _ => return fail(StatusCode::NOT_FOUND, "no such folder"),
         };
 
-        let mut raw = Vec::with_capacity(listing_blob.size() as usize);
-        for index in 0..listing_blob.chunk_count() {
-            if !listing_blob.wait_for_chunk(index, state.transfers.stall_timeout()).await {
-                return fail(StatusCode::SERVICE_UNAVAILABLE, "the folder's contents are not available right now");
+        let listing = match read_folder_listing(state, &listing_blob).await {
+            Ok(listing) => listing,
+            Err(ListingError::Unavailable) => {
+                return fail(StatusCode::SERVICE_UNAVAILABLE, "the folder's contents are not available right now")
             }
-            match listing_blob.read_chunk_verified(index).await {
-                Ok(bytes) => raw.extend(bytes),
-                Err(_) => return fail(StatusCode::INTERNAL_SERVER_ERROR, "could not read the folder"),
-            }
-        }
-        let Ok(listing) = serde_json::from_slice::<FolderListing>(&raw) else {
-            return fail(StatusCode::INTERNAL_SERVER_ERROR, "the folder's listing is damaged");
+            Err(ListingError::Unreadable) => return fail(StatusCode::INTERNAL_SERVER_ERROR, "could not read the folder"),
+            Err(ListingError::Damaged) => return fail(StatusCode::INTERNAL_SERVER_ERROR, "the folder's listing is damaged"),
         };
-        if listing.children.len() > validate::MAX_FOLDER_FILES as usize {
-            return fail(StatusCode::INTERNAL_SERVER_ERROR, "the folder's listing is damaged");
-        }
 
         // Sizes come from the catalog, not from the listing, so the length announced is the length sent.
-        let mut children: Vec<(String, String, u64)> = Vec::with_capacity(listing.children.len());
-        for child in &listing.children {
-            let entry = state.catalog.listed(&child.file_id).map(|l| l.entry).filter(|e| e.parent() == Some(folder_id));
-            let (Some(entry), Some(path)) = (entry, validate::sanitize_relative_path(&child.path)) else {
-                return fail(StatusCode::CONFLICT, "part of this folder is no longer available");
-            };
-            children.push((path, entry.file_id, entry.size));
-        }
+        let Some(children) = listed_children(state, folder_id, &listing) else {
+            return fail(StatusCode::CONFLICT, "part of this folder is no longer available");
+        };
+        let children: Vec<(String, String, u64)> = children.into_iter().map(|(path, entry)| (path, entry.file_id, entry.size)).collect();
         for (_, id, _) in children.iter().take(ZIP_PREFETCH) {
             if let Err(e) = transfer::ensure_file(state, id).await {
                 return fetch_error(e);

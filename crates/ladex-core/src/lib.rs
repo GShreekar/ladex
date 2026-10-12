@@ -23,6 +23,7 @@ pub mod pairing;
 pub mod persist;
 pub mod push;
 pub mod ratelimit;
+pub mod receive;
 pub mod revocation;
 pub mod server;
 pub mod sessions;

@@ -63,10 +63,19 @@ impl std::fmt::Display for StoreError {
     }
 }
 
+// ENOSPC and the Windows equivalents
+pub(crate) fn is_disk_full(e: &io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(28) | Some(112) | Some(39))
+}
+
+/// Whether writing `size` more bytes under `dir` would eat into the free space always kept on its disk.
+pub(crate) fn lacks_free_space(dir: &Path, size: u64) -> bool {
+    fs4::available_space(dir).is_ok_and(|free| free < size.saturating_add(MIN_FREE_BYTES))
+}
+
 impl From<io::Error> for StoreError {
     fn from(e: io::Error) -> Self {
-        // ENOSPC and the Windows equivalents
-        if matches!(e.raw_os_error(), Some(28) | Some(112) | Some(39)) {
+        if is_disk_full(&e) {
             StoreError::DiskFull
         } else {
             StoreError::Io(e.to_string())
@@ -796,7 +805,7 @@ impl Store {
         if registry.used.saturating_add(size) > self.quota {
             return Err(StoreError::QuotaExceeded);
         }
-        if fs4::available_space(&self.layout.root).is_ok_and(|free| free < size.saturating_add(MIN_FREE_BYTES)) {
+        if lacks_free_space(&self.layout.root, size) {
             return Err(StoreError::DiskFull);
         }
 

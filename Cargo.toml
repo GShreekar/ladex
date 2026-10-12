@@ -39,6 +39,7 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 tower-service = "0.3"
 subtle = "2"
 fs4 = { version = "0.13", features = ["sync"] }
+cap-std = "4"
 bytes = "1"
 http-body-util = "0.1"
 percent-encoding = "2"
