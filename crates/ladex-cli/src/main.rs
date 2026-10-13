@@ -10,8 +10,8 @@ use warp::Filter;
 use include_dir::{include_dir, Dir};
 use ladex_core::types::{self, *};
 use ladex_core::{
-    auth, control, discovery, files_api, handlers, hlc, identity, mdns, mesh, pairing, persist, ratelimit, server, sessions, state, store,
-    tls, transfer, trust, websocket, NodeState,
+    auth, control, discovery, files_api, guest, handlers, hlc, identity, mdns, mesh, pairing, persist, ratelimit, server, sessions, state,
+    store, tls, transfer, trust, websocket, NodeState,
 };
 
 static STATIC_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/../../static");
@@ -84,6 +84,10 @@ struct Args {
     /// Most disk space, in GiB, that shared files may use on this node.
     #[arg(long, default_value = "20")]
     storage_limit_gb: u64,
+
+    /// How long a browser guest stays signed in after joining.
+    #[arg(long, default_value = "8")]
+    guest_session_hours: u64,
 
     /// Keep this node's private key in a file in the data directory instead of the OS keychain.
     #[arg(long)]
@@ -312,6 +316,8 @@ async fn run_node(args: Args, data_dir: std::path::PathBuf) {
         })),
         pushes: Arc::new(ladex_core::push::Pushes::default()),
         sessions: Arc::new(sessions::SessionStore::new()),
+        catalog_changes: Arc::new(tokio::sync::watch::channel(0).0),
+        guests: Arc::new(guest::Guests::new(Duration::from_secs(args.guest_session_hours * 60 * 60))),
         clock: Arc::new(hlc::Clock::new(node_id.clone())),
         session_owners: Arc::new(RwLock::new(HashMap::new())),
         connection_counter: Arc::new(AtomicU64::new(1)),
@@ -654,7 +660,8 @@ async fn run_node(args: Args, data_dir: std::path::PathBuf) {
     }
 
     let service = warp::service(routes);
-    let api = files_api::FilesApi::new(state.clone());
+    let files = files_api::FilesApi::new(state.clone());
+    let api = server::Chain(files.clone(), guest::api::GuestApi::new(state.clone(), files));
     if let (Some(listener), Some(port)) = (local_listener, local_http_port) {
         let hosts = vec![format!("localhost:{port}"), format!("127.0.0.1:{port}")];
         let service = service.clone();

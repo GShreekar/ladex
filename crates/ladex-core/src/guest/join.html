@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Join LADEX</title>
+<style>
+  :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+  body { margin: 0 auto; max-width: 40rem; padding: 1rem; }
+  h1 { font-size: 1.4rem; }
+  input, button { font: inherit; padding: .5rem .75rem; }
+  input[type=text] { letter-spacing: .15em; text-transform: uppercase; width: 10rem; }
+  ul { list-style: none; padding: 0; }
+  li { display: flex; justify-content: space-between; gap: 1rem; padding: .5rem 0; border-bottom: 1px solid #8884; }
+  .muted { opacity: .7; font-size: .9rem; }
+  .error { color: #c0392b; }
+  code { word-break: break-all; }
+  [hidden] { display: none; }
+</style>
+</head>
+<body>
+<h1>LADEX</h1>
+
+<section id="join" hidden>
+  <p>Enter the code shown on the host's screen, or scan its QR code.</p>
+  <form id="join-form">
+    <input id="code" type="text" inputmode="text" autocomplete="off" maxlength="9" placeholder="ABCD-EFGH" aria-label="Invitation code">
+    <button>Join</button>
+  </form>
+  <p id="join-error" class="error" role="alert"></p>
+  <p class="muted">Check that this certificate fingerprint matches the one on the host's screen:<br><code>{{fingerprint}}</code></p>
+</section>
+
+<section id="session" hidden>
+  <p class="muted" id="who"></p>
+  <section id="upload-section" hidden>
+    <input id="picker" type="file" multiple>
+    <ul id="uploads"></ul>
+  </section>
+  <h2>Shared files</h2>
+  <ul id="files"></ul>
+  <h2>Devices</h2>
+  <ul id="devices"></ul>
+</section>
+
+<script src="/join.js"></script>
+</body>
+</html>
