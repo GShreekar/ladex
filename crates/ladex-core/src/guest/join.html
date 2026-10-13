@@ -28,7 +28,13 @@
     <button>Join</button>
   </form>
   <p id="join-error" class="error" role="alert"></p>
-  <p class="muted">Check that this certificate fingerprint matches the one on the host's screen:<br><code>{{fingerprint}}</code></p>
+  <section id="confirm" hidden>
+    <p>The QR code you scanned says this node's certificate fingerprint is:</p>
+    <p><code id="qr-fingerprint"></code></p>
+    <p>Open your browser's certificate details (from the security warning) and check that it shows exactly this. If it differs, someone else may be answering: close this page.</p>
+    <button id="confirm-join">The fingerprints match: join</button>
+  </section>
+  <p class="muted">This page reports its certificate fingerprint as:<br><code>{{fingerprint}}</code><br>Compare it with the one on the host's screen.</p>
 </section>
 
 <section id="session" hidden>

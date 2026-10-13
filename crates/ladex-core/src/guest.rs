@@ -30,6 +30,19 @@ pub enum Permission {
     UploadWithApproval,
 }
 
+impl std::str::FromStr for Permission {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, String> {
+        match text {
+            "read-only" => Ok(Permission::ReadOnly),
+            "upload" => Ok(Permission::Upload),
+            "upload-with-approval" => Ok(Permission::UploadWithApproval),
+            other => Err(format!("{other:?} is not read-only, upload or upload-with-approval")),
+        }
+    }
+}
+
 impl Permission {
     pub fn can_upload(self) -> bool {
         self != Permission::ReadOnly
@@ -64,6 +77,19 @@ impl Guests {
             join_limiter: crate::ratelimit::AttemptLimiter::new(policy),
         }
     }
+}
+
+/// The address a guest opens, with the invitation token and the certificate fingerprint in the fragment.
+/// A browser never sends the fragment to the server or in a Referer, so it stays between the QR code and the page.
+pub fn invite_link(state: &NodeState, invite: &invites::IssuedInvite) -> Option<String> {
+    let ip = state.local_ip?;
+    let is_encrypted = !state.tls_fingerprint.is_empty();
+    let scheme = if is_encrypted { "https" } else { "http" };
+    let mut fragment = format!("t={}", invite.token);
+    if is_encrypted {
+        fragment.push_str(&format!("&fp={}", crate::tls::format_fingerprint(&state.tls_fingerprint)));
+    }
+    Some(format!("{scheme}://{ip}:{}/join#{fragment}", state.http_port))
 }
 
 /// Ends a guest's session and throws away what they uploaded but nobody has accepted.
@@ -141,5 +167,47 @@ pub fn collect_garbage(state: &NodeState) {
         if is_leftover {
             state.store.remove(blob.id());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node_at(ip: &str, fingerprint: &[u8]) -> NodeState {
+        let mut state = NodeState::for_tests(None);
+        state.local_ip = Some(ip.parse().unwrap());
+        state.http_port = 8443;
+        state.tls_fingerprint = fingerprint.to_vec();
+        state
+    }
+
+    #[test]
+    fn an_encrypted_nodes_link_carries_the_token_and_the_fingerprint_in_the_fragment() {
+        let state = node_at("192.168.1.5", &[0xAB, 0xCD]);
+        let invite = state.guests.invites.issue(Permission::Upload);
+        let link = invite_link(&state, &invite).unwrap();
+        assert_eq!(link, format!("https://192.168.1.5:8443/join#t={}&fp=AB:CD", invite.token));
+    }
+
+    #[test]
+    fn a_plain_nodes_link_has_no_fingerprint() {
+        let state = node_at("192.168.1.5", &[]);
+        let invite = state.guests.invites.issue(Permission::ReadOnly);
+        let link = invite_link(&state, &invite).unwrap();
+        assert_eq!(link, format!("http://192.168.1.5:8443/join#t={}", invite.token));
+    }
+
+    #[test]
+    fn there_is_no_link_without_an_address() {
+        let mut state = node_at("192.168.1.5", &[]);
+        state.local_ip = None;
+        assert!(invite_link(&state, &state.guests.invites.issue(Permission::ReadOnly)).is_none());
+    }
+
+    #[test]
+    fn a_permission_is_read_from_its_command_line_name() {
+        assert_eq!("upload-with-approval".parse(), Ok(Permission::UploadWithApproval));
+        assert!("everything".parse::<Permission>().is_err());
     }
 }

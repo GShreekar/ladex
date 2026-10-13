@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use super::api::{refuse, require_same_origin, GuestApi, Outcome};
 use super::invites::display_code;
 use super::uploads::{Upload, UploadState};
-use super::{revoke_guest, share_upload, Permission};
+use super::{invite_link, revoke_guest, share_upload, Permission};
 use crate::files_api::json;
 use crate::server::{peer_ip, PeerAddr};
 use crate::tls;
@@ -70,9 +70,7 @@ impl GuestApi {
         let state = &self.state;
         let invite = state.guests.invites.issue(request.permission);
         let is_encrypted = !state.tls_fingerprint.is_empty();
-        let scheme = if is_encrypted { "https" } else { "http" };
-        // The token sits in the fragment, which a browser never sends to the server or in a Referer.
-        let url = state.local_ip.map(|ip| format!("{scheme}://{ip}:{}/join#{}", state.http_port, invite.token));
+        let url = invite_link(state, &invite);
         Ok(json(
             StatusCode::CREATED,
             &serde_json::json!({

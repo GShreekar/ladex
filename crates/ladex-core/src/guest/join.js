@@ -30,7 +30,7 @@ function row(list, label, detail, link) {
 }
 
 async function join(secret) {
-  const field = secret.length > 32 ? 'token' : 'code';
+  const field = secret.length > 12 ? 'token' : 'code';
   const response = await fetch('/join', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -127,11 +127,30 @@ $('join-form').addEventListener('submit', async (event) => {
 
 $('picker').addEventListener('change', (event) => { upload([...event.target.files]); event.target.value = ''; });
 
-// The invitation token in the QR code's fragment is used once and then removed from the address bar.
-const token = location.hash.slice(1);
-if (token) {
+// The fragment of the QR code's link holds the one-time token and the fingerprint the host's screen shows.
+// It is removed from the address bar at once; the token stays in memory until it is used.
+function readFragment() {
+  const raw = location.hash.slice(1);
+  if (!raw) return {};
   history.replaceState(null, '', location.pathname);
-  join(token).then((error) => { if (error) { $('join-error').textContent = error; show('join'); } else start(); });
+  const fields = new URLSearchParams(raw);
+  return fields.has('t') ? { token: fields.get('t'), fingerprint: fields.get('fp') } : { token: raw };
+}
+
+async function joinWith(token) {
+  const error = await join(token);
+  if (error) { $('join-error').textContent = error; show('join'); } else start();
+}
+
+const { token, fingerprint } = readFragment();
+if (token && fingerprint) {
+  // The certificate was accepted by hand, so the person must compare it before the token is handed over.
+  $('qr-fingerprint').textContent = fingerprint;
+  $('confirm').hidden = false;
+  $('confirm-join').addEventListener('click', () => joinWith(token));
+  show('join');
+} else if (token) {
+  joinWith(token);
 } else {
   start();
 }

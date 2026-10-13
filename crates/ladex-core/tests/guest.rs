@@ -81,7 +81,7 @@ impl Site {
         assert_eq!(reply.status, 201, "{}", String::from_utf8_lossy(&reply.body));
         let body = reply.json();
         let url = body["url"].as_str().unwrap();
-        (url.split_once('#').unwrap().1.to_string(), body["code"].as_str().unwrap().to_string())
+        (url.split_once("#t=").unwrap().1.to_string(), body["code"].as_str().unwrap().to_string())
     }
 
     async fn join(&self, permission: &str) -> String {
