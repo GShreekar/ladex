@@ -17,11 +17,7 @@ pub mod endpoint;
 mod frames;
 pub mod quic;
 
-// 8: mesh messages on QUIC stream 0 are postcard-encoded instead of JSON.
-// 9: nodes trade catalog version vectors and signed ops.
-// 10: holders are told with `Have` messages instead of being listed in the catalog.
-// 11: chunks travel on a stream per request (see `transfer::wire`), and stream 0 frames are bare postcard messages.
-// 12: `HaveChunks` adds chunks to a map already told, and `WantHave` asks a peer to tell its map.
+// Bumped whenever the wire format changes; nodes on different versions refuse each other.
 pub const PROTOCOL_VERSION: u32 = 12;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);

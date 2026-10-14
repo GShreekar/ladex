@@ -1,7 +1,6 @@
 //! The shared file catalog: an add-wins OR-Set of signed adds and removes that converge whatever order they arrive in.
 //!
-//! An add is tagged with its publisher's stamp. A remove lists the add tags it saw, so an add made concurrently
-//! survives it. Only the publisher, or a key the publisher named in the add, can remove it; every node checks that.
+//! A remove lists the add tags it saw, so a concurrent add survives it. Only the publisher, or a key it named in the add, can remove.
 
 mod log;
 pub mod shared;

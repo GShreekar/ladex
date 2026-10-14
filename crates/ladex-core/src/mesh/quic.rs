@@ -1,11 +1,8 @@
 //! Mesh connections over QUIC: open stream 0, run the handshake unless both nodes already trust each other, then the control loop.
 //!
-//! A node is dialed either by id, as discovery does, or by address alone, as `--peer`, saved peers and pairing do.
-//!
-//! Stream 0 starts with an [`Opening`] from the dialer. A dialer that trusts the listener asks to resume; the listener agrees
-//! only if it trusts the dialer too, and otherwise both fall back to the full handshake on the same stream. TLS has already
-//! proven each side's key, so resuming needs no passphrase. After that, stream 0 carries postcard-encoded [`MeshMessage`]s,
-//! one per length-prefixed frame. Chunks never use stream 0: each request for chunks opens a stream of its own (`transfer::wire`).
+//! Stream 0 starts with an `Opening` from the dialer. A dialer that trusts the listener asks to resume without the
+//! passphrase; unless the listener trusts it too, both fall back to the full handshake on the same stream. After that,
+//! stream 0 carries length-prefixed postcard [`MeshMessage`]s. Chunks use streams of their own (`transfer::wire`).
 
 use std::net::SocketAddr;
 use std::sync::Arc;

@@ -1,4 +1,4 @@
-// Phase 5 exit criteria (source killed, receiver kill -9, many receivers), against real LADEX processes; needs `cargo build` (or LADEX_BIN) and Node 22+. Run: node tests/e2e/swarm.test.js
+// Swarm end to end (source killed, receiver kill -9, many receivers), against real LADEX processes; needs `cargo build` (or LADEX_BIN) and Node 22+. Run: node tests/e2e/swarm.test.js
 // LADEX_SWARM_MIB sets the file size (default 256); LADEX_SWARM_RECEIVERS sets the swarm size (default 10).
 const { spawn } = require('node:child_process');
 const crypto = require('node:crypto');
