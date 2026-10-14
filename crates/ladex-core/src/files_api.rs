@@ -30,7 +30,7 @@ const MAX_STORED_LISTING_BYTES: u64 = 2 * MAX_FOLDER_LISTING_BYTES as u64;
 #[derive(Clone)]
 pub struct FilesApi {
     state: NodeState,
-    uploads: Arc<Semaphore>,
+    pub(crate) uploads: Arc<Semaphore>,
     downloads: Arc<Semaphore>,
 }
 
@@ -157,15 +157,15 @@ struct FolderChild {
     file_id: String,
 }
 
-fn empty() -> ServerBody {
+pub(crate) fn empty() -> ServerBody {
     Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync()
 }
 
-fn full(bytes: impl Into<Bytes>) -> ServerBody {
+pub(crate) fn full(bytes: impl Into<Bytes>) -> ServerBody {
     Full::new(bytes.into()).map_err(|e| match e {}).boxed_unsync()
 }
 
-fn json(status: StatusCode, value: &impl Serialize) -> Response<ServerBody> {
+pub(crate) fn json(status: StatusCode, value: &impl Serialize) -> Response<ServerBody> {
     let mut response = Response::new(full(serde_json::to_vec(value).unwrap_or_default()));
     *response.status_mut() = status;
     response.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -173,11 +173,11 @@ fn json(status: StatusCode, value: &impl Serialize) -> Response<ServerBody> {
     response
 }
 
-fn fail(status: StatusCode, message: &str) -> Response<ServerBody> {
+pub(crate) fn fail(status: StatusCode, message: &str) -> Response<ServerBody> {
     json(status, &serde_json::json!({ "success": false, "message": message }))
 }
 
-fn store_error(e: StoreError) -> Response<ServerBody> {
+pub(crate) fn store_error(e: StoreError) -> Response<ServerBody> {
     let status = match e {
         StoreError::InvalidId => StatusCode::BAD_REQUEST,
         StoreError::SizeMismatch => StatusCode::CONFLICT,
@@ -189,7 +189,7 @@ fn store_error(e: StoreError) -> Response<ServerBody> {
 
 const MAX_DRAIN_BYTES: u64 = 64 * 1024 * 1024;
 
-async fn drain(mut body: Incoming) {
+pub(crate) async fn drain(mut body: Incoming) {
     let mut drained = 0u64;
     while let Some(Ok(frame)) = body.frame().await {
         drained += frame.data_ref().map_or(0, |d| d.len() as u64);
@@ -199,15 +199,15 @@ async fn drain(mut body: Incoming) {
     }
 }
 
-fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+pub(crate) fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|v| v.to_str().ok())
 }
 
-fn header_u64(headers: &HeaderMap, name: &str) -> Option<u64> {
+pub(crate) fn header_u64(headers: &HeaderMap, name: &str) -> Option<u64> {
     header_str(headers, name)?.trim().parse().ok()
 }
 
-fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+pub(crate) fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers
         .get_all(header::COOKIE)
         .iter()
@@ -217,7 +217,7 @@ fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 }
 
 // A browser always sends Origin on the requests that change things; it has to name this host.
-fn same_origin(headers: &HeaderMap) -> bool {
+pub(crate) fn same_origin(headers: &HeaderMap) -> bool {
     let origin = header_str(headers, "origin").and_then(|o| o.strip_prefix("https://").or_else(|| o.strip_prefix("http://")));
     matches!((origin, header_str(headers, "host")), (Some(o), Some(h)) if o == h)
 }
@@ -301,7 +301,7 @@ async fn send_range(
     true
 }
 
-fn query_value<'a>(req: &'a Request<Incoming>, key: &str) -> Option<&'a str> {
+pub(crate) fn query_value<'a>(req: &'a Request<Incoming>, key: &str) -> Option<&'a str> {
     req.uri().query()?.split('&').find_map(|pair| pair.strip_prefix(key)?.strip_prefix('='))
 }
 
@@ -321,6 +321,36 @@ fn fetch_error(error: FetchError) -> Response<ServerBody> {
         }
         FetchError::Store(e) => store_error(e),
     }
+}
+
+/// Stores an upload's body as chunks of the file from `offset` on and saves its progress; returns the bytes left over short of a chunk.
+pub(crate) async fn write_body(blob: &Blob, size: u64, offset: u64, mut body: Incoming) -> Result<usize, Response<ServerBody>> {
+    let mut buffer: Vec<u8> = Vec::with_capacity(CHUNK_SIZE as usize);
+    let mut index = (offset / CHUNK_SIZE) as u32;
+    while let Some(frame) = body.frame().await {
+        let Ok(frame) = frame else {
+            blob.persist().await;
+            return Err(fail(StatusCode::BAD_REQUEST, "upload interrupted"));
+        };
+        let Ok(mut data) = frame.into_data() else { continue };
+        while !data.is_empty() {
+            if index >= blob.chunk_count() {
+                return Err(fail(StatusCode::BAD_REQUEST, "more data than announced"));
+            }
+            let wanted = chunk_len(size, index) - buffer.len();
+            buffer.extend_from_slice(&data.split_to(wanted.min(data.len())));
+            if buffer.len() == chunk_len(size, index) {
+                let chunk = std::mem::replace(&mut buffer, Vec::with_capacity(CHUNK_SIZE as usize));
+                if let Err(e) = blob.write_chunk_hashing(index, chunk).await {
+                    tracing::warn!("Upload of {}: could not store chunk {index}: {e:?}", blob.id());
+                    return Err(fail(StatusCode::INTERNAL_SERVER_ERROR, "could not store the file"));
+                }
+                index += 1;
+            }
+        }
+    }
+    blob.persist().await;
+    Ok(buffer.len())
 }
 
 const ZIP_PREFETCH: usize = 3;
@@ -357,7 +387,7 @@ impl FilesApi {
             (Method::GET | Method::HEAD, ["api", "files", id]) => self.download(req, id, auth).await,
             (Method::PUT, ["api", "folders", id]) => self.publish_folder(req, id, auth).await,
             (Method::GET | Method::HEAD, ["api", "folders", name]) if name.ends_with(".zip") => {
-                self.download_zip(req, &name[..name.len() - 4]).await
+                self.download_zip(req.method(), &name[..name.len() - 4]).await
             }
             _ => fail(StatusCode::NOT_FOUND, "not found"),
         }
@@ -484,36 +514,13 @@ impl FilesApi {
             );
         }
 
-        let Some(mut body) = body_slot.take() else {
+        let Some(body) = body_slot.take() else {
             return fail(StatusCode::INTERNAL_SERVER_ERROR, "no request body");
         };
-        let mut buffer: Vec<u8> = Vec::with_capacity(CHUNK_SIZE as usize);
-        let mut index = (offset / CHUNK_SIZE) as u32;
-        while let Some(frame) = body.frame().await {
-            let Ok(frame) = frame else {
-                blob.persist().await;
-                return fail(StatusCode::BAD_REQUEST, "upload interrupted");
-            };
-            let Ok(mut data) = frame.into_data() else { continue };
-            while !data.is_empty() {
-                if index >= blob.chunk_count() {
-                    return fail(StatusCode::BAD_REQUEST, "more data than announced");
-                }
-                let wanted = chunk_len(size, index) - buffer.len();
-                buffer.extend_from_slice(&data.split_to(wanted.min(data.len())));
-                if buffer.len() == chunk_len(size, index) {
-                    let chunk = std::mem::replace(&mut buffer, Vec::with_capacity(CHUNK_SIZE as usize));
-                    if let Err(e) = blob.write_chunk_hashing(index, chunk).await {
-                        tracing::warn!("Upload of {id}: could not store chunk {index}: {e:?}");
-                        return fail(StatusCode::INTERNAL_SERVER_ERROR, "could not store the file");
-                    }
-                    index += 1;
-                }
-            }
-        }
-        blob.persist().await;
-        if !buffer.is_empty() {
-            return fail(StatusCode::BAD_REQUEST, "the body ended before the file did");
+        match write_body(&blob, size, offset, body).await {
+            Err(response) => return response,
+            Ok(0) => {}
+            Ok(_) => return fail(StatusCode::BAD_REQUEST, "the body ended before the file did"),
         }
         if !blob.bitmap().is_full() {
             let done = (blob.leading_chunks() as u64 * CHUNK_SIZE).min(size);
@@ -571,7 +578,7 @@ impl FilesApi {
         Some((blob, file.name, file.manifest_root))
     }
 
-    async fn listed_file(&self, id: &str) -> Result<(Arc<Blob>, String, String), Response<ServerBody>> {
+    pub(crate) async fn listed_file(&self, id: &str) -> Result<(Arc<Blob>, String, String), Response<ServerBody>> {
         let blob = transfer::ensure_file(&self.state, id).await.map_err(fetch_error)?;
         let listed = self.state.catalog.listed(id).ok_or_else(|| fail(StatusCode::NOT_FOUND, "no such file"))?;
         Ok((blob, listed.entry.name, listed.entry.manifest_root))
@@ -583,15 +590,27 @@ impl FilesApi {
             true => self.pushed_file(&req, id, &auth).await.ok_or_else(|| fail(StatusCode::NOT_FOUND, "no such file")),
             false => self.listed_file(id).await,
         };
-        let (blob, name, manifest_root) = match found {
-            Ok(found) => found,
-            Err(response) => return response,
-        };
+        match found {
+            Ok((blob, name, manifest_root)) => self.respond_with_blob(req.headers(), req.method(), blob, &name, &manifest_root).await,
+            Err(response) => response,
+        }
+    }
+
+    /// Streams a file as a download, honouring `Range` and `If-Range`; chunks still arriving are waited for.
+    pub(crate) async fn respond_with_blob(
+        &self,
+        request_headers: &HeaderMap,
+        method: &Method,
+        blob: Arc<Blob>,
+        name: &str,
+        manifest_root: &str,
+    ) -> Response<ServerBody> {
+        let state = &self.state;
         let etag = Some(format!("\"{manifest_root}\""));
         let size = blob.size();
 
         let range_header =
-            header_str(req.headers(), "range").filter(|_| range_still_valid(header_str(req.headers(), "if-range"), etag.as_deref()));
+            header_str(request_headers, "range").filter(|_| range_still_valid(header_str(request_headers, "if-range"), etag.as_deref()));
         let (status, start, end) = match parse_range(range_header, size) {
             None => (StatusCode::OK, 0, size.saturating_sub(1)),
             Some(Ok((start, end))) => (StatusCode::PARTIAL_CONTENT, start, end),
@@ -616,13 +635,13 @@ impl FilesApi {
             headers.insert(header::ETAG, value);
         }
         headers.insert(header::CONTENT_LENGTH, HeaderValue::from(length));
-        if let Ok(value) = HeaderValue::from_str(&content_disposition(&name)) {
+        if let Ok(value) = HeaderValue::from_str(&content_disposition(name)) {
             headers.insert(header::CONTENT_DISPOSITION, value);
         }
         if status == StatusCode::PARTIAL_CONTENT {
             headers.insert(header::CONTENT_RANGE, HeaderValue::from_str(&format!("bytes {start}-{end}/{size}")).unwrap());
         }
-        if req.method() == Method::HEAD || length == 0 {
+        if method == Method::HEAD || length == 0 {
             return response;
         }
 
@@ -640,7 +659,7 @@ impl FilesApi {
         response
     }
 
-    async fn download_zip(&self, req: Request<Incoming>, folder_id: &str) -> Response<ServerBody> {
+    pub(crate) async fn download_zip(&self, method: &Method, folder_id: &str) -> Response<ServerBody> {
         let state = &self.state;
         let listing_blob = match transfer::ensure_file(state, folder_id).await {
             Ok(blob) => blob,
@@ -685,7 +704,7 @@ impl FilesApi {
         if let Ok(value) = HeaderValue::from_str(&content_disposition(&archive_name)) {
             headers.insert(header::CONTENT_DISPOSITION, value);
         }
-        if req.method() == Method::HEAD {
+        if method == Method::HEAD {
             return response;
         }
 

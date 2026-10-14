@@ -6,7 +6,8 @@ use std::time::{Duration, SystemTime};
 use anyhow::{anyhow, bail, Context};
 use clap::Subcommand;
 use ladex_core::control::server::{self, Endpoint};
-use ladex_core::control::{Device, Event, Invite, Node, Reply, Request};
+use ladex_core::control::{Device, Event, GuestInvite, Invite, Node, Reply, Request};
+use ladex_core::guest::Permission;
 use ladex_core::types::FileView;
 
 use crate::doctor;
@@ -47,8 +48,12 @@ pub enum Command {
     },
     /// List the connected devices and nodes
     Devices,
-    /// Show how another device can join: the address, as text and as a QR code
-    Invite,
+    /// Invite a browser: a one-time link as text and as a QR code, with the certificate fingerprint to check
+    Invite {
+        /// What the guest may do: read-only, upload or upload-with-approval
+        #[arg(long, default_value = "read-only")]
+        permission: Permission,
+    },
     /// Check that this node can be reached and has what it needs
     Doctor,
 }
@@ -127,7 +132,7 @@ async fn execute(command: Command, data_dir: &Path, is_json: bool) -> anyhow::Re
         Command::Seed { dir, watch: true } => return watch(&session, &existing(&[dir])?.remove(0)).await,
         Command::Ls { all } => return list(&session, all).await,
         Command::Devices => Request::Devices,
-        Command::Invite => Request::Invite,
+        Command::Invite { permission } => Request::Invite { permission },
         Command::Doctor => unreachable!("doctor does not need a running node and is handled before this"),
     };
     let reply = session.call(&request).await?;
@@ -218,17 +223,38 @@ fn print_invite(invite: &Invite) {
     let Some(url) = &invite.url else {
         return println!("This machine has no address on a local network, so other devices cannot reach it yet.");
     };
-    println!("Open on the other device: {url}");
-    if let Some(fingerprint) = &invite.certificate_fingerprint {
-        println!("Its browser will warn about the certificate; accept it only if the fingerprint shown is:\n  {fingerprint}");
+    if let Some(guest) = &invite.guest {
+        print_guest_invite(guest, invite.certificate_fingerprint.as_deref());
     }
+    println!("\nMembers of this mesh sign in at {url}");
     if invite.needs_passphrase {
-        println!("It will ask for the passphrase this node was started with.");
+        println!("They are asked for the passphrase this node was started with.");
     }
     if let Some(address) = &invite.peer_address {
         println!("To connect another node directly: ladex --peer {address}");
     }
-    output::print_qr_code(url);
+}
+
+fn print_guest_invite(guest: &GuestInvite, fingerprint: Option<&str>) {
+    let minutes = guest.expires_in_secs / 60;
+    println!("Invite a browser (one device, within {minutes} minutes; it may {}):", describe(guest.permission));
+    println!("  Open: {}", guest.join_url);
+    println!("  Or go to this address's /join page and type: {}", guest.code);
+    match fingerprint {
+        Some(fingerprint) => {
+            println!("  The browser will warn about the certificate; accept it only if the fingerprint shown is:\n    {fingerprint}")
+        }
+        None => println!("  This node is not using encryption, so this link can be read by anyone on the network."),
+    }
+    output::print_qr_code(&guest.join_url);
+}
+
+fn describe(permission: Permission) -> &'static str {
+    match permission {
+        Permission::ReadOnly => "download only",
+        Permission::Upload => "download and upload",
+        Permission::UploadWithApproval => "download, and upload once you accept each file",
+    }
 }
 
 // Everything under a folder that would change what is shared: each file's path, size and time of last change.

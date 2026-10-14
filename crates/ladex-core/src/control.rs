@@ -9,6 +9,7 @@ use anyhow::{anyhow, bail, Context};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
+use crate::guest::{self, Permission};
 use crate::receive::{self, ReceiveRoot};
 use crate::store::CHUNK_SIZE;
 use crate::types::{FileView, NodeId, PeerInfo, SessionId};
@@ -40,7 +41,11 @@ pub enum Request {
     },
     List,
     Devices,
-    Invite,
+    /// Shows how another device can join, with a new one-time invitation for a browser guest.
+    Invite {
+        #[serde(default)]
+        permission: Permission,
+    },
     Status,
 }
 
@@ -111,6 +116,18 @@ pub struct Invite {
     pub needs_passphrase: bool,
     /// What another node passes to `--peer` to connect to this one.
     pub peer_address: Option<String>,
+    /// A one-time invitation for a browser guest; none without an address to join at.
+    pub guest: Option<GuestInvite>,
+}
+
+/// What a browser guest needs to join once: a link for the QR code and a code to type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuestInvite {
+    /// Carries the token and the certificate fingerprint in its fragment.
+    pub join_url: String,
+    pub code: String,
+    pub permission: Permission,
+    pub expires_in_secs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -195,7 +212,7 @@ async fn run(state: &NodeState, settings: &Settings, request: Request, events: &
         Request::Get { file, into } => save(state, &file, into, events).await,
         Request::List => Ok(Reply::Files { files: state::file_views(state) }),
         Request::Devices => Ok(Reply::Devices { devices: devices(state).await, nodes: nodes(state).await }),
-        Request::Invite => Ok(Reply::Invite(invite(state))),
+        Request::Invite { permission } => Ok(Reply::Invite(invite(state, permission))),
         Request::Status => Ok(Reply::Status(Box::new(status(state, settings).await))),
     }
 }
@@ -278,13 +295,21 @@ fn is_encrypted(state: &NodeState) -> bool {
     !state.tls_fingerprint.is_empty()
 }
 
-fn invite(state: &NodeState) -> Invite {
+fn invite(state: &NodeState, permission: Permission) -> Invite {
+    let issued = state.guests.invites.issue(permission);
+    let guest = guest::invite_link(state, &issued).map(|join_url| GuestInvite {
+        join_url,
+        code: guest::invites::display_code(&issued.code),
+        permission,
+        expires_in_secs: issued.expires_in.as_secs(),
+    });
     let scheme = if is_encrypted(state) { "https" } else { "http" };
     Invite {
         url: state.local_ip.map(|ip| format!("{scheme}://{ip}:{}", state.http_port)),
         certificate_fingerprint: is_encrypted(state).then(|| tls::format_fingerprint(&state.tls_fingerprint)),
         needs_passphrase: state.passphrase.is_some(),
         peer_address: state.local_ip.map(|ip| format!("{ip}:{}", state.quic_port)),
+        guest,
     }
 }
 

@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/ladex-core", "crates/ladex-cli"]
 
 [workspace.package]
-version = "3.0.0-alpha.1"
+version = "3.0.0-beta.1"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/GShreekar/ladex"

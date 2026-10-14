@@ -12,3 +12,5 @@ Thumbs.db
 *.log
 
 docs
+ui/node_modules
+ui/dist

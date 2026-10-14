@@ -56,11 +56,11 @@ pub struct SessionStore {
     ended: broadcast::Sender<String>,
 }
 
-fn token_hash(token: &str) -> Vec<u8> {
+pub(crate) fn token_hash(token: &str) -> Vec<u8> {
     digest::digest(&digest::SHA256, token.as_bytes()).as_ref().to_vec()
 }
 
-fn random_hex(len_bytes: usize) -> String {
+pub(crate) fn random_hex(len_bytes: usize) -> String {
     let bytes: Vec<u8> = (0..len_bytes).map(|_| rand::thread_rng().gen()).collect();
     hex::encode(bytes)
 }

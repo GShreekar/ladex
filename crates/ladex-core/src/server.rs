@@ -23,6 +23,27 @@ pub trait Api: Clone + Send + Sync + 'static {
     fn handle(&self, req: hyper::Request<Incoming>, peer: PeerAddr) -> impl Future<Output = hyper::Response<ServerBody>> + Send;
 }
 
+/// Two handlers served together; the first takes the paths it claims, the second the rest it claims.
+#[derive(Clone)]
+pub struct Chain<First, Second>(pub First, pub Second);
+
+impl<First: Api, Second: Api> Api for Chain<First, Second> {
+    fn claims(&self, path: &str) -> bool {
+        self.0.claims(path) || self.1.claims(path)
+    }
+
+    fn handle(&self, req: hyper::Request<Incoming>, peer: PeerAddr) -> impl Future<Output = hyper::Response<ServerBody>> + Send {
+        let first_takes_it = self.0.claims(req.uri().path());
+        let (first, second) = (self.0.clone(), self.1.clone());
+        async move {
+            match first_takes_it {
+                true => first.handle(req, peer).await,
+                false => second.handle(req, peer).await,
+            }
+        }
+    }
+}
+
 fn from_warp(response: warp::reply::Response) -> hyper::Response<ServerBody> {
     response.map(|body| body.map_err(|e| Box::new(e) as BoxError).boxed_unsync())
 }

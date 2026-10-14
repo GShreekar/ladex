@@ -113,6 +113,7 @@ pub fn file_view(state: &NodeState, id: &str) -> Option<FileView> {
 }
 
 pub async fn broadcast_catalog(state: &NodeState) {
+    state.catalog_changes.send_modify(|count| *count += 1);
     websocket::broadcast(state, ServerMessage::FileListUpdate { files: file_views(state) }).await;
 }
 
@@ -190,6 +191,7 @@ const UNPUBLISHED_FOLDER_FILES_MS: u64 = 60 * 60 * 1000;
 
 /// Deletes abandoned partial files and uploads for folders that were never published, and evicts cached files over the quota.
 pub async fn collect_garbage(state: &NodeState) {
+    crate::guest::collect_garbage(state);
     collect_garbage_with(state, ABANDONED_PARTIAL, UNPUBLISHED_FOLDER_FILES_MS).await;
 }
 

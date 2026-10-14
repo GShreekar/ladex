@@ -136,7 +136,8 @@ ladex ls                             # list what is shared (--all also lists fil
 ladex get report.pdf -o ~/Downloads  # download by name or id (default: the current directory)
 ladex seed photos/ --watch           # share a folder, and share it again whenever it changes
 ladex devices                        # list connected devices and nodes
-ladex invite                         # the address for another device, as text and a QR code
+ladex invite                         # a one-time browser invitation as a link, a typed code and a QR code
+ladex invite --permission upload     # also read-only (default) or upload-with-approval
 ladex doctor                         # check that the node is running and reachable
 ```
 

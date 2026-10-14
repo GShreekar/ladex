@@ -1406,7 +1406,7 @@ dependencies = [
 
 [[package]]
 name = "ladex"
-version = "3.0.0-alpha.1"
+version = "3.0.0-beta.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1425,7 +1425,7 @@ dependencies = [
 
 [[package]]
 name = "ladex-core"
-version = "3.0.0-alpha.1"
+version = "3.0.0-beta.1"
 dependencies = [
  "anyhow",
  "blake3",

@@ -1,0 +1,80 @@
+/* Colours from the "Calm Peer Utility" (light) and "Technical Dark" (dark) design systems. */
+:root {
+  --bg: #f9f9ff;
+  --surface: #ffffff;
+  --surface-low: #f1f3ff;
+  --surface-high: #e0e8ff;
+  --border: #dfe1ee;
+  --border-strong: #c5c5d7;
+  --text: #141b2c;
+  --text-muted: #444654;
+  --text-faint: #757686;
+  --accent: #4f6bed;
+  --accent-hover: #3e58d4;
+  --on-accent: #ffffff;
+  --accent-text: #3250d3;
+  --accent-tint: #dee1ff;
+  --on-accent-tint: #0d35bb;
+  --success: #006c44;
+  --success-tint: #c9f7de;
+  --warning: #8f4e00;
+  --warning-tint: #ffe9d6;
+  --danger: #ba1a1a;
+  --danger-tint: #ffdad6;
+  --shadow-overlay: 0 4px 16px rgba(16, 24, 40, 0.1);
+  --scrim: rgba(20, 27, 44, 0.45);
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  color-scheme: light;
+}
+
+:root[data-theme='dark'] {
+  --bg: #111317;
+  --surface: #1a1c20;
+  --surface-low: #1e2024;
+  --surface-high: #282a2e;
+  --border: #2d3037;
+  --border-strong: #444654;
+  --text: #e2e2e8;
+  --text-muted: #c5c5d7;
+  --text-faint: #8e90a0;
+  --accent-text: #b9c3ff;
+  --accent-tint: rgba(185, 195, 255, 0.14);
+  --on-accent-tint: #b9c3ff;
+  --success: #71dba2;
+  --success-tint: rgba(113, 219, 162, 0.15);
+  --warning: #ffb689;
+  --warning-tint: rgba(255, 182, 137, 0.15);
+  --danger: #ffb4ab;
+  --danger-tint: rgba(255, 180, 171, 0.15);
+  --shadow-overlay: 0 4px 20px rgba(0, 0, 0, 0.45);
+  --scrim: rgba(0, 0, 0, 0.6);
+  color-scheme: dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) {
+    --bg: #111317;
+    --surface: #1a1c20;
+    --surface-low: #1e2024;
+    --surface-high: #282a2e;
+    --border: #2d3037;
+    --border-strong: #444654;
+    --text: #e2e2e8;
+    --text-muted: #c5c5d7;
+    --text-faint: #8e90a0;
+    --accent-text: #b9c3ff;
+    --accent-tint: rgba(185, 195, 255, 0.14);
+    --on-accent-tint: #b9c3ff;
+    --success: #71dba2;
+    --success-tint: rgba(113, 219, 162, 0.15);
+    --warning: #ffb689;
+    --warning-tint: rgba(255, 182, 137, 0.15);
+    --danger: #ffb4ab;
+    --danger-tint: rgba(255, 180, 171, 0.15);
+    --shadow-overlay: 0 4px 20px rgba(0, 0, 0, 0.45);
+    --scrim: rgba(0, 0, 0, 0.6);
+    color-scheme: dark;
+  }
+}

@@ -151,6 +151,13 @@ const check = (name, ok, detail = '') => { console.log(`${ok ? 'PASS' : 'FAIL'} 
 
     r = await runJson(n1, ['invite']);
     check('invite gives the address, the certificate fingerprint and the --peer address', /^https:\/\/.+:9510$/.test(r.json?.url || '') && /^([0-9A-F]{2}:){31}[0-9A-F]{2}$/.test(r.json.certificate_fingerprint || '') && r.json.needs_passphrase === true && /:9510$/.test(r.json.peer_address || ''), r.stdout);
+    const guest = r.json.guest || {};
+    check('invite also issues a one-time guest link with the token and the fingerprint in its fragment', /^https:\/\/.+:9510\/join#t=[0-9a-f]{32}&fp=([0-9A-F]{2}:){31}[0-9A-F]{2}$/.test(guest.join_url || '') && guest.permission === 'read-only' && /^[A-Z2-7]{4}-[A-Z2-7]{4}$/.test(guest.code || '') && guest.expires_in_secs === 600, r.stdout);
+    check('the fingerprint in the link is the certificate fingerprint', guest.join_url?.endsWith(`fp=${r.json.certificate_fingerprint}`), r.stdout);
+    r = await runJson(n1, ['invite', '--permission', 'upload-with-approval']);
+    check('a permission can be chosen, and each invite is a new token', r.json?.guest?.permission === 'upload-with-approval' && r.json.guest.join_url !== guest.join_url, r.stdout);
+    r = await run(n1, ['invite', '--permission', 'everything']);
+    check('an unknown permission is refused', r.code !== 0, r.stderr);
     r = await run(n1, ['invite']);
     check('and draws a QR code for people', /Scan to open/.test(r.stdout) && /█|▀|▄/.test(r.stdout));
 

@@ -13,6 +13,7 @@ pub mod catalog;
 pub mod control;
 pub mod discovery;
 pub mod files_api;
+pub mod guest;
 pub mod handlers;
 pub mod handshake;
 pub mod hlc;
@@ -107,6 +108,12 @@ pub struct NodeState {
     /// The signed-op catalog that replaces `files`, and is kept in step across the mesh by version vectors (see catalog.rs).
     pub catalog: Arc<catalog::shared::SharedCatalog>,
 
+    /// Counts catalog changes, so a connection that streams the catalog knows when to send it again.
+    pub catalog_changes: Arc<tokio::sync::watch::Sender<u64>>,
+
+    /// Browser guests: the invites that admit them, their sessions, and the files they have uploaded.
+    pub guests: Arc<guest::Guests>,
+
     /// Which WebSocket connection holds each browser `session_id`.
     pub session_owners: Arc<RwLock<HashMap<SessionId, websocket::ConnOwner>>>,
     pub connection_counter: Arc<AtomicU64>,
@@ -188,6 +195,8 @@ impl NodeState {
             })),
             pushes: Arc::new(push::Pushes::default()),
             catalog: Arc::new(catalog::shared::SharedCatalog::open(&data_dir, state::MAX_CATALOG_ENTRIES).unwrap()),
+            catalog_changes: Arc::new(tokio::sync::watch::channel(0).0),
+            guests: Arc::new(guest::Guests::new(guest::DEFAULT_SESSION_LIFETIME)),
             session_owners: Arc::new(RwLock::new(HashMap::new())),
             connection_counter: Arc::new(AtomicU64::new(1)),
             clock_alert_at: Arc::new(Mutex::new(None)),
