@@ -1,4 +1,4 @@
-//! The browser-tab WebSocket (/ws): joins, chat, file actions and signaling.
+//! The browser-tab WebSocket (/ws): joins, chat and file actions.
 
 use crate::server::PeerAddr;
 use crate::sessions::SessionHandle;
@@ -310,7 +310,7 @@ async fn handle_client_message(
         }
 
         ClientMessage::OfferFileTo { session_id: from, target_session_id, file_id } => {
-            mesh::route_signal(
+            mesh::route_to_device(
                 state,
                 &from,
                 &target_session_id,
@@ -323,7 +323,7 @@ async fn handle_client_message(
             // A file sent to this device alone is declined at its node; an offer of a catalog file just tells the other tab.
             if !crate::push::decline(state, &from, &file_id).await {
                 let declined = ServerMessage::FileOfferDeclined { file_id, from_session_id: from.clone() };
-                mesh::route_signal(state, &from, &target_session_id, declined).await;
+                mesh::route_to_device(state, &from, &target_session_id, declined).await;
             }
         }
 

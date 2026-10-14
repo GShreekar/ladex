@@ -1,0 +1,563 @@
+import { runLimited, sleep } from './concurrency';
+import { deviceKindOf, friendlyDeviceName, randomId } from './format';
+import { runResumableUpload, SignedOut, type SendResult, type UploadReply, type UploadWire } from './resumable-upload';
+import {
+  TransferError,
+  type Capabilities,
+  type ChatMessage,
+  type ClientEvent,
+  type ClientListener,
+  type ConnectionState,
+  type Device,
+  type DownloadTicket,
+  type FileUploadRequest,
+  type IncomingOffer,
+  type LadexClient,
+  type NoticeLevel,
+  type SelfInfo,
+  type SharedFile,
+  type UploadOutcome,
+  type UploadRequest,
+} from './types';
+import type { AuthStatus, ServerMessage, WireFile, WireMessage, WirePeer } from './wire';
+
+const SESSION_KEY = 'ladex_session';
+const NICKNAME_KEY = 'ladex_nickname';
+const NICKNAME_MAX_CHARS = 40;
+const RECONNECT_DELAY_MS = 3000;
+const FOLDER_CONCURRENCY = 3;
+const MAX_FOLDER_FILES = 100_000;
+const ACCEPT_POLL_ATTEMPTS = 10;
+const ACCEPT_POLL_DELAY_MS = 300;
+
+function loadSessionId(): string {
+  try {
+    const saved = sessionStorage.getItem(SESSION_KEY);
+    if (saved) return saved;
+    const created = randomId('peer_', 10);
+    sessionStorage.setItem(SESSION_KEY, created);
+    return created;
+  } catch {
+    return randomId('peer_', 10);
+  }
+}
+
+function loadNickname(): string {
+  try {
+    return localStorage.getItem(NICKNAME_KEY) ?? '';
+  } catch {
+    return '';
+  }
+}
+
+function saveNickname(nickname: string): void {
+  try {
+    localStorage.setItem(NICKNAME_KEY, nickname);
+  } catch {
+    // The name still applies for this visit.
+  }
+}
+
+function describeProblem(status: number): string {
+  if (status === 404) return 'That file has been removed.';
+  if (status === 503) return 'No device that has this file is online right now.';
+  if (status === 507) return 'This node does not have room to fetch that file.';
+  return `The node could not provide that file (error ${status}).`;
+}
+
+function parseReply(text: string): UploadReply {
+  try {
+    return JSON.parse(text) as UploadReply;
+  } catch {
+    return {};
+  }
+}
+
+function putWithXhr(url: string, headers: Record<string, string>, body: Blob, signal: AbortSignal, onProgress: (loaded: number) => void): Promise<SendResult> {
+  return new Promise((resolve) => {
+    const request = new XMLHttpRequest();
+    request.open('PUT', url);
+    for (const [name, value] of Object.entries(headers)) request.setRequestHeader(name, value);
+    request.upload.onprogress = (event) => {
+      if (event.lengthComputable) onProgress(event.loaded);
+    };
+    request.onload = () =>
+      resolve({ status: request.status, isNetworkFailure: false, isAborted: false, reply: parseReply(request.responseText) });
+    request.onerror = () => resolve({ status: 0, isNetworkFailure: true, isAborted: false, reply: {} });
+    request.ontimeout = request.onerror;
+    request.onabort = () => resolve({ status: 0, isNetworkFailure: false, isAborted: true, reply: {} });
+    signal.addEventListener('abort', () => request.abort(), { once: true });
+    request.send(body);
+  });
+}
+
+interface SendOptions {
+  parent?: string;
+  to?: string;
+  signal: AbortSignal;
+  onProgress: (bytesSent: number) => void;
+}
+
+/** A node reached over HTTP and a WebSocket from a browser on the same machine or LAN, signed in with the node's passphrase. */
+export class LocalNodeClient implements LadexClient {
+  private readonly listeners = new Set<ClientListener>();
+  private readonly peers = new Map<string, WirePeer>();
+  private readonly nodeNames = new Map<string, string>();
+  private readonly pendingUnshares = new Map<string, string>();
+  private readonly sentFiles = new Map<string, string>();
+  private readonly sessionId = loadSessionId();
+  private nickname = loadNickname();
+  private files: WireFile[] = [];
+  private messages: WireMessage[] = [];
+  private status: AuthStatus = { authenticated: false, auth_required: false, node_id: '', is_host: false };
+  private socket: WebSocket | null = null;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private isStopped = false;
+
+  get capabilities(): Capabilities {
+    return {
+      canUpload: true,
+      uploadNeedsApproval: false,
+      canShareFolders: true,
+      canChat: true,
+      canRename: true,
+      canSendToDevice: true,
+      canManageGuests: this.status.is_host,
+      canLeave: this.status.auth_required,
+    };
+  }
+
+  subscribe(listener: ClientListener): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  async start(): Promise<void> {
+    this.isStopped = false;
+    this.emit({ type: 'connection', state: 'connecting' });
+    try {
+      this.status = await this.fetchStatus();
+    } catch {
+      this.emit({ type: 'connection', state: 'offline' });
+      this.scheduleReconnect();
+      return;
+    }
+    if (this.status.auth_required && !this.status.authenticated) {
+      this.emit({ type: 'connection', state: 'signed-out' });
+      return;
+    }
+    this.publishSelf();
+    this.openSocket();
+  }
+
+  stop(): void {
+    this.isStopped = true;
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.socket?.close();
+    this.socket = null;
+  }
+
+  async uploadFile(file: File, request: FileUploadRequest): Promise<UploadOutcome> {
+    const fileId = randomId('file_', 12);
+    await this.sendFile(file, fileId, { signal: request.signal, onProgress: request.onProgress, to: request.toDeviceId });
+    if (!request.toDeviceId) return 'shared';
+    this.sentFiles.set(fileId, file.name);
+    return 'offered';
+  }
+
+  async uploadFolder(files: File[], request: UploadRequest): Promise<UploadOutcome> {
+    if (files.length > MAX_FOLDER_FILES) throw new TransferError(`a folder can hold at most ${MAX_FOLDER_FILES} files`);
+    const folderId = randomId('file_', 12);
+    const folderName = files[0]?.webkitRelativePath.split('/')[0] || 'folder';
+    const sentBytes = new Array<number>(files.length).fill(0);
+    const children: Array<{ path: string; file_id: string }> = [];
+
+    try {
+      await runLimited(files, FOLDER_CONCURRENCY, async (file, index) => {
+        const fileId = randomId('file_', 12);
+        await this.sendFile(file, fileId, {
+          parent: folderId,
+          signal: request.signal,
+          onProgress: (bytes) => {
+            sentBytes[index] = bytes;
+            request.onProgress(sentBytes.reduce((sum, value) => sum + value, 0));
+          },
+        });
+        children.push({ path: file.webkitRelativePath || file.name, file_id: fileId });
+      });
+      await this.publishFolder(folderId, folderName, children);
+    } catch (error) {
+      // Files that did arrive stay hidden but take up room, so they are removed with the folder that never was.
+      for (const child of children) this.send({ type: 'delete_file', session_id: this.sessionId, file_id: child.file_id });
+      throw error;
+    }
+    return 'shared';
+  }
+
+  async prepareDownload(file: SharedFile): Promise<DownloadTicket> {
+    if (file.isFolder) {
+      return { url: `/api/folders/${encodeURIComponent(file.id)}.zip`, filename: `${file.name}.zip` };
+    }
+    const url = `/api/files/${encodeURIComponent(file.id)}`;
+    await this.probe(url);
+    return { url, filename: file.name };
+  }
+
+  unshare(file: SharedFile): void {
+    this.pendingUnshares.set(file.id, file.name);
+    this.send({ type: 'delete_file', session_id: this.sessionId, file_id: file.id });
+  }
+
+  sendMessage(text: string): void {
+    const content = text.trim();
+    if (content) this.send({ type: 'text_message', session_id: this.sessionId, content });
+  }
+
+  rename(nickname: string): void {
+    this.nickname = nickname.trim().slice(0, NICKNAME_MAX_CHARS);
+    saveNickname(this.nickname);
+    if (this.nickname) this.send({ type: 'set_nickname', session_id: this.sessionId, nickname: this.nickname });
+    this.publishSelf();
+    this.publishDevices();
+    this.publishFiles();
+    this.publishMessages();
+  }
+
+  offerFile(file: SharedFile, device: Device): void {
+    this.send({ type: 'offer_file_to', session_id: this.sessionId, target_session_id: device.id, file_id: file.id });
+    this.notify('info', `Offered "${file.name}" to ${device.name}`);
+  }
+
+  async answerOffer(offer: IncomingOffer, accepted: boolean): Promise<DownloadTicket | null> {
+    if (!accepted) {
+      this.send({ type: 'decline_file_offer', session_id: this.sessionId, target_session_id: offer.senderId, file_id: offer.fileId });
+      return null;
+    }
+    if (!offer.isDirect) {
+      const listed = this.files.find((file) => file.id === offer.fileId);
+      if (!listed) throw new TransferError('That file is no longer available.');
+      return this.prepareDownload(this.toSharedFile(listed));
+    }
+    this.send({ type: 'accept_file_offer', session_id: this.sessionId, file_id: offer.fileId });
+    return this.waitForPushedFile(offer);
+  }
+
+  async leave(): Promise<void> {
+    this.stop();
+    await fetch('/logout', { method: 'POST', credentials: 'same-origin' }).catch(() => undefined);
+    this.emit({ type: 'connection', state: 'signed-out' });
+  }
+
+  private emit(event: ClientEvent): void {
+    for (const listener of this.listeners) listener(event);
+  }
+
+  private notify(level: NoticeLevel, text: string): void {
+    this.emit({ type: 'notice', notice: { level, text } });
+  }
+
+  private async fetchStatus(): Promise<AuthStatus> {
+    const response = await fetch('/auth-status', { cache: 'no-store' });
+    return (await response.json()) as AuthStatus;
+  }
+
+  private setConnection(state: ConnectionState): void {
+    this.emit({ type: 'connection', state });
+  }
+
+  private openSocket(): void {
+    const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const socket = new WebSocket(`${scheme}//${location.host}/ws`);
+    this.socket = socket;
+
+    socket.onopen = () => {
+      this.setConnection('online');
+      this.send({ type: 'join', session_id: this.sessionId, user_agent: navigator.userAgent, nickname: this.nickname || null });
+    };
+    socket.onmessage = (event) => {
+      try {
+        this.handleMessage(JSON.parse(event.data as string) as ServerMessage);
+      } catch (error) {
+        console.error('Could not read a message from the node', error);
+      }
+    };
+    socket.onclose = () => {
+      if (this.isStopped || this.socket !== socket) return;
+      this.setConnection('offline');
+      this.scheduleReconnect();
+    };
+  }
+
+  // Signed out means the node would refuse the socket, so ask first instead of looping.
+  private scheduleReconnect(): void {
+    if (this.isStopped) return;
+    this.reconnectTimer = setTimeout(async () => {
+      try {
+        this.status = await this.fetchStatus();
+        if (this.status.auth_required && !this.status.authenticated) {
+          this.setConnection('signed-out');
+          return;
+        }
+      } catch {
+        this.scheduleReconnect();
+        return;
+      }
+      this.openSocket();
+    }, RECONNECT_DELAY_MS);
+  }
+
+  private send(message: Record<string, unknown>): void {
+    if (this.socket?.readyState === WebSocket.OPEN) this.socket.send(JSON.stringify(message));
+  }
+
+  private handleMessage(message: ServerMessage): void {
+    switch (message.type) {
+      case 'peer_joined':
+        this.rememberPeer(message.peer);
+        this.publishDevices();
+        this.publishFiles();
+        break;
+      case 'peer_left':
+        this.peers.delete(message.session_id);
+        this.publishDevices();
+        break;
+      case 'peer_sync':
+        for (const peer of message.peers) {
+          if (peer.hosting_node_id == null) this.peers.delete(peer.session_id);
+          else this.rememberPeer({ ...this.peers.get(peer.session_id), ...peer });
+        }
+        this.publishDevices();
+        this.publishFiles();
+        break;
+      case 'file_list_update':
+        this.files = message.files;
+        this.publishFiles();
+        break;
+      case 'file_removed':
+        this.confirmRemoval(message.file_id);
+        break;
+      case 'text_message':
+        this.messages = [...this.messages, message.message];
+        this.publishMessages();
+        break;
+      case 'message_history':
+        this.messages = message.messages;
+        this.publishMessages();
+        break;
+      case 'incoming_file_offer':
+        this.emit({ type: 'offer', offer: this.toOffer(message) });
+        break;
+      case 'file_offer_declined':
+        this.reportDeclined(message.file_id, message.from_session_id);
+        break;
+      case 'file_push_delivered':
+        this.reportDelivered(message.file_id, message.to_session_id);
+        break;
+      case 'no_peers_warning':
+        this.emit({ type: 'no-peers' });
+        break;
+      case 'error':
+        this.notify('error', message.message);
+        break;
+      case 'pong':
+        break;
+    }
+  }
+
+  private rememberPeer(peer: WirePeer): void {
+    if (peer.hosting_node_id && peer.hosting_node_name) this.nodeNames.set(peer.hosting_node_id, peer.hosting_node_name);
+    this.peers.set(peer.session_id, peer);
+  }
+
+  private nodeName(nodeId: string): string {
+    return this.nodeNames.get(nodeId) ?? `node ${nodeId.slice(-6)}`;
+  }
+
+  private deviceName(sessionId: string): string {
+    if (sessionId === this.sessionId) {
+      return this.nickname || friendlyDeviceName(navigator.userAgent) || 'This device';
+    }
+    const peer = this.peers.get(sessionId);
+    return peer?.nickname || friendlyDeviceName(peer?.user_agent) || `Peer ${sessionId.slice(-6)}`;
+  }
+
+  private publishSelf(): void {
+    const own = this.peers.get(this.sessionId);
+    const nodeName = own?.hosting_node_name ?? this.nodeNames.get(this.status.node_id) ?? 'this node';
+    const self: SelfInfo = { id: this.sessionId, name: this.deviceName(this.sessionId), nodeName };
+    this.emit({ type: 'self', self });
+  }
+
+  private publishDevices(): void {
+    const others = [...this.peers.values()].filter((peer) => peer.session_id !== this.sessionId && !peer.left);
+    const toDevice = (peer: WirePeer): Device => ({
+      id: peer.session_id,
+      name: this.deviceName(peer.session_id),
+      nodeName: peer.hosting_node_name ?? '',
+      kind: deviceKindOf(peer.user_agent),
+      isSelf: false,
+      latencyMs: peer.node_rtt_ms ?? null,
+    });
+    const self: Device = {
+      id: this.sessionId,
+      name: this.deviceName(this.sessionId),
+      nodeName: this.peers.get(this.sessionId)?.hosting_node_name ?? '',
+      kind: deviceKindOf(navigator.userAgent),
+      isSelf: true,
+      latencyMs: null,
+    };
+    this.emit({ type: 'devices', devices: [self, ...others.map(toDevice)] });
+    this.publishSelf();
+  }
+
+  private toSharedFile(file: WireFile): SharedFile {
+    const isOwn = file.uploader_id === this.sessionId;
+    const uploaderKnown = file.uploader_id !== '' && (isOwn || this.peers.has(file.uploader_id));
+    const holderNames = file.hosts.map((nodeId) => this.nodeName(nodeId));
+    return {
+      id: file.id,
+      name: file.name,
+      mimeType: file.mime_type,
+      isFolder: file.is_folder,
+      sizeBytes: file.is_folder ? file.folder_bytes : file.size,
+      folderFileCount: file.folder_files,
+      sharedAt: Date.parse(file.uploaded_at),
+      sharedBy: isOwn ? 'You' : uploaderKnown ? this.deviceName(file.uploader_id) : this.nodeName(file.uploader_node),
+      holderNames,
+      isAvailable: holderNames.length > 0,
+      canUnshare: isOwn || (this.status.is_host && file.uploader_node === this.status.node_id),
+    };
+  }
+
+  private publishFiles(): void {
+    const files = this.files.filter((file) => !file.parent).map((file) => this.toSharedFile(file));
+    this.emit({ type: 'files', files });
+  }
+
+  private publishMessages(): void {
+    const messages: ChatMessage[] = this.messages.map((message) => ({
+      id: message.id,
+      text: message.content,
+      senderName: message.sender_id === this.sessionId ? 'You' : message.sender_name || this.deviceName(message.sender_id),
+      isOwn: message.sender_id === this.sessionId,
+      sentAt: Date.parse(message.timestamp),
+    }));
+    this.emit({ type: 'messages', messages });
+  }
+
+  private toOffer(message: Extract<ServerMessage, { type: 'incoming_file_offer' }>): IncomingOffer {
+    const listed = this.files.find((file) => file.id === message.file_id);
+    const pushed = message.pushed;
+    const fallbackSize = listed ? (listed.is_folder ? listed.folder_bytes : listed.size) : null;
+    return {
+      fileId: message.file_id,
+      fileName: pushed?.name ?? listed?.name ?? 'a file',
+      sizeBytes: pushed?.size ?? fallbackSize,
+      senderName: this.deviceName(message.from_session_id),
+      senderId: message.from_session_id,
+      isDirect: pushed !== undefined,
+    };
+  }
+
+  private confirmRemoval(fileId: string): void {
+    const name = this.pendingUnshares.get(fileId);
+    if (name === undefined) {
+      this.notify('info', 'A shared file was removed');
+      return;
+    }
+    this.pendingUnshares.delete(fileId);
+    this.notify('success', `Unshared ${name}`);
+  }
+
+  private reportDeclined(fileId: string, fromSessionId: string): void {
+    const who = this.deviceName(fromSessionId);
+    const name = this.sentFiles.get(fileId);
+    this.sentFiles.delete(fileId);
+    this.notify('warning', name ? `${who} declined "${name}"` : `${who} declined your file offer`);
+  }
+
+  private reportDelivered(fileId: string, toSessionId: string): void {
+    const who = this.deviceName(toSessionId);
+    const name = this.sentFiles.get(fileId) ?? 'your file';
+    this.sentFiles.delete(fileId);
+    this.notify('success', `${who} received "${name}"`);
+  }
+
+  private handleSignedOut(): never {
+    this.setConnection('signed-out');
+    throw new TransferError('You have been signed out.');
+  }
+
+  private async probe(url: string): Promise<void> {
+    let response: Response;
+    try {
+      response = await fetch(url, { method: 'HEAD', cache: 'no-store' });
+    } catch {
+      throw new TransferError('Could not reach the node.');
+    }
+    if (response.status === 401) this.handleSignedOut();
+    if (!response.ok) throw new TransferError(describeProblem(response.status));
+  }
+
+  // The node learns of the acceptance over the WebSocket, which this request can overtake.
+  private async waitForPushedFile(offer: IncomingOffer): Promise<DownloadTicket> {
+    const url = `/api/files/${encodeURIComponent(offer.fileId)}?to=${encodeURIComponent(this.sessionId)}`;
+    for (let attempt = 0; attempt < ACCEPT_POLL_ATTEMPTS; attempt++) {
+      const response = await fetch(url, { method: 'HEAD', cache: 'no-store' }).catch(() => null);
+      if (response?.status === 401) this.handleSignedOut();
+      if (response?.ok) return { url, filename: offer.fileName };
+      await sleep(ACCEPT_POLL_DELAY_MS);
+    }
+    throw new TransferError(`Could not receive ${offer.fileName}.`);
+  }
+
+  private uploadWire(file: File, fileId: string, options: SendOptions): UploadWire {
+    const baseHeaders: Record<string, string> = {
+      'X-Ladex-Session': this.sessionId,
+      'X-Ladex-Size': String(file.size),
+      'X-Ladex-Name': encodeURIComponent(file.name),
+      'Content-Type': file.type || 'application/octet-stream',
+    };
+    if (options.parent) baseHeaders['X-Ladex-Parent'] = options.parent;
+    if (options.to) baseHeaders['X-Ladex-To'] = options.to;
+
+    return {
+      queryProgress: async () => {
+        const response = await fetch(`/api/files/${fileId}/upload?size=${file.size}`, { cache: 'no-store' });
+        if (response.status === 401) throw new SignedOut();
+        const body = (await response.json()) as { offset?: number; complete?: boolean };
+        return { offset: body.offset ?? 0, isComplete: body.complete ?? false };
+      },
+      sendFrom: (offset, onProgress) => {
+        const headers = { ...baseHeaders, 'X-Ladex-Offset': String(offset) };
+        const body = offset > 0 ? file.slice(offset) : file;
+        return putWithXhr(`/api/files/${fileId}`, headers, body, options.signal, (loaded) => onProgress(offset + loaded));
+      },
+    };
+  }
+
+  private async sendFile(file: File, fileId: string, options: SendOptions): Promise<UploadReply> {
+    try {
+      return await runResumableUpload(this.uploadWire(file, fileId, options), {
+        signal: options.signal,
+        onProgress: options.onProgress,
+        fileId,
+        size: file.size,
+      });
+    } catch (error) {
+      if (error instanceof SignedOut) this.handleSignedOut();
+      throw error;
+    }
+  }
+
+  private async publishFolder(folderId: string, name: string, children: Array<{ path: string; file_id: string }>): Promise<void> {
+    const response = await fetch(`/api/folders/${folderId}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', 'X-Ladex-Session': this.sessionId },
+      body: JSON.stringify({ name, children }),
+    });
+    if (response.ok) return;
+    const body = (await response.json().catch(() => ({}))) as UploadReply;
+    throw new TransferError(body.message ?? `the node answered ${response.status}`);
+  }
+}

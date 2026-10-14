@@ -98,13 +98,13 @@ pub enum MeshMessage {
         size: u64,
         hashes: String,
     },
-    /// Routes a WebRTC signal between browser tabs on different nodes.
-    SignalRelay {
+    /// Carries a message for a browser tab (a file offer or its refusal) to the node that hosts the tab.
+    DeviceRelay {
         to_node_id: NodeId,
         from_node_id: NodeId,
         to_session_id: SessionId,
         /// The [`ServerMessage`] for the tab, as the JSON the browser reads.
-        signal: String,
+        message: String,
     },
 
     /// Keys no longer trusted, each signed by the node that revoked it.
@@ -489,21 +489,21 @@ pub(crate) async fn dispatch(msg: &MeshMessage, from_node_id: &NodeId, state: &N
             state::apply_chat_message(state, message.clone()).await;
         }
 
-        MeshMessage::SignalRelay { to_node_id, from_node_id: from, to_session_id, signal } => {
+        MeshMessage::DeviceRelay { to_node_id, from_node_id: from, to_session_id, message } => {
             // The mesh is one hop, so a relay always comes from this peer and is addressed to us.
             if from != from_node_id || to_node_id != &state.node_id {
-                tracing::warn!("SignalRelay from {from_node_id} with mismatched addressing — dropped");
+                tracing::warn!("DeviceRelay from {from_node_id} with mismatched addressing — dropped");
                 return;
             }
-            let srv_msg = match serde_json::from_str::<ServerMessage>(signal) {
+            let srv_msg = match serde_json::from_str::<ServerMessage>(message) {
                 Ok(m) => m,
                 Err(e) => {
-                    tracing::warn!("SignalRelay: bad signal for tab {to_session_id}: {e}");
+                    tracing::warn!("DeviceRelay: bad message for tab {to_session_id}: {e}");
                     return;
                 }
             };
             if !relay_is_legitimate(state, &srv_msg, from_node_id).await {
-                tracing::warn!("SignalRelay from {from_node_id} refused: not a signaling message from one of its own devices");
+                tracing::warn!("DeviceRelay from {from_node_id} refused: not a file offer from one of its own devices");
                 return;
             }
             let senders = state.local_senders.read().await;
@@ -511,7 +511,7 @@ pub(crate) async fn dispatch(msg: &MeshMessage, from_node_id: &NodeId, state: &N
                 Some(sender) => {
                     let _ = sender.send(srv_msg);
                 }
-                None => tracing::warn!("SignalRelay: no local tab {to_session_id}"),
+                None => tracing::warn!("DeviceRelay: no local tab {to_session_id}"),
             }
         }
 
@@ -609,8 +609,8 @@ async fn relay_is_legitimate(state: &NodeState, msg: &ServerMessage, sender_node
     peers.get(claimed_from).is_some_and(|p| !p.left && p.hosting_node_id.as_ref() == Some(sender_node))
 }
 
-/// Routes a WebRTC signaling payload from a local tab to a tab that may be on another node.
-pub async fn route_signal(state: &NodeState, _from_session_id: &str, to_session_id: &str, srv_msg: ServerMessage) {
+/// Delivers a file offer or its refusal to a tab, which may be hosted by another node.
+pub async fn route_to_device(state: &NodeState, _from_session_id: &str, to_session_id: &str, srv_msg: ServerMessage) {
     let hosting_node_id: Option<NodeId> = {
         let peers = state.local_peers.read().await;
         peers.get(to_session_id).and_then(|p| p.hosting_node_id.clone())
@@ -622,27 +622,27 @@ pub async fn route_signal(state: &NodeState, _from_session_id: &str, to_session_
             if let Some(sender) = senders.get(to_session_id) {
                 let _ = sender.send(srv_msg);
             } else {
-                tracing::warn!("route_signal: no local sender for {to_session_id}");
+                tracing::warn!("route_to_device: no local sender for {to_session_id}");
             }
         }
 
         Some(target_node_id) => {
-            let signal = serde_json::to_string(&srv_msg).expect("a server message always serializes");
+            let message = serde_json::to_string(&srv_msg).expect("a server message always serializes");
             let peers = state.mesh_peers.read().await;
             if let Some(peer) = peers.get(&target_node_id) {
-                let _ = peer.sender.send(MeshMessage::SignalRelay {
+                let _ = peer.sender.send(MeshMessage::DeviceRelay {
                     to_node_id: target_node_id,
                     from_node_id: state.node_id.clone(),
                     to_session_id: to_session_id.to_string(),
-                    signal,
+                    message,
                 });
             } else {
-                tracing::warn!("route_signal: no mesh peer {target_node_id} for tab {to_session_id}");
+                tracing::warn!("route_to_device: no mesh peer {target_node_id} for tab {to_session_id}");
             }
         }
 
         None => {
-            tracing::warn!("route_signal: unknown hosting node for tab {to_session_id} — trying local fallback");
+            tracing::warn!("route_to_device: unknown hosting node for tab {to_session_id} — trying local fallback");
             let senders = state.local_senders.read().await;
             if let Some(sender) = senders.get(to_session_id) {
                 let _ = sender.send(srv_msg);
@@ -689,15 +689,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_relayed_signal_reaches_the_tab_it_is_addressed_to() {
+    async fn a_relayed_message_reaches_the_tab_it_is_addressed_to() {
         let state = node_with_device("peer_x", "node_other", false).await;
         let (tab, mut inbox) = mpsc::unbounded_channel();
         state.local_senders.write().await.insert("tab_1".into(), tab);
-        let relay = MeshMessage::SignalRelay {
+        let relay = MeshMessage::DeviceRelay {
             to_node_id: state.node_id.clone(),
             from_node_id: "node_other".into(),
             to_session_id: "tab_1".into(),
-            signal: serde_json::to_string(&offer("peer_x")).unwrap(),
+            message: serde_json::to_string(&offer("peer_x")).unwrap(),
         };
         dispatch(&relay, &"node_other".to_string(), &state).await;
         assert!(matches!(inbox.try_recv(), Ok(ServerMessage::IncomingFileOffer { .. })));

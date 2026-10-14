@@ -26,8 +26,27 @@ const MAX_CATALOG_STREAMS: usize = 64;
 const CATALOG_DEBOUNCE: Duration = Duration::from_millis(250);
 const KEEP_ALIVE: Duration = Duration::from_secs(15);
 
-const JOIN_PAGE: &str = include_str!("join.html");
-const JOIN_SCRIPT: &str = include_str!("join.js");
+const LEGACY_JOIN_PAGE: &str = include_str!("join.html");
+const LEGACY_JOIN_SCRIPT: &str = include_str!("join.js");
+
+/// The page served at /join. `{{fingerprint}}` in it is replaced by the node's certificate fingerprint.
+#[derive(Clone)]
+pub struct JoinPage {
+    html: Arc<str>,
+    script: Option<Arc<str>>,
+}
+
+impl JoinPage {
+    /// A page whose script and styles are files the node serves elsewhere.
+    pub fn new(html: String) -> Self {
+        Self { html: html.into(), script: None }
+    }
+
+    /// The small self-contained page that shipped before the web UI, kept for `--legacy-ui`.
+    pub fn legacy() -> Self {
+        Self { html: LEGACY_JOIN_PAGE.into(), script: Some(LEGACY_JOIN_SCRIPT.into()) }
+    }
+}
 
 /// The response that turns a request away; boxed because a response is large and every `?` carries one.
 pub(super) type Refusal = Box<Response<ServerBody>>;
@@ -43,12 +62,18 @@ pub(super) fn refuse(status: StatusCode, message: &str) -> Refusal {
 pub struct GuestApi {
     pub(super) state: NodeState,
     pub(super) files: FilesApi,
+    join_page: JoinPage,
     catalog_streams: Arc<Semaphore>,
 }
 
 impl GuestApi {
     pub fn new(state: NodeState, files: FilesApi) -> Self {
-        Self { state, files, catalog_streams: Arc::new(Semaphore::new(MAX_CATALOG_STREAMS)) }
+        Self { state, files, join_page: JoinPage::legacy(), catalog_streams: Arc::new(Semaphore::new(MAX_CATALOG_STREAMS)) }
+    }
+
+    pub fn with_join_page(mut self, join_page: JoinPage) -> Self {
+        self.join_page = join_page;
+        self
     }
 }
 
@@ -90,7 +115,7 @@ fn page(body: String, content_type: &'static str) -> Response<ServerBody> {
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(
-            "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+            "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
         ),
     );
     response
@@ -129,7 +154,7 @@ impl GuestApi {
         let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
         match (parts.method.clone(), segments.as_slice()) {
             (Method::GET | Method::HEAD, ["join"]) => Ok(self.join_page()),
-            (Method::GET, ["join.js"]) => Ok(page(JOIN_SCRIPT.to_string(), "text/javascript; charset=utf-8")),
+            (Method::GET, ["join.js"]) => self.join_script(),
             (Method::POST, ["join"]) => self.join(parts, body, peer).await,
             (Method::GET, ["api", "me"]) => self.me(parts),
             (Method::DELETE, ["api", "me"]) => self.leave(parts, peer),
@@ -159,7 +184,14 @@ impl GuestApi {
             true => "This node is not using encryption.".to_string(),
             false => tls::format_fingerprint(&self.state.tls_fingerprint),
         };
-        page(JOIN_PAGE.replace("{{fingerprint}}", &fingerprint), "text/html; charset=utf-8")
+        page(self.join_page.html.replace("{{fingerprint}}", &fingerprint), "text/html; charset=utf-8")
+    }
+
+    fn join_script(&self) -> Outcome {
+        match &self.join_page.script {
+            Some(script) => Ok(page(script.to_string(), "text/javascript; charset=utf-8")),
+            None => Err(refuse(StatusCode::NOT_FOUND, "not found")),
+        }
     }
 
     async fn join(&self, parts: &Parts, body: &mut Option<Incoming>, peer: PeerAddr) -> Outcome {

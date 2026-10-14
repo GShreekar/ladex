@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use ladex_core::files_api::FilesApi;
-use ladex_core::guest::api::GuestApi;
+use ladex_core::guest::api::{GuestApi, JoinPage};
 use ladex_core::server::{self, Chain};
 use ladex_core::store::CHUNK_SIZE;
 use ladex_core::testing::{spawn_node, NodeConfig, NodeHandle};
@@ -39,11 +39,15 @@ struct Site {
 }
 
 async fn start_site() -> Site {
+    start_site_with(|api| api).await
+}
+
+async fn start_site_with(configure: impl FnOnce(GuestApi) -> GuestApi) -> Site {
     let node = spawn_node(NodeConfig::named("host").passphrase("mesh-secret")).await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let files = FilesApi::new(node.state.clone());
-    let api = Chain(files.clone(), GuestApi::new(node.state.clone(), files));
+    let api = Chain(files.clone(), configure(GuestApi::new(node.state.clone(), files)));
     let routes = warp::service(warp::any().map(warp::reply));
     tokio::spawn(server::serve(listener, None, None, routes, api));
     Site { addr, node }
@@ -209,6 +213,20 @@ async fn the_join_page_shows_the_fingerprint_and_blocks_referrers() {
     assert_eq!(page.header("referrer-policy"), Some("no-referrer"));
     assert!(page.header("content-security-policy").unwrap().contains("default-src 'none'"));
     assert!(String::from_utf8_lossy(&page.body).contains("not using encryption"));
+}
+
+#[tokio::test]
+async fn a_custom_join_page_is_served_with_the_fingerprint_and_has_no_legacy_script() {
+    let site = start_site_with(|api| api.with_join_page(JoinPage::new("<p>fp {{fingerprint}}</p>".into()))).await;
+    let page = site.request("GET", "/join", &[], b"").await;
+    assert!(String::from_utf8_lossy(&page.body).starts_with("<p>fp "));
+    assert_eq!(site.request("GET", "/join.js", &[], b"").await.status, 404);
+}
+
+#[tokio::test]
+async fn the_legacy_join_page_serves_its_script() {
+    let site = start_site().await;
+    assert_eq!(site.request("GET", "/join.js", &[], b"").await.status, 200);
 }
 
 #[tokio::test]

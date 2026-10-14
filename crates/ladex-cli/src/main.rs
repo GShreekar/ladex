@@ -14,7 +14,10 @@ use ladex_core::{
     store, tls, transfer, trust, websocket, NodeState,
 };
 
-static STATIC_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/../../static");
+// The previous web UI, served only with --legacy-ui.
+static LEGACY_UI_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/../../static");
+// The web UI built from `ui/` by build.rs.
+static UI_DIR: Dir = include_dir!("$OUT_DIR/ui");
 
 mod commands;
 mod doctor;
@@ -92,6 +95,10 @@ struct Args {
     /// Keep this node's private key in a file in the data directory instead of the OS keychain.
     #[arg(long)]
     no_keychain: bool,
+
+    /// Serve the previous web UI instead of the new one. Deprecated: it is removed in the next release.
+    #[arg(long)]
+    legacy_ui: bool,
 }
 
 /// Resolves the browser's login session; `None` without a passphrase, otherwise a missing session is rejected.
@@ -161,15 +168,10 @@ async fn handle_rejection(err: warp::Rejection) -> Result<Box<dyn warp::Reply>, 
     }
 }
 
-async fn serve_login_page() -> Result<Box<dyn warp::Reply>, warp::Rejection> {
-    let lookup = "login.html".to_string();
-    if let Some(file) = STATIC_DIR.get_file(&lookup) {
-        let mime = mime_guess::from_path(&lookup).first_or_octet_stream().to_string();
-        let bytes = file.contents().to_vec();
-        Ok(Box::new(warp::reply::with_header(warp::reply::html(bytes), "content-type", mime)) as Box<dyn warp::Reply>)
-    } else {
-        Err(warp::reject::not_found())
-    }
+fn embedded_file(dir: &'static Dir<'static>, path: &str) -> Result<Box<dyn warp::Reply>, warp::Rejection> {
+    let file = dir.get_file(path).ok_or_else(warp::reject::not_found)?;
+    let mime = mime_guess::from_path(path).first_or_octet_stream().to_string();
+    Ok(Box::new(warp::reply::with_header(warp::reply::html(file.contents().to_vec()), "content-type", mime)))
 }
 
 #[tokio::main]
@@ -455,16 +457,19 @@ async fn run_node(args: Args, data_dir: std::path::PathBuf) {
         });
     }
 
+    // The new UI shows its own sign-in; only the previous one has a page for it.
+    let is_legacy_ui = args.legacy_ui;
     let app_state_login = state.clone();
-    let login_route =
-        warp::path("login").and(warp::get()).and(warp::any().map(move || app_state_login.clone())).and_then(|s: NodeState| async move {
-            if s.passphrase.is_some() {
-                serve_login_page().await
+    let login_route = warp::path("login").and(warp::get()).and(warp::any().map(move || app_state_login.clone())).and_then(
+        move |s: NodeState| async move {
+            if is_legacy_ui && s.passphrase.is_some() {
+                embedded_file(&LEGACY_UI_DIR, "login.html")
             } else {
                 let redirect = warp::redirect::temporary(warp::http::Uri::from_static("/"));
                 Ok::<_, warp::Rejection>(Box::new(redirect) as Box<dyn warp::Reply>)
             }
-        });
+        },
+    );
 
     let app_state_auth = state.clone();
     let auth_route = warp::path("auth")
@@ -557,24 +562,29 @@ async fn run_node(args: Args, data_dir: std::path::PathBuf) {
         }))
         .and_then(handlers::check_auth_status);
 
-    let static_route = warp::path("static").and(warp::path::tail()).and_then(|tail: warp::filters::path::Tail| async move {
-        let lookup = tail.as_str().trim_start_matches('/').to_string();
-        let lookup = if lookup.is_empty() { "index.html".to_string() } else { lookup };
-        if let Some(file) = STATIC_DIR.get_file(&lookup) {
-            let mime = mime_guess::from_path(&lookup).first_or_octet_stream().to_string();
-            let bytes = file.contents().to_vec();
-            Ok::<_, warp::Rejection>(warp::reply::with_header(warp::reply::html(bytes), "content-type", mime))
-        } else {
-            Err(warp::reject::not_found())
+    let static_route = warp::path("static").and(warp::path::tail()).and_then(move |tail: warp::filters::path::Tail| async move {
+        if !is_legacy_ui {
+            return Err(warp::reject::not_found());
         }
+        let lookup = tail.as_str().trim_start_matches('/');
+        embedded_file(&LEGACY_UI_DIR, if lookup.is_empty() { "index.html" } else { lookup })
     });
 
-    let favicon_route = warp::path("favicon.ico").and(warp::get()).and_then(|| async move {
-        match STATIC_DIR.get_file("favicon.svg") {
-            Some(file) => Ok(warp::reply::with_header(warp::reply::html(file.contents().to_vec()), "content-type", "image/svg+xml")),
-            None => Err(warp::reject::not_found()),
+    // Built files carry a content hash in their name, so a browser may keep them for good.
+    let assets_route = warp::path("assets").and(warp::path::tail()).and_then(move |tail: warp::filters::path::Tail| async move {
+        if is_legacy_ui {
+            return Err(warp::reject::not_found());
         }
+        let reply = embedded_file(&UI_DIR, &format!("assets/{}", tail.as_str()))?;
+        Ok(Box::new(warp::reply::with_header(reply, "cache-control", "public, max-age=31536000, immutable")) as Box<dyn warp::Reply>)
     });
+
+    let ui_dir: &'static Dir<'static> = if is_legacy_ui { &LEGACY_UI_DIR } else { &UI_DIR };
+    let favicon_route = warp::path("favicon.ico")
+        .or(warp::path("favicon.svg"))
+        .unify()
+        .and(warp::get())
+        .and_then(move || async move { embedded_file(ui_dir, "favicon.svg") });
 
     let app_state_ws = state.clone();
     let websocket_route = warp::path("ws")
@@ -585,16 +595,9 @@ async fn run_node(args: Args, data_dir: std::path::PathBuf) {
         .and(warp::any().map(move || app_state_ws.clone()))
         .and_then(websocket::websocket_handler);
 
-    let index = warp::path::end().and(with_auth(state.clone())).and_then(|| async move {
-        let lookup = "index.html".to_string();
-        if let Some(file) = STATIC_DIR.get_file(&lookup) {
-            let mime = mime_guess::from_path(&lookup).first_or_octet_stream().to_string();
-            let bytes = file.contents().to_vec();
-            Ok::<_, warp::Rejection>(warp::reply::with_header(warp::reply::html(bytes), "content-type", mime))
-        } else {
-            Err(warp::reject::not_found())
-        }
-    });
+    // The new UI is public code and signs the person in itself; the previous one is only handed to a signed-in browser.
+    let index_gate = if is_legacy_ui { with_auth(state.clone()).boxed() } else { warp::any().boxed() };
+    let index = warp::path::end().and(index_gate).and_then(move || async move { embedded_file(ui_dir, "index.html") });
 
     let cors = warp::cors().allow_any_origin().allow_headers(vec!["content-type"]).allow_methods(vec!["GET", "POST", "PUT", "DELETE"]);
 
@@ -608,6 +611,7 @@ async fn run_node(args: Args, data_dir: std::path::PathBuf) {
         .or(trust_routes)
         .or(auth_status_route)
         .or(static_route)
+        .or(assets_route)
         .or(favicon_route)
         .or(websocket_route)
         .or(index)
@@ -661,7 +665,15 @@ async fn run_node(args: Args, data_dir: std::path::PathBuf) {
 
     let service = warp::service(routes);
     let files = files_api::FilesApi::new(state.clone());
-    let api = server::Chain(files.clone(), guest::api::GuestApi::new(state.clone(), files));
+    let guest_api = guest::api::GuestApi::new(state.clone(), files.clone());
+    let guest_api = match is_legacy_ui {
+        true => guest_api,
+        false => {
+            let page = UI_DIR.get_file("join.html").and_then(|file| file.contents_utf8()).unwrap_or_default();
+            guest_api.with_join_page(guest::api::JoinPage::new(page.to_string()))
+        }
+    };
+    let api = server::Chain(files, guest_api);
     if let (Some(listener), Some(port)) = (local_listener, local_http_port) {
         let hosts = vec![format!("localhost:{port}"), format!("127.0.0.1:{port}")];
         let service = service.clone();

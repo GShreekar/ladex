@@ -513,16 +513,16 @@ mod tests {
     }
 
     #[test]
-    fn a_relayed_signal_still_reads_as_a_server_message_after_postcard() {
+    fn a_relayed_message_still_reads_as_a_server_message_after_postcard() {
         let offer = ServerMessage::IncomingFileOffer { file_id: "file_1".into(), from_session_id: "device_1".into(), pushed: None };
-        let relay = MeshMessage::SignalRelay {
+        let relay = MeshMessage::DeviceRelay {
             to_node_id: "node_b".into(),
             from_node_id: "node_a".into(),
             to_session_id: "device_2".into(),
-            signal: serde_json::to_string(&offer).unwrap(),
+            message: serde_json::to_string(&offer).unwrap(),
         };
-        let MeshMessage::SignalRelay { signal, .. } = assert_survives_postcard(relay) else { panic!("decoded as another message") };
-        assert!(matches!(serde_json::from_str(&signal).unwrap(), ServerMessage::IncomingFileOffer { .. }));
+        let MeshMessage::DeviceRelay { message, .. } = assert_survives_postcard(relay) else { panic!("decoded as another message") };
+        assert!(matches!(serde_json::from_str(&message).unwrap(), ServerMessage::IncomingFileOffer { .. }));
     }
 
     #[test]
