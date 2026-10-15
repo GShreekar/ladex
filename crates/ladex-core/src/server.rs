@@ -85,10 +85,34 @@ where
     S::Future: Send,
     A: Api,
 {
+    serve_until(listener, tls, allowed_hosts, routes, api, std::future::pending()).await
+}
+
+/// Serves like `serve` until `stop` resolves, then closes the listener and waits for every open connection to end.
+pub async fn serve_until<S, A>(
+    listener: TcpListener,
+    tls: Option<TlsAcceptor>,
+    allowed_hosts: Option<AllowedHosts>,
+    routes: S,
+    api: A,
+    stop: impl std::future::Future<Output = ()>,
+) -> anyhow::Result<()>
+where
+    S: Service<hyper::Request<Incoming>, Response = warp::reply::Response, Error = Infallible> + Clone + Send + 'static,
+    S::Future: Send,
+    A: Api,
+{
     tracing::info!("Serving on {} ({})", listener.local_addr()?, if tls.is_some() { "TLS" } else { "plain HTTP" });
 
+    tokio::pin!(stop);
+    let mut connections = tokio::task::JoinSet::new();
     loop {
-        let (tcp, peer) = match listener.accept().await {
+        while connections.try_join_next().is_some() {}
+        let accepted = tokio::select! {
+            accepted = listener.accept() => accepted,
+            _ = &mut stop => break,
+        };
+        let (tcp, peer) = match accepted {
             Ok(pair) => pair,
             Err(e) => {
                 tracing::warn!("Accept error: {e}");
@@ -102,7 +126,7 @@ where
         let allowed_hosts = allowed_hosts.clone();
         let is_tls = tls.is_some();
 
-        tokio::spawn(async move {
+        connections.spawn(async move {
             let service = hyper::service::service_fn(move |mut req: hyper::Request<Incoming>| {
                 let peer_addr = PeerAddr { addr: peer, tls: is_tls };
                 req.extensions_mut().insert(peer_addr);
@@ -147,6 +171,8 @@ where
             }
         });
     }
+    connections.shutdown().await;
+    Ok(())
 }
 
 #[cfg(test)]

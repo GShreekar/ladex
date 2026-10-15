@@ -21,6 +21,7 @@ pub mod identity;
 pub mod manifest;
 pub mod mdns;
 pub mod mesh;
+pub mod node;
 pub mod pairing;
 pub mod persist;
 pub mod push;

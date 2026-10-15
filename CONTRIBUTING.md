@@ -14,7 +14,7 @@ cd ladex
 cargo build
 ```
 
-The workspace has two crates: `crates/ladex-core` (everything the node does) and `crates/ladex-cli` (the `ladex` binary, which wires it together). The web UI is in `ui/` (Svelte + TypeScript; `cargo build` builds it through `crates/ladex-cli/build.rs`, so you need Node.js 20 or newer, or set `LADEX_SKIP_UI_BUILD=1` to build without it). The previous UI in `static/` is served only with `--legacy-ui` and is deleted in the next release.
+The workspace has two crates: `crates/ladex-core` (everything the node does, started through `ladex_core::node::Node::start`) and `crates/ladex-cli` (the `ladex` binary: flags, output and the embedded web UI around that call). The web UI is in `ui/` (Svelte + TypeScript; `cargo build` builds it through `crates/ladex-cli/build.rs`, so you need Node.js 20 or newer, or set `LADEX_SKIP_UI_BUILD=1` to build without it). The previous UI in `static/` is served only with `--legacy-ui` and is deleted in the next release.
 
 ## Before you open a pull request
 

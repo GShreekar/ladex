@@ -1412,15 +1412,12 @@ dependencies = [
  "clap",
  "include_dir",
  "ladex-core",
- "mime_guess",
  "qrcode",
  "serde",
  "serde_json",
  "tokio",
- "tokio-rustls",
  "tracing",
  "tracing-subscriber",
- "warp",
 ]
 
 [[package]]
