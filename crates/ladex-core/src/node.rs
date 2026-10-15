@@ -16,8 +16,12 @@ use crate::{
     sessions, state, store, tls, transfer, trust, websocket, NodeState,
 };
 
+pub mod bridge;
+pub mod local;
 pub mod web;
 
+pub use bridge::{Bridge, Reply, SocketEvent};
+pub use local::{LinkError, LocalLink, LocalResponse, LocalUpload, SavedFile, SocketReader, SocketWriter};
 pub use web::{UiAssets, WebUi};
 
 pub const DEFAULT_HTTP_PORT: u16 = 8080;
@@ -140,6 +144,7 @@ pub struct NodeHandle {
     web_server: JoinHandle<anyhow::Result<()>>,
     local_web_server: Option<JoinHandle<()>>,
     stop_web: watch::Sender<bool>,
+    open_pipe: local::OpenPipe,
     background_tasks: Vec<JoinHandle<()>>,
 }
 
@@ -150,6 +155,11 @@ impl NodeHandle {
 
     pub fn state(&self) -> &NodeState {
         &self.state
+    }
+
+    /// An in-process way into this node's web server, for a window that lives in the same process.
+    pub fn local_link(&self) -> LocalLink {
+        LocalLink::new(self.state.clone(), self.open_pipe.clone(), self.stop_web.subscribe())
     }
 
     /// Resolves when the web server stops, which it only does on an error.
@@ -249,7 +259,7 @@ impl Node {
         let mdns = mdns::advertise(&local_ips, http_port, is_tls_enabled);
         let (stop_web, stop_signal) = watch::channel(false);
         let listeners = Listeners { public: public_listener, local: local_listener };
-        let WebServers { public: web_server, local: local_web_server } =
+        let WebServers { public: web_server, local: local_web_server, open_pipe } =
             serve_web(&state, &config.web_ui, listeners, tls_config, stop_signal);
 
         let info = NodeInfo {
@@ -266,7 +276,7 @@ impl Node {
             imported_legacy_files,
             notices,
         };
-        Ok(NodeHandle { info, state, mesh_endpoint, saver, mdns, web_server, local_web_server, stop_web, background_tasks })
+        Ok(NodeHandle { info, state, mesh_endpoint, saver, mdns, web_server, local_web_server, stop_web, open_pipe, background_tasks })
     }
 }
 
@@ -499,6 +509,7 @@ struct Listeners {
 struct WebServers {
     public: JoinHandle<anyhow::Result<()>>,
     local: Option<JoinHandle<()>>,
+    open_pipe: local::OpenPipe,
 }
 
 /// Serves the node's own page and the guest and file APIs on the public listener, and on the loopback one if it is open.
@@ -526,9 +537,26 @@ fn serve_web(
         })
     });
 
+    // Each in-process connection ends with the node, as a socket would.
+    let open_pipe: local::OpenPipe = {
+        let (service, api, stop) = (service.clone(), api.clone(), stop.clone());
+        Arc::new(move || {
+            let (client, served) = tokio::io::duplex(local::PIPE_BYTES);
+            let serving = server::serve_connection(served, local::local_peer(), None, service.clone(), api.clone());
+            let stop = wait_for_stop(stop.clone());
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = serving => {}
+                    _ = stop => {}
+                }
+            });
+            client
+        })
+    };
+
     let acceptor = tls_config.map(tokio_rustls::TlsAcceptor::from);
     let public = tokio::spawn(server::serve_until(listeners.public, acceptor, None, service, api, wait_for_stop(stop)));
-    WebServers { public, local }
+    WebServers { public, local, open_pipe }
 }
 
 async fn wait_for_stop(mut stop: watch::Receiver<bool>) {

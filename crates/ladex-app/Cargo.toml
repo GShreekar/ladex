@@ -1,0 +1,19 @@
+[package]
+name = "ladex-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "LADEX desktop app: a Tauri window around an embedded node"
+
+[build-dependencies]
+tauri-build = "2"
+
+[dependencies]
+ladex-core.workspace = true
+tauri = "2"
+tauri-plugin-dialog = "2"
+include_dir.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

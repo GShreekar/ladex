@@ -5,21 +5,16 @@
   import Icon from '../../components/Icon.svelte';
   import QrCode from '../../components/QrCode.svelte';
   import { clock } from '../../state/clock.svelte';
-  import { useApp } from '../../state/context';
+  import { useHost } from '../host-context';
   import {
-    answerUpload,
-    issueInvitation,
-    listGuests,
-    listWaitingUploads,
     PERMISSION_LABELS,
-    signOutGuest,
     type GuestPermission,
     type GuestSummary,
     type Invitation,
     type WaitingUpload,
   } from '../guests-api';
 
-  const { toasts } = useApp();
+  const { toasts, guestsApi } = useHost();
 
   const REFRESH_MS = 3000;
   const permissions: GuestPermission[] = ['read-only', 'upload', 'upload-with-approval'];
@@ -37,7 +32,7 @@
 
   async function refresh(): Promise<void> {
     try {
-      [guests, waiting] = await Promise.all([listGuests(), listWaitingUploads()]);
+      [guests, waiting] = await Promise.all([guestsApi.listGuests(), guestsApi.listWaitingUploads()]);
     } catch {
       // The next refresh tries again.
     }
@@ -56,7 +51,7 @@
   async function invite(): Promise<void> {
     isIssuing = true;
     try {
-      invitation = await issueInvitation(permission);
+      invitation = await guestsApi.issueInvitation(permission);
       issuedAt = Date.now();
     } catch (error) {
       reportFailure(error, 'Could not create an invitation.');
@@ -67,7 +62,7 @@
 
   async function signOut(guest: GuestSummary): Promise<void> {
     try {
-      await signOutGuest(guest.id);
+      await guestsApi.signOutGuest(guest.id);
       await refresh();
     } catch (error) {
       reportFailure(error, 'Could not sign that guest out.');
@@ -76,7 +71,7 @@
 
   async function answer(upload: WaitingUpload, accepted: boolean): Promise<void> {
     try {
-      await answerUpload(upload.id, accepted);
+      await guestsApi.answerUpload(upload.id, accepted);
       toasts.show('success', accepted ? `Accepted ${upload.name}` : `Declined ${upload.name}`);
       await refresh();
     } catch (error) {

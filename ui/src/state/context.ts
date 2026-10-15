@@ -15,6 +15,11 @@ export function provideApp(context: AppContext): void {
   setContext(KEY, context);
 }
 
+/** The context a root component is mounted with, for code that builds the app's state before mounting it. */
+export function contextFor(context: AppContext): Map<unknown, unknown> {
+  return new Map([[KEY, context]]);
+}
+
 export function useApp(): AppContext {
   return getContext<AppContext>(KEY);
 }
