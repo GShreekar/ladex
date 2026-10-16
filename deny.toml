@@ -1,5 +1,15 @@
 [advisories]
 yanked = "deny"
+# Unmaintained or unsound crates that only the desktop app's Tauri/GTK webview stack pulls in; drop each when Tauri moves off it.
+ignore = [
+    "RUSTSEC-2024-0370", # proc-macro-error, via gtk3-rs
+    "RUSTSEC-2024-0429", # glib 0.18, via gtk3-rs
+    "RUSTSEC-2025-0075", # unic-char-range, via tauri-utils
+    "RUSTSEC-2025-0080", # unic-common, via tauri-utils
+    "RUSTSEC-2025-0081", # unic-char-property, via tauri-utils
+    "RUSTSEC-2025-0098", # unic-ucd-version, via tauri-utils
+    "RUSTSEC-2025-0100", # unic-ucd-ident, via tauri-utils
+]
 
 [licenses]
 allow = [
@@ -17,6 +27,14 @@ allow = [
     "Zlib",
 ]
 confidence-threshold = 0.9
+# File-level copyleft, pulled in only by the desktop app's webview stack and used unmodified.
+exceptions = [
+    { allow = ["MPL-2.0"], crate = "cssparser" },
+    { allow = ["MPL-2.0"], crate = "cssparser-macros" },
+    { allow = ["MPL-2.0"], crate = "dtoa-short" },
+    { allow = ["MPL-2.0"], crate = "option-ext" },
+    { allow = ["MPL-2.0"], crate = "selectors" },
+]
 
 [licenses.private]
 ignore = true
