@@ -150,6 +150,9 @@ pub struct Status {
     pub node_name: String,
     pub local_ip: Option<IpAddr>,
     pub http_port: u16,
+    // Plain HTTP on 127.0.0.1, which a window on this machine can open without a certificate warning.
+    #[serde(default)]
+    pub local_http_port: Option<u16>,
     pub quic_port: u16,
     pub discovery_port: Option<u16>,
     pub is_encrypted: bool,
@@ -170,6 +173,7 @@ pub struct Settings {
     pub data_dir: PathBuf,
     /// None when discovery is switched off.
     pub discovery_port: Option<u16>,
+    pub local_http_port: Option<u16>,
 }
 
 /// The command stopped listening, so there is nobody to finish the work for.
@@ -333,6 +337,7 @@ async fn status(state: &NodeState, settings: &Settings) -> Status {
         node_name: state.node_name.clone(),
         local_ip: state.local_ip,
         http_port: state.http_port,
+        local_http_port: settings.local_http_port,
         quic_port: state.quic_port,
         discovery_port: settings.discovery_port,
         is_encrypted: is_encrypted(state),

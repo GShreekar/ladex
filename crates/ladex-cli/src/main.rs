@@ -29,7 +29,7 @@ struct Cli {
     #[command(flatten)]
     node: Args,
 
-    /// Where the node keeps its files and settings. Default: ~/.ladex/files
+    /// Where the node keeps its files and settings. Default: $LADEX_DATA_DIR, else ~/.ladex/files
     #[arg(long, global = true)]
     data_dir: Option<std::path::PathBuf>,
 

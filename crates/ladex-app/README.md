@@ -18,11 +18,13 @@ The app embeds the built web UI, so build that first. On Linux install the webvi
 cargo run -p ladex-app
 ```
 
+`ui/dist` is shared: the app embeds it directly, and `ladex` stages a copy of it from `crates/ladex-cli/build.rs`, so one `npm run build` serves both.
+
 ## Settings until the first-run wizard
 
 | Variable | Meaning |
 |---|---|
 | `LADEX_PASSPHRASE` | Passphrase the node joins the mesh with and requires of browsers; unset means an open node. |
-| `LADEX_DATA_DIR` | Where the node keeps its files and settings; the same default as `ladex` (`~/.ladex/files`). |
+| `LADEX_DATA_DIR` | Where the node keeps its files and settings; the same default as `ladex` (`~/.ladex/files`), and `ladex` reads it too, so its commands find the app's node. |
 
 Files saved from the window are written to the system downloads folder.

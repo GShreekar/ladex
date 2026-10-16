@@ -32,6 +32,7 @@ pub const DEFAULT_STORAGE_LIMIT_GIB: u64 = 20;
 pub const DEFAULT_STALL_TIMEOUT_SECS: u64 = 60;
 pub const DEFAULT_GUEST_SESSION_HOURS: u64 = 8;
 
+pub const DATA_DIR_VARIABLE: &str = "LADEX_DATA_DIR";
 const BYTES_PER_GIB: u64 = 1 << 30;
 const MESH_GOODBYE_GRACE: Duration = Duration::from_secs(1);
 const MANUAL_PEER_DELAY: Duration = Duration::from_millis(500);
@@ -269,7 +270,7 @@ impl Node {
         let saver = persist::spawn_saver(state.clone(), &data_dir, saved.as_ref());
 
         let mut background_tasks = vec![tokio::spawn(mesh::quic::accept_loop(state.clone(), mesh_endpoint.clone()))];
-        background_tasks.extend(start_control_socket(&state, &config, &mut notices).await);
+        background_tasks.extend(start_control_socket(&state, &config, local_http_port, &mut notices).await);
         background_tasks.extend(dial_manual_peers(&state, &config.manual_peers));
         if let Some(saved) = &saved {
             persist::redial(&state, saved.peers.clone());
@@ -463,10 +464,15 @@ async fn restore_state(state: &NodeState, saved: Option<&persist::Saved>, node_i
     imported
 }
 
-async fn start_control_socket(state: &NodeState, config: &NodeConfig, notices: &mut Vec<Notice>) -> Option<JoinHandle<()>> {
+async fn start_control_socket(
+    state: &NodeState,
+    config: &NodeConfig,
+    local_http_port: Option<u16>,
+    notices: &mut Vec<Notice>,
+) -> Option<JoinHandle<()>> {
     match control::server::open(&config.data_dir).await {
         Ok((listener, endpoint)) => {
-            let settings = control::Settings { data_dir: config.data_dir.clone(), discovery_port: config.discovery_port };
+            let settings = control::Settings { data_dir: config.data_dir.clone(), discovery_port: config.discovery_port, local_http_port };
             Some(tokio::spawn(control::server::serve(state.clone(), settings, listener, endpoint)))
         }
         Err(e) => {
@@ -622,7 +628,30 @@ fn join_page(web_ui: &WebUi) -> guest::api::JoinPage {
     guest::api::JoinPage::new(page.to_string())
 }
 
-/// Resolves where the CLI and app keep a node's files when none is given.
+/// Where the CLI and app keep a node's files when none is given: `LADEX_DATA_DIR`, else `~/.ladex/files`.
 pub fn default_data_dir() -> PathBuf {
-    tls::config_dir().join("files")
+    data_dir_from(std::env::var_os(DATA_DIR_VARIABLE))
+}
+
+fn data_dir_from(variable: Option<std::ffi::OsString>) -> PathBuf {
+    match variable {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => tls::config_dir().join("files"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_variable_names_the_data_dir_when_set() {
+        assert_eq!(data_dir_from(Some("/srv/ladex".into())), PathBuf::from("/srv/ladex"));
+    }
+
+    #[test]
+    fn an_unset_or_empty_variable_falls_back_to_the_home_folder() {
+        assert_eq!(data_dir_from(None), tls::config_dir().join("files"));
+        assert_eq!(data_dir_from(Some("".into())), tls::config_dir().join("files"));
+    }
 }

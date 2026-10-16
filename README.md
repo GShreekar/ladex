@@ -142,7 +142,7 @@ ladex doctor                         # check that the node is running and reacha
 ```
 
 - Add `--json` to any command for output a script can read. A command exits with 0 on success and 1 on failure.
-- Add `--data-dir DIR` if the node was started with one; that is how a command finds its node.
+- Add `--data-dir DIR` if the node was started with one (or set `LADEX_DATA_DIR`, which the app reads too); that is how a command finds its node. It works the same whether the node is the `ladex` daemon or the app.
 - `get` never overwrites: a second copy is saved as `name (1).ext`. A folder is saved as real directories.
 - `send` and `seed` copy what they share into the node's store, so a shared file takes its size twice on disk.
 - `send --to` takes a device's name or its id from `ladex devices`, and only sends files, not folders. Ctrl-C while it waits leaves the offer open.
@@ -166,7 +166,7 @@ ladex [PASSPHRASE]     # Launch with your own passphrase
 ladex -s, --secure     # Launch with a generated passphrase
 ladex                  # Launch without a passphrase (open access, prints a warning)
 ladex --local-port N   # Port for the localhost-only HTTP listener (default: port + 1)
-ladex --data-dir DIR   # Where shared files are stored (default: ~/.ladex/files)
+ladex --data-dir DIR   # Where shared files are stored (default: $LADEX_DATA_DIR, else ~/.ladex/files)
 ladex <command> --help # send, get, seed, ls, devices, invite, doctor (see Commands)
 ladex --storage-limit-gb N   # Most disk this node may use for shared files (default: 20)
 ladex --no-keychain    # Keep the node's key in a file in the data folder, not the OS keychain

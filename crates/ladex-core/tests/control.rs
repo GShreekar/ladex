@@ -14,7 +14,7 @@ use tokio::net::{TcpListener, TcpStream};
 async fn control_of(node: &NodeHandle, data_dir: &Path) -> Endpoint {
     std::fs::create_dir_all(data_dir).unwrap();
     let (listener, endpoint) = server::open(data_dir).await.unwrap();
-    let settings = Settings { data_dir: data_dir.to_path_buf(), discovery_port: None };
+    let settings = Settings { data_dir: data_dir.to_path_buf(), discovery_port: None, local_http_port: None };
     tokio::spawn(server::serve(node.state.clone(), settings, listener, endpoint.clone()));
     endpoint
 }

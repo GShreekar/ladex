@@ -2,10 +2,11 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use include_dir::{include_dir, Dir};
+use ladex_core::control::server::{self as control, Endpoint};
+use ladex_core::control::{Reply as CommandReply, Request as Command};
 use ladex_core::node::{self, Bridge, Node, NodeConfig, NodeHandle, Reply, SocketEvent, StartError, UiAssets, WebUi};
 use tauri::ipc::{Channel, InvokeBody, Request};
 use tauri::{AppHandle, Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder};
@@ -102,18 +103,18 @@ async fn ladex_save_download(node: State<'_, AppNode>, path: String, file_name: 
     node.bridge.save_download(&path, &file_name).await.map_err(|error| error.to_string())
 }
 
-// Until the first-run settings of Phase 7b, the passphrase and data folder come from the environment.
+// Until the first-run settings of Phase 7b, the passphrase and data folder come from the environment (the data folder as for `ladex`).
 fn node_config() -> NodeConfig {
-    let data_dir = std::env::var_os("LADEX_DATA_DIR").map(PathBuf::from).unwrap_or_else(node::default_data_dir);
+    let data_dir = node::default_data_dir();
     let assets: Arc<dyn UiAssets> = Arc::new(EmbeddedUi(&UI_DIR));
     let mut config = NodeConfig::new(data_dir, WebUi { assets, is_legacy: false });
     config.passphrase = std::env::var("LADEX_PASSPHRASE").ok().filter(|passphrase| !passphrase.is_empty());
     config
 }
 
-fn open_window(app: &AppHandle) -> tauri::Result<()> {
+fn open_window(app: &AppHandle, url: WebviewUrl) -> tauri::Result<()> {
     // Dropped files are handled by the page, which the shell's own drag-and-drop would otherwise hide them from.
-    WebviewWindowBuilder::new(app, WINDOW_LABEL, WebviewUrl::default())
+    WebviewWindowBuilder::new(app, WINDOW_LABEL, url)
         .title("LADEX")
         .inner_size(1100.0, 760.0)
         .min_inner_size(420.0, 520.0)
@@ -122,20 +123,36 @@ fn open_window(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
-fn run_node(app: &tauri::App) -> tauri::Result<()> {
-    let started = tauri::async_runtime::block_on(Node::start(node_config()));
-    let node = match started {
-        Ok(node) => node,
-        Err(error) => {
-            tracing::error!("The node could not start: {error}");
-            let message = match &error {
-                StartError::DataDirInUse { .. } => format!("{error}.\n\nUse that one, or quit it before opening LADEX again."),
-                _ => error.to_string(),
-            };
-            let handle = app.handle().clone();
-            app.dialog().message(message).title("LADEX could not start").kind(MessageDialogKind::Error).show(move |_| handle.exit(1));
-            return Ok(());
+// The page of the node already running on this data folder, if it serves one to this machine.
+fn running_node_page(running: Option<&Endpoint>) -> Option<WebviewUrl> {
+    let reply = tauri::async_runtime::block_on(control::call(running?, &Command::Status, |_| {})).ok()?;
+    let CommandReply::Status(status) = reply else { return None };
+    let url = format!("http://localhost:{}", status.local_http_port?);
+    Some(WebviewUrl::External(url.parse().ok()?))
+}
+
+// The window attaches to the node that owns the data folder; the app never starts a second one.
+fn report_start_failure(app: &tauri::App, error: StartError) -> tauri::Result<()> {
+    if let StartError::DataDirInUse { running, .. } = &error {
+        if let Some(page) = running_node_page(running.as_ref()) {
+            tracing::info!("A node already runs on this data folder; opening its page");
+            return open_window(app.handle(), page);
         }
+    }
+    tracing::error!("The node could not start: {error}");
+    let message = match &error {
+        StartError::DataDirInUse { .. } => format!("{error}.\n\nUse that one, or quit it before opening LADEX again."),
+        _ => error.to_string(),
+    };
+    let handle = app.handle().clone();
+    app.dialog().message(message).title("LADEX could not start").kind(MessageDialogKind::Error).show(move |_| handle.exit(1));
+    Ok(())
+}
+
+fn run_node(app: &tauri::App) -> tauri::Result<()> {
+    let node = match tauri::async_runtime::block_on(Node::start(node_config())) {
+        Ok(node) => node,
+        Err(error) => return report_start_failure(app, error),
     };
     for notice in &node.info().notices {
         tracing::warn!("{notice:?}");
@@ -143,7 +160,7 @@ fn run_node(app: &tauri::App) -> tauri::Result<()> {
     let downloads = app.path().download_dir().unwrap_or_else(|_| node.info().data_dir.join("received"));
     let bridge = Bridge::new(node.local_link(), downloads);
     app.manage(AppNode { bridge, handle: Mutex::new(Some(node)) });
-    open_window(app.handle())
+    open_window(app.handle(), WebviewUrl::default())
 }
 
 fn main() {

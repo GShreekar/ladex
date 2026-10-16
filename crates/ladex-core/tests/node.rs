@@ -3,7 +3,8 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use ladex_core::control::server::Endpoint;
+use ladex_core::control::server::{self, Endpoint};
+use ladex_core::control::{Reply, Request};
 use ladex_core::node::{Node, NodeConfig, NodeHandle, Notice, StartError, UiAssets, WebUi};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -160,6 +161,22 @@ async fn with_tls_the_node_reports_a_fingerprint_and_a_certificate_free_local_po
     assert_eq!(get(local_port, "/").await, (200, INDEX_PAGE.to_vec()));
     assert!(!node.info().notices.iter().any(|notice| matches!(notice, Notice::CertificateUnavailable(_))));
 
+    node.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_status_names_the_local_page_a_second_window_can_attach_to() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut secured = config(dir.path());
+    secured.use_tls = true;
+    secured.local_http_port = Some(0);
+    let node = Node::start(secured).await.expect("the node starts");
+
+    let endpoint = Endpoint::load(dir.path()).unwrap();
+    let Reply::Status(status) = server::call(&endpoint, &Request::Status, |_| {}).await.unwrap() else { panic!("expected a status") };
+
+    assert_eq!(status.local_http_port, node.info().local_http_port);
+    assert!(status.local_http_port.is_some());
     node.shutdown().await;
 }
 
