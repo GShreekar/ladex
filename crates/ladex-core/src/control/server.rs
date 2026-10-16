@@ -12,7 +12,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
-use super::{Event, Events, Reply, Request, Settings};
+use super::{version_mismatch_message, Event, Events, Reply, Request, Settings, VERSION};
 use crate::{persist, NodeState};
 
 const FILE_NAME: &str = "control.json";
@@ -31,6 +31,9 @@ pub struct Endpoint {
 #[derive(Serialize, Deserialize)]
 struct Hello {
     token: String,
+    // Commands from before the version check do not send one.
+    #[serde(default)]
+    version: String,
     request: Request,
 }
 
@@ -102,11 +105,16 @@ async fn write_event(stream: &mut (impl tokio::io::AsyncWrite + Unpin), event: &
 async fn serve_command(state: NodeState, settings: Settings, mut stream: TcpStream, endpoint: &Endpoint) -> anyhow::Result<()> {
     let (mut reading, mut writing) = stream.split();
     let hello = serde_json::from_str::<Hello>(&read_line(&mut reading).await?);
-    let request = match hello {
-        Ok(hello) if endpoint.accepts(&hello.token) => hello.request,
+    let hello = match hello {
+        Ok(hello) if endpoint.accepts(&hello.token) => hello,
         // The same answer either way, so a stranger learns nothing about what the token should look like.
         _ => return write_event(&mut writing, &Event::Failed { message: "this command may not control the node".into() }).await,
     };
+    if hello.version != VERSION {
+        return write_event(&mut writing, &Event::Failed { message: version_mismatch_message(VERSION, &hello.version) }).await;
+    }
+    write_event(&mut writing, &Event::Welcome { version: VERSION.to_string() }).await?;
+    let request = hello.request;
 
     // The work runs in a task of its own: an offer to a device stands even after the command that made it has gone.
     let (events, mut outbox) = mpsc::channel(EVENT_QUEUE);
@@ -120,17 +128,34 @@ async fn serve_command(state: NodeState, settings: Settings, mut stream: TcpStre
 /// Sends one request to a running node, passing on each progress event; returns its reply.
 pub async fn call(endpoint: &Endpoint, request: &Request, mut on_event: impl FnMut(&Event)) -> anyhow::Result<Reply> {
     let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, endpoint.port)).await?;
-    let mut hello = serde_json::to_vec(&Hello { token: endpoint.token.clone(), request: request.clone() })?;
+    let mut hello = serde_json::to_vec(&Hello { token: endpoint.token.clone(), version: VERSION.to_string(), request: request.clone() })?;
     hello.push(b'\n');
     stream.write_all(&hello).await?;
 
     let mut lines = BufReader::new(stream).lines();
+    ensure_node_matches(&mut lines).await?;
     while let Some(line) = lines.next_line().await? {
-        match serde_json::from_str::<Event>(&line).context("the node sent something this command does not understand")? {
+        match parse_event(&line)? {
             Event::Done { reply } => return Ok(*reply),
             Event::Failed { message } => bail!(message),
+            Event::Welcome { .. } => bail!("the node sent something this command does not understand"),
             event => on_event(&event),
         }
     }
     bail!("the node stopped before it answered")
+}
+
+fn parse_event(line: &str) -> anyhow::Result<Event> {
+    serde_json::from_str(line).context("the node sent something this command does not understand")
+}
+
+// A node from before the version check never says hello, so anything else first means it is older.
+async fn ensure_node_matches(lines: &mut tokio::io::Lines<BufReader<TcpStream>>) -> anyhow::Result<()> {
+    let first = lines.next_line().await?.context("the node stopped before it answered")?;
+    match parse_event(&first) {
+        Ok(Event::Welcome { version }) if version == VERSION => Ok(()),
+        Ok(Event::Welcome { version }) => bail!(version_mismatch_message(&version, VERSION)),
+        Ok(Event::Failed { message }) => bail!(message),
+        _ => bail!(version_mismatch_message("", VERSION)),
+    }
 }
