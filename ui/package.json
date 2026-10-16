@@ -1,7 +1,7 @@
 {
   "name": "ladex-ui",
   "private": true,
-  "version": "3.0.0-beta.1",
+  "version": "3.0.0-beta.2",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -23,6 +23,7 @@
   },
   "dependencies": {
     "@fontsource-variable/inter": "^5.3.0",
+    "@tauri-apps/api": "^2.12.4",
     "qrcode-generator": "^2.0.4"
   }
 }

@@ -175,25 +175,33 @@ pub fn spawn_saver(state: NodeState, dir: &Path, saved: Option<&Saved>) -> Flush
     };
     let saver = Saver { path: path_in(dir), login, peers: saved.map(|s| s.peers.clone()).unwrap_or_default(), last_written: Vec::new() };
     let saver = std::sync::Arc::new(tokio::sync::Mutex::new(saver));
-    let flusher = Flusher { state: state.clone(), saver: saver.clone() };
-    tokio::spawn(async move {
+    let flusher_state = state.clone();
+    let flusher_saver = saver.clone();
+    let task = tokio::spawn(async move {
         let mut tick = tokio::time::interval(SAVE_EVERY);
         loop {
             tick.tick().await;
             saver.lock().await.save(&state).await;
         }
     });
-    flusher
+    Flusher { state: flusher_state, saver: flusher_saver, task }
 }
 
 pub struct Flusher {
     state: NodeState,
     saver: std::sync::Arc<tokio::sync::Mutex<Saver>>,
+    task: tokio::task::JoinHandle<()>,
 }
 
 impl Flusher {
     pub async fn flush(&self) {
         self.saver.lock().await.save(&self.state).await;
+    }
+
+    /// Ends the periodic saving and waits until the saver has let go of the node's state.
+    pub async fn stop(self) {
+        self.task.abort();
+        let _ = self.task.await;
     }
 }
 

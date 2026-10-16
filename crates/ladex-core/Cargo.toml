@@ -33,6 +33,7 @@ spake2.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 tower-service.workspace = true
+tokio-tungstenite.workspace = true
 subtle.workspace = true
 fs4.workspace = true
 cap-std.workspace = true

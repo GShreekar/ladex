@@ -1,9 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/ladex-core", "crates/ladex-cli"]
+members = ["crates/ladex-core", "crates/ladex-cli", "crates/ladex-app"]
+# The app needs the platform webview, so plain `cargo build` and `cargo test` leave it out.
+default-members = ["crates/ladex-core", "crates/ladex-cli"]
 
 [workspace.package]
-version = "3.0.0-beta.1"
+version = "3.0.0-beta.2"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/GShreekar/ladex"
@@ -34,9 +36,10 @@ gethostname = "0.5"
 qrcode = { version = "0.14", default-features = false }
 mdns-sd = "0.21"
 spake2 = "0.4"
-hyper = { version = "1", features = ["server", "http1"] }
+hyper = { version = "1", features = ["server", "client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 tower-service = "0.3"
+tokio-tungstenite = { version = "0.27", default-features = false, features = ["handshake"] }
 subtle = "2"
 fs4 = { version = "0.13", features = ["sync"] }
 cap-std = "4"

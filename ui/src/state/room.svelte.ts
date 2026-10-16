@@ -57,7 +57,7 @@ export class Room {
     this.offers = this.offers.filter((pending) => pending !== offer);
     try {
       const ticket = await this.client.answerOffer(offer, accepted);
-      if (ticket) this.save(ticket, `Receiving ${ticket.filename}: your browser is saving it`);
+      if (ticket) await this.save(ticket, `Receiving ${ticket.filename}: your browser is saving it`);
     } catch (error) {
       this.toasts.show('error', error instanceof TransferError ? error.message : 'Could not receive that file.');
     }
@@ -66,16 +66,22 @@ export class Room {
   async download(file: SharedFile): Promise<void> {
     try {
       const ticket = await this.client.prepareDownload(file);
-      this.save(ticket, `Downloading ${ticket.filename}: your browser is saving it`);
+      await this.save(ticket, `Downloading ${ticket.filename}: your browser is saving it`);
     } catch (error) {
       if (this.connection === 'signed-out' || this.connection === 'ended') return;
       this.toasts.show('error', error instanceof TransferError ? error.message : 'Could not download that file.');
     }
   }
 
-  private save(ticket: DownloadTicket, message: string): void {
-    saveViaBrowser(ticket.url, ticket.filename);
-    this.toasts.show('info', message);
+  private async save(ticket: DownloadTicket, browserMessage: string): Promise<void> {
+    if (!ticket.saveToDisk) {
+      saveViaBrowser(ticket.url, ticket.filename);
+      this.toasts.show('info', browserMessage);
+      return;
+    }
+    this.toasts.show('info', `Saving ${ticket.filename}…`);
+    const savedAt = await ticket.saveToDisk();
+    this.toasts.show('success', `Saved to ${savedAt}`);
   }
 
   private apply(event: ClientEvent): void {

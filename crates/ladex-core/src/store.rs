@@ -1,8 +1,8 @@
 //! On-disk storage for the files this node holds: 1 MiB chunks, each checked against its BLAKE3 hash before it is written.
 //!
-//! Layout under the store root: `partial/<file_id>.part` (a file still arriving, preallocated), `blobs/<file_id>` (a file
-//! that is complete), `hashes/<file_id>` (32 bytes per chunk) and `store.redb` (one record per file: progress, ownership,
-//! pin and last access). A file is renamed from `partial/` to `blobs/` only once every chunk is verified and synced.
+//! Under the store root: `partial/<file_id>.part` (still arriving), `blobs/<file_id>` (complete), `hashes/<file_id>`
+//! (32 bytes per chunk) and `store.redb` (one record per file). A file moves from `partial/` to `blobs/` only once every
+//! chunk is verified and synced.
 
 mod evict;
 mod index;

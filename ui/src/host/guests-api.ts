@@ -1,3 +1,4 @@
+import type { NodeTransport } from '../client/transport';
 import { TransferError } from '../client/types';
 
 export type GuestPermission = 'read-only' | 'upload' | 'upload-with-approval';
@@ -34,33 +35,40 @@ export const PERMISSION_LABELS: Record<GuestPermission, string> = {
   'upload-with-approval': 'Needs approval',
 };
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, { cache: 'no-store', ...init });
-  const body = (await response.json().catch(() => ({}))) as T & { message?: string };
-  if (!response.ok) throw new TransferError(body.message ?? `the node answered ${response.status}`);
-  return body;
-}
+/** What the person at the node's machine does about guests: invite them, see them, sign them out, answer their uploads. */
+export class GuestsApi {
+  constructor(private readonly transport: NodeTransport) {}
 
-export async function issueInvitation(permission: GuestPermission): Promise<Invitation> {
-  return request<Invitation>('/api/guests/invites', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ permission }),
-  });
-}
+  issueInvitation(permission: GuestPermission): Promise<Invitation> {
+    return this.call<Invitation>('POST', '/api/guests/invites', { permission });
+  }
 
-export async function listGuests(): Promise<GuestSummary[]> {
-  return (await request<{ guests: GuestSummary[] }>('/api/guests/sessions')).guests;
-}
+  async listGuests(): Promise<GuestSummary[]> {
+    return (await this.call<{ guests: GuestSummary[] }>('GET', '/api/guests/sessions')).guests;
+  }
 
-export async function signOutGuest(id: string): Promise<void> {
-  await request(`/api/guests/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' });
-}
+  async signOutGuest(id: string): Promise<void> {
+    await this.call('DELETE', `/api/guests/sessions/${encodeURIComponent(id)}`);
+  }
 
-export async function listWaitingUploads(): Promise<WaitingUpload[]> {
-  return (await request<{ uploads: WaitingUpload[] }>('/api/guests/uploads')).uploads;
-}
+  async listWaitingUploads(): Promise<WaitingUpload[]> {
+    return (await this.call<{ uploads: WaitingUpload[] }>('GET', '/api/guests/uploads')).uploads;
+  }
 
-export async function answerUpload(id: string, accepted: boolean): Promise<void> {
-  await request(`/api/guests/uploads/${encodeURIComponent(id)}/${accepted ? 'approve' : 'deny'}`, { method: 'POST' });
+  async answerUpload(id: string, accepted: boolean): Promise<void> {
+    await this.call('POST', `/api/guests/uploads/${encodeURIComponent(id)}/${accepted ? 'approve' : 'deny'}`);
+  }
+
+  private async call<T>(method: string, path: string, body?: unknown): Promise<T> {
+    const headers = body === undefined ? undefined : { 'Content-Type': 'application/json' };
+    const reply = await this.transport.request(method, path, { headers, body: body === undefined ? undefined : JSON.stringify(body) });
+    let parsed: T & { message?: string };
+    try {
+      parsed = JSON.parse(reply.text) as T & { message?: string };
+    } catch {
+      parsed = {} as T & { message?: string };
+    }
+    if (reply.status < 200 || reply.status >= 300) throw new TransferError(parsed.message ?? `the node answered ${reply.status}`);
+    return parsed;
+  }
 }

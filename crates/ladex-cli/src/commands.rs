@@ -95,7 +95,7 @@ impl Session {
             }
             Event::Delivered { name } => eprintln!("{name} was delivered"),
             Event::Declined { name } => eprintln!("{name} was declined"),
-            Event::Progress { .. } | Event::Done { .. } | Event::Failed { .. } => {}
+            Event::Welcome { .. } | Event::Progress { .. } | Event::Done { .. } | Event::Failed { .. } => {}
         }
     }
 }

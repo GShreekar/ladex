@@ -1,8 +1,7 @@
-//! The chunk data plane: each request for chunks gets its own short-lived stream, so a slow request never holds up control messages or other requests.
+//! The chunk data plane: one short-lived stream per request, so a slow request never holds up control messages or others.
 //!
-//! The requester writes one [`GetChunks`] frame and finishes its side; the serving node answers with [`Reply`] frames and finishes.
-//! A frame is a 4-byte big-endian length and then the body. Requests are postcard; replies are framed by hand (kind, index, bytes)
-//! so a 1 MiB chunk is read straight into its buffer and never re-encoded.
+//! A frame is a 4-byte big-endian length and then the body. Requests are postcard; replies are framed by hand so a
+//! 1 MiB chunk is read straight into its buffer and never re-encoded.
 
 use std::future::Future;
 use std::io;

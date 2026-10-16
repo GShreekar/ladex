@@ -1,19 +1,11 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { LocalNodeClient } from '../client/local-node-client';
   import ToastViewport from '../components/ToastViewport.svelte';
-  import { provideApp } from '../state/context';
-  import { Room } from '../state/room.svelte';
-  import { Toasts } from '../state/toasts.svelte';
-  import { Transfers } from '../state/transfers.svelte';
+  import { useApp } from '../state/context';
   import Login from './Login.svelte';
   import Shell from './Shell.svelte';
 
-  const toasts = new Toasts();
-  const client = new LocalNodeClient();
-  const room = new Room(client, toasts);
-  const transfers = new Transfers(client, toasts);
-  provideApp({ room, transfers, toasts });
+  const { room, transfers, toasts } = useApp();
 
   onMount(() => {
     void room.start();

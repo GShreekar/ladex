@@ -1,7 +1,7 @@
 //! This node's QUIC endpoint: it accepts and dials mesh connections, mutually authenticated with each node's Ed25519 key.
 //!
-//! TLS carries the bare identity key (RFC 7250 raw public keys), so a peer's node id is `node_id_for` the key it proved
-//! in the handshake. Whether that node is trusted or revoked is the mesh handshake's call, not this layer's.
+//! TLS carries the bare identity key (RFC 7250), so a peer's node id is derived from the key it proved. Whether that
+//! node is trusted or revoked is the mesh handshake's call, not this layer's.
 
 use std::net::SocketAddr;
 use std::sync::Arc;

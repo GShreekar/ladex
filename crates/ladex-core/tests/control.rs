@@ -3,16 +3,18 @@
 use std::path::{Path, PathBuf};
 
 use ladex_core::control::server::{self, Endpoint};
-use ladex_core::control::{Event, Reply, Request, Settings};
+use ladex_core::control::{Event, Reply, Request, Settings, VERSION};
 use ladex_core::store::CHUNK_SIZE;
 use ladex_core::testing::{eventually, spawn_mesh, NodeHandle};
 use ladex_core::types::FileView;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
 
 /// Opens a node's control socket the way the node does at start; returns where commands reach it.
 async fn control_of(node: &NodeHandle, data_dir: &Path) -> Endpoint {
     std::fs::create_dir_all(data_dir).unwrap();
     let (listener, endpoint) = server::open(data_dir).await.unwrap();
-    let settings = Settings { data_dir: data_dir.to_path_buf(), discovery_port: None };
+    let settings = Settings { data_dir: data_dir.to_path_buf(), discovery_port: None, local_http_port: None };
     tokio::spawn(server::serve(node.state.clone(), settings, listener, endpoint.clone()));
     endpoint
 }
@@ -188,4 +190,106 @@ async fn a_file_sent_to_a_device_that_is_not_connected_is_refused_and_not_kept()
 
     assert!(refused.unwrap_err().to_string().contains("no device called"));
     assert!(node.state.store.all().is_empty());
+}
+
+/// Sends one raw line to a control socket and returns the first line it answers.
+async fn first_reply_to(port: u16, line: &str) -> String {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    stream.write_all(format!("{line}\n").as_bytes()).await.unwrap();
+    BufReader::new(stream).lines().next_line().await.unwrap().expect("the node answers")
+}
+
+fn hello(endpoint: &Endpoint, version: Option<&str>) -> String {
+    let mut hello = serde_json::json!({ "token": endpoint.token, "request": { "command": "status" } });
+    if let Some(version) = version {
+        hello["version"] = version.into();
+    }
+    hello.to_string()
+}
+
+#[tokio::test]
+async fn a_command_of_another_version_is_refused_with_both_versions_named() {
+    let node = &spawn_mesh(1, None).await[0];
+    let dir = tempfile::tempdir().unwrap();
+    let endpoint = control_of(node, dir.path()).await;
+
+    let answer = first_reply_to(endpoint.port, &hello(&endpoint, Some("0.0.1"))).await;
+
+    let expected = format!("the running node is {VERSION}, this command is 0.0.1 — update one of them");
+    assert_eq!(serde_json::from_str::<Event>(&answer).unwrap(), Event::Failed { message: expected });
+}
+
+#[tokio::test]
+async fn a_command_that_reports_no_version_is_refused_as_older() {
+    let node = &spawn_mesh(1, None).await[0];
+    let dir = tempfile::tempdir().unwrap();
+    let endpoint = control_of(node, dir.path()).await;
+
+    let answer = first_reply_to(endpoint.port, &hello(&endpoint, None)).await;
+
+    let expected = format!("the running node is {VERSION}, this command is an older version — update one of them");
+    assert_eq!(serde_json::from_str::<Event>(&answer).unwrap(), Event::Failed { message: expected });
+}
+
+#[tokio::test]
+async fn a_stranger_of_another_version_learns_nothing_about_the_node() {
+    let node = &spawn_mesh(1, None).await[0];
+    let dir = tempfile::tempdir().unwrap();
+    let endpoint = control_of(node, dir.path()).await;
+    let stranger = Endpoint { port: endpoint.port, token: "0".repeat(64) };
+
+    let answer = first_reply_to(endpoint.port, &hello(&stranger, Some("0.0.1"))).await;
+
+    let refused = Event::Failed { message: "this command may not control the node".into() };
+    assert_eq!(serde_json::from_str::<Event>(&answer).unwrap(), refused);
+}
+
+#[tokio::test]
+async fn a_matching_command_is_welcomed_with_the_nodes_version() {
+    let node = &spawn_mesh(1, None).await[0];
+    let dir = tempfile::tempdir().unwrap();
+    let endpoint = control_of(node, dir.path()).await;
+
+    let answer = first_reply_to(endpoint.port, &hello(&endpoint, Some(VERSION))).await;
+
+    assert_eq!(serde_json::from_str::<Event>(&answer).unwrap(), Event::Welcome { version: VERSION.to_string() });
+}
+
+/// A stand-in node that answers whatever it is asked with the given lines.
+async fn fake_node_saying(lines: Vec<String>) -> Endpoint {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (reading, mut writing) = stream.into_split();
+        BufReader::new(reading).lines().next_line().await.unwrap();
+        for line in lines {
+            writing.write_all(format!("{line}\n").as_bytes()).await.unwrap();
+        }
+    });
+    Endpoint { port, token: "unused".into() }
+}
+
+fn event_line(event: &Event) -> String {
+    serde_json::to_string(event).unwrap()
+}
+
+#[tokio::test]
+async fn a_node_of_another_version_is_refused_by_the_command() {
+    let welcome = Event::Welcome { version: "0.0.1".into() };
+    let endpoint = fake_node_saying(vec![event_line(&welcome)]).await;
+
+    let refused = ask(&endpoint, Request::Status).await.unwrap_err();
+
+    assert_eq!(refused.to_string(), format!("the running node is 0.0.1, this command is {VERSION} — update one of them"));
+}
+
+#[tokio::test]
+async fn a_node_that_never_reports_its_version_is_refused_as_older() {
+    let reply = Event::Done { reply: Box::new(Reply::Files { files: Vec::new() }) };
+    let endpoint = fake_node_saying(vec![event_line(&reply)]).await;
+
+    let refused = ask(&endpoint, Request::List).await.unwrap_err();
+
+    assert_eq!(refused.to_string(), format!("the running node is an older version, this command is {VERSION} — update one of them"));
 }

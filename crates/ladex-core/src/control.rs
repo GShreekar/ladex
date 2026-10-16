@@ -21,6 +21,15 @@ mod share;
 
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
 
+/// The version commands and nodes must share; they are released together, so any difference is a mismatch.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// What a command or node is told when the other side runs another version; an empty version is one too old to report it.
+pub fn version_mismatch_message(node_version: &str, command_version: &str) -> String {
+    let named = |version: &str| if version.is_empty() { "an older version".to_string() } else { version.to_string() };
+    format!("the running node is {}, this command is {} — update one of them", named(node_version), named(command_version))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum Request {
@@ -52,6 +61,10 @@ pub enum Request {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Event {
+    /// The first thing a node says to a command it accepts, so the command can check they match.
+    Welcome {
+        version: String,
+    },
     Progress {
         name: String,
         done: u64,
@@ -137,6 +150,9 @@ pub struct Status {
     pub node_name: String,
     pub local_ip: Option<IpAddr>,
     pub http_port: u16,
+    // Plain HTTP on 127.0.0.1, which a window on this machine can open without a certificate warning.
+    #[serde(default)]
+    pub local_http_port: Option<u16>,
     pub quic_port: u16,
     pub discovery_port: Option<u16>,
     pub is_encrypted: bool,
@@ -157,6 +173,7 @@ pub struct Settings {
     pub data_dir: PathBuf,
     /// None when discovery is switched off.
     pub discovery_port: Option<u16>,
+    pub local_http_port: Option<u16>,
 }
 
 /// The command stopped listening, so there is nobody to finish the work for.
@@ -315,11 +332,12 @@ fn invite(state: &NodeState, permission: Permission) -> Invite {
 
 async fn status(state: &NodeState, settings: &Settings) -> Status {
     Status {
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: VERSION.to_string(),
         node_id: state.node_id.clone(),
         node_name: state.node_name.clone(),
         local_ip: state.local_ip,
         http_port: state.http_port,
+        local_http_port: settings.local_http_port,
         quic_port: state.quic_port,
         discovery_port: settings.discovery_port,
         is_encrypted: is_encrypted(state),

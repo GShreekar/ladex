@@ -1,6 +1,7 @@
 import { runLimited, sleep } from './concurrency';
 import { deviceKindOf, friendlyDeviceName, randomId } from './format';
-import { runResumableUpload, SignedOut, type SendResult, type UploadReply, type UploadWire } from './resumable-upload';
+import { HttpTransport } from './http-transport';
+import { runResumableUpload, SignedOut, type UploadReply, type UploadWire } from './resumable-upload';
 import {
   TransferError,
   type Capabilities,
@@ -19,6 +20,7 @@ import {
   type UploadOutcome,
   type UploadRequest,
 } from './types';
+import { parseUploadReply, type NodeSocket, type NodeTransport } from './transport';
 import type { AuthStatus, ServerMessage, WireFile, WireMessage, WirePeer } from './wire';
 
 const SESSION_KEY = 'ladex_session';
@@ -58,37 +60,15 @@ function saveNickname(nickname: string): void {
   }
 }
 
+function isSuccess(status: number): boolean {
+  return status >= 200 && status < 300;
+}
+
 function describeProblem(status: number): string {
   if (status === 404) return 'That file has been removed.';
   if (status === 503) return 'No device that has this file is online right now.';
   if (status === 507) return 'This node does not have room to fetch that file.';
   return `The node could not provide that file (error ${status}).`;
-}
-
-function parseReply(text: string): UploadReply {
-  try {
-    return JSON.parse(text) as UploadReply;
-  } catch {
-    return {};
-  }
-}
-
-function putWithXhr(url: string, headers: Record<string, string>, body: Blob, signal: AbortSignal, onProgress: (loaded: number) => void): Promise<SendResult> {
-  return new Promise((resolve) => {
-    const request = new XMLHttpRequest();
-    request.open('PUT', url);
-    for (const [name, value] of Object.entries(headers)) request.setRequestHeader(name, value);
-    request.upload.onprogress = (event) => {
-      if (event.lengthComputable) onProgress(event.loaded);
-    };
-    request.onload = () =>
-      resolve({ status: request.status, isNetworkFailure: false, isAborted: false, reply: parseReply(request.responseText) });
-    request.onerror = () => resolve({ status: 0, isNetworkFailure: true, isAborted: false, reply: {} });
-    request.ontimeout = request.onerror;
-    request.onabort = () => resolve({ status: 0, isNetworkFailure: false, isAborted: true, reply: {} });
-    signal.addEventListener('abort', () => request.abort(), { once: true });
-    request.send(body);
-  });
 }
 
 interface SendOptions {
@@ -98,7 +78,7 @@ interface SendOptions {
   onProgress: (bytesSent: number) => void;
 }
 
-/** A node reached over HTTP and a WebSocket from a browser on the same machine or LAN, signed in with the node's passphrase. */
+/** A node reached through a transport: from a browser on the same machine or LAN over HTTP, signed in with the node's passphrase. */
 export class LocalNodeClient implements LadexClient {
   private readonly listeners = new Set<ClientListener>();
   private readonly peers = new Map<string, WirePeer>();
@@ -110,9 +90,11 @@ export class LocalNodeClient implements LadexClient {
   private files: WireFile[] = [];
   private messages: WireMessage[] = [];
   private status: AuthStatus = { authenticated: false, auth_required: false, node_id: '', is_host: false };
-  private socket: WebSocket | null = null;
+  private socket: NodeSocket | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private isStopped = false;
+
+  constructor(readonly transport: NodeTransport = new HttpTransport()) {}
 
   get capabilities(): Capabilities {
     return {
@@ -196,11 +178,11 @@ export class LocalNodeClient implements LadexClient {
 
   async prepareDownload(file: SharedFile): Promise<DownloadTicket> {
     if (file.isFolder) {
-      return { url: `/api/folders/${encodeURIComponent(file.id)}.zip`, filename: `${file.name}.zip` };
+      return this.ticket(`/api/folders/${encodeURIComponent(file.id)}.zip`, `${file.name}.zip`);
     }
     const url = `/api/files/${encodeURIComponent(file.id)}`;
     await this.probe(url);
-    return { url, filename: file.name };
+    return this.ticket(url, file.name);
   }
 
   unshare(file: SharedFile): void {
@@ -244,7 +226,7 @@ export class LocalNodeClient implements LadexClient {
 
   async leave(): Promise<void> {
     this.stop();
-    await fetch('/logout', { method: 'POST', credentials: 'same-origin' }).catch(() => undefined);
+    await this.transport.request('POST', '/logout').catch(() => undefined);
     this.emit({ type: 'connection', state: 'signed-out' });
   }
 
@@ -257,8 +239,8 @@ export class LocalNodeClient implements LadexClient {
   }
 
   private async fetchStatus(): Promise<AuthStatus> {
-    const response = await fetch('/auth-status', { cache: 'no-store' });
-    return (await response.json()) as AuthStatus;
+    const reply = await this.transport.request('GET', '/auth-status');
+    return JSON.parse(reply.text) as AuthStatus;
   }
 
   private setConnection(state: ConnectionState): void {
@@ -266,26 +248,25 @@ export class LocalNodeClient implements LadexClient {
   }
 
   private openSocket(): void {
-    const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const socket = new WebSocket(`${scheme}//${location.host}/ws`);
+    const socket: NodeSocket = this.transport.openSocket({
+      onOpen: () => {
+        this.setConnection('online');
+        this.send({ type: 'join', session_id: this.sessionId, user_agent: navigator.userAgent, nickname: this.nickname || null });
+      },
+      onMessage: (text) => {
+        try {
+          this.handleMessage(JSON.parse(text) as ServerMessage);
+        } catch (error) {
+          console.error('Could not read a message from the node', error);
+        }
+      },
+      onClose: () => {
+        if (this.isStopped || this.socket !== socket) return;
+        this.setConnection('offline');
+        this.scheduleReconnect();
+      },
+    });
     this.socket = socket;
-
-    socket.onopen = () => {
-      this.setConnection('online');
-      this.send({ type: 'join', session_id: this.sessionId, user_agent: navigator.userAgent, nickname: this.nickname || null });
-    };
-    socket.onmessage = (event) => {
-      try {
-        this.handleMessage(JSON.parse(event.data as string) as ServerMessage);
-      } catch (error) {
-        console.error('Could not read a message from the node', error);
-      }
-    };
-    socket.onclose = () => {
-      if (this.isStopped || this.socket !== socket) return;
-      this.setConnection('offline');
-      this.scheduleReconnect();
-    };
   }
 
   // Signed out means the node would refuse the socket, so ask first instead of looping.
@@ -307,7 +288,7 @@ export class LocalNodeClient implements LadexClient {
   }
 
   private send(message: Record<string, unknown>): void {
-    if (this.socket?.readyState === WebSocket.OPEN) this.socket.send(JSON.stringify(message));
+    if (this.socket?.isOpen) this.socket.send(JSON.stringify(message));
   }
 
   private handleMessage(message: ServerMessage): void {
@@ -488,24 +469,29 @@ export class LocalNodeClient implements LadexClient {
     throw new TransferError('You have been signed out.');
   }
 
+  /** What the page needs to save a file; a subclass may save it itself. */
+  protected ticket(url: string, filename: string): DownloadTicket {
+    return { url, filename };
+  }
+
   private async probe(url: string): Promise<void> {
-    let response: Response;
+    let reply;
     try {
-      response = await fetch(url, { method: 'HEAD', cache: 'no-store' });
+      reply = await this.transport.request('HEAD', url);
     } catch {
       throw new TransferError('Could not reach the node.');
     }
-    if (response.status === 401) this.handleSignedOut();
-    if (!response.ok) throw new TransferError(describeProblem(response.status));
+    if (reply.status === 401) this.handleSignedOut();
+    if (!isSuccess(reply.status)) throw new TransferError(describeProblem(reply.status));
   }
 
   // The node learns of the acceptance over the WebSocket, which this request can overtake.
   private async waitForPushedFile(offer: IncomingOffer): Promise<DownloadTicket> {
     const url = `/api/files/${encodeURIComponent(offer.fileId)}?to=${encodeURIComponent(this.sessionId)}`;
     for (let attempt = 0; attempt < ACCEPT_POLL_ATTEMPTS; attempt++) {
-      const response = await fetch(url, { method: 'HEAD', cache: 'no-store' }).catch(() => null);
-      if (response?.status === 401) this.handleSignedOut();
-      if (response?.ok) return { url, filename: offer.fileName };
+      const reply = await this.transport.request('HEAD', url).catch(() => null);
+      if (reply?.status === 401) this.handleSignedOut();
+      if (reply && isSuccess(reply.status)) return this.ticket(url, offer.fileName);
       await sleep(ACCEPT_POLL_DELAY_MS);
     }
     throw new TransferError(`Could not receive ${offer.fileName}.`);
@@ -523,15 +509,15 @@ export class LocalNodeClient implements LadexClient {
 
     return {
       queryProgress: async () => {
-        const response = await fetch(`/api/files/${fileId}/upload?size=${file.size}`, { cache: 'no-store' });
-        if (response.status === 401) throw new SignedOut();
-        const body = (await response.json()) as { offset?: number; complete?: boolean };
+        const reply = await this.transport.request('GET', `/api/files/${fileId}/upload?size=${file.size}`);
+        if (reply.status === 401) throw new SignedOut();
+        const body = JSON.parse(reply.text) as { offset?: number; complete?: boolean };
         return { offset: body.offset ?? 0, isComplete: body.complete ?? false };
       },
       sendFrom: (offset, onProgress) => {
         const headers = { ...baseHeaders, 'X-Ladex-Offset': String(offset) };
         const body = offset > 0 ? file.slice(offset) : file;
-        return putWithXhr(`/api/files/${fileId}`, headers, body, options.signal, (loaded) => onProgress(offset + loaded));
+        return this.transport.upload(`/api/files/${fileId}`, headers, body, options.signal, (sent) => onProgress(offset + sent));
       },
     };
   }
@@ -551,13 +537,11 @@ export class LocalNodeClient implements LadexClient {
   }
 
   private async publishFolder(folderId: string, name: string, children: Array<{ path: string; file_id: string }>): Promise<void> {
-    const response = await fetch(`/api/folders/${folderId}`, {
-      method: 'PUT',
+    const reply = await this.transport.request('PUT', `/api/folders/${folderId}`, {
       headers: { 'Content-Type': 'application/json', 'X-Ladex-Session': this.sessionId },
       body: JSON.stringify({ name, children }),
     });
-    if (response.ok) return;
-    const body = (await response.json().catch(() => ({}))) as UploadReply;
-    throw new TransferError(body.message ?? `the node answered ${response.status}`);
+    if (isSuccess(reply.status)) return;
+    throw new TransferError(parseUploadReply(reply.text).message ?? `the node answered ${reply.status}`);
   }
 }

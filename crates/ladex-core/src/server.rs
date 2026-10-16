@@ -85,10 +85,34 @@ where
     S::Future: Send,
     A: Api,
 {
+    serve_until(listener, tls, allowed_hosts, routes, api, std::future::pending()).await
+}
+
+/// Serves like `serve` until `stop` resolves, then closes the listener and waits for every open connection to end.
+pub async fn serve_until<S, A>(
+    listener: TcpListener,
+    tls: Option<TlsAcceptor>,
+    allowed_hosts: Option<AllowedHosts>,
+    routes: S,
+    api: A,
+    stop: impl std::future::Future<Output = ()>,
+) -> anyhow::Result<()>
+where
+    S: Service<hyper::Request<Incoming>, Response = warp::reply::Response, Error = Infallible> + Clone + Send + 'static,
+    S::Future: Send,
+    A: Api,
+{
     tracing::info!("Serving on {} ({})", listener.local_addr()?, if tls.is_some() { "TLS" } else { "plain HTTP" });
 
+    tokio::pin!(stop);
+    let mut connections = tokio::task::JoinSet::new();
     loop {
-        let (tcp, peer) = match listener.accept().await {
+        while connections.try_join_next().is_some() {}
+        let accepted = tokio::select! {
+            accepted = listener.accept() => accepted,
+            _ = &mut stop => break,
+        };
+        let (tcp, peer) = match accepted {
             Ok(pair) => pair,
             Err(e) => {
                 tracing::warn!("Accept error: {e}");
@@ -100,31 +124,8 @@ where
         let routes = routes.clone();
         let api = api.clone();
         let allowed_hosts = allowed_hosts.clone();
-        let is_tls = tls.is_some();
 
-        tokio::spawn(async move {
-            let service = hyper::service::service_fn(move |mut req: hyper::Request<Incoming>| {
-                let peer_addr = PeerAddr { addr: peer, tls: is_tls };
-                req.extensions_mut().insert(peer_addr);
-                let mut routes = routes.clone();
-                let api = api.clone();
-                let allowed_hosts = allowed_hosts.clone();
-                async move {
-                    if let Some(allowed) = &allowed_hosts {
-                        if !host_allowed(allowed, req.headers().get(hyper::header::HOST)) {
-                            let refusal = warp::reply::with_status("Unexpected Host header", hyper::StatusCode::MISDIRECTED_REQUEST);
-                            return Ok::<_, Infallible>(from_warp(refusal.into_response()));
-                        }
-                    }
-                    if api.claims(req.uri().path()) {
-                        return Ok(api.handle(req, peer_addr).await);
-                    }
-                    Ok(from_warp(routes.call(req).await?))
-                }
-            });
-            let mut http = hyper::server::conn::http1::Builder::new();
-            http.timer(TokioTimer::new()).header_read_timeout(HEADER_READ_TIMEOUT);
-
+        connections.spawn(async move {
             let result = match tls {
                 Some(acceptor) => {
                     let stream = match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(tcp)).await {
@@ -138,15 +139,54 @@ where
                             return;
                         }
                     };
-                    http.serve_connection(TokioIo::new(stream), service).with_upgrades().await
+                    serve_connection(stream, PeerAddr { addr: peer, tls: true }, allowed_hosts, routes, api).await
                 }
-                None => http.serve_connection(TokioIo::new(tcp), service).with_upgrades().await,
+                None => serve_connection(tcp, PeerAddr { addr: peer, tls: false }, allowed_hosts, routes, api).await,
             };
             if let Err(e) = result {
                 tracing::debug!("Connection with {peer} ended: {e}");
             }
         });
     }
+    connections.shutdown().await;
+    Ok(())
+}
+
+/// Serves one client's requests on an already open stream, until it closes.
+pub async fn serve_connection<Io, S, A>(
+    io: Io,
+    peer: PeerAddr,
+    allowed_hosts: Option<AllowedHosts>,
+    routes: S,
+    api: A,
+) -> Result<(), hyper::Error>
+where
+    Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    S: Service<hyper::Request<Incoming>, Response = warp::reply::Response, Error = Infallible> + Clone + Send + 'static,
+    S::Future: Send,
+    A: Api,
+{
+    let service = hyper::service::service_fn(move |mut req: hyper::Request<Incoming>| {
+        req.extensions_mut().insert(peer);
+        let mut routes = routes.clone();
+        let api = api.clone();
+        let allowed_hosts = allowed_hosts.clone();
+        async move {
+            if let Some(allowed) = &allowed_hosts {
+                if !host_allowed(allowed, req.headers().get(hyper::header::HOST)) {
+                    let refusal = warp::reply::with_status("Unexpected Host header", hyper::StatusCode::MISDIRECTED_REQUEST);
+                    return Ok::<_, Infallible>(from_warp(refusal.into_response()));
+                }
+            }
+            if api.claims(req.uri().path()) {
+                return Ok(api.handle(req, peer).await);
+            }
+            Ok(from_warp(routes.call(req).await?))
+        }
+    });
+    let mut http = hyper::server::conn::http1::Builder::new();
+    http.timer(TokioTimer::new()).header_read_timeout(HEADER_READ_TIMEOUT);
+    http.serve_connection(TokioIo::new(io), service).with_upgrades().await
 }
 
 #[cfg(test)]

@@ -188,6 +188,7 @@ mod tests {
             node_name: "laptop".into(),
             local_ip: Some("192.168.1.20".parse().unwrap()),
             http_port: 8080,
+            local_http_port: Some(8081),
             quic_port: 8080,
             discovery_port: Some(7878),
             is_encrypted: true,

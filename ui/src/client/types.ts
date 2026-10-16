@@ -94,6 +94,8 @@ export type UploadOutcome = 'shared' | 'awaiting-approval' | 'offered';
 export interface DownloadTicket {
   url: string;
   filename: string;
+  // Set when the client writes the file to disk itself; resolves to where it went.
+  saveToDisk?: () => Promise<string>;
 }
 
 /** Why a transfer stopped, in words fit for a toast. */
