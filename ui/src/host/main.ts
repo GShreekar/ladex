@@ -18,9 +18,15 @@ interface HostServices {
   transport: NodeTransport;
 }
 
-// The app's window reaches its node in-process; any browser reaches it over HTTP.
+// A window attached to a running daemon shows that node's page over loopback HTTP, with no app commands behind it.
+function isShownByTheApp(): boolean {
+  const isLoopbackPage = location.protocol === 'http:' && ['localhost', '127.0.0.1'].includes(location.hostname);
+  return isTauri() && !isLoopbackPage;
+}
+
+// The app's own window reaches its node in-process; any browser reaches it over HTTP.
 async function connectToNode(): Promise<HostServices> {
-  if (isTauri()) {
+  if (isShownByTheApp()) {
     const { IpcClient } = await import('../client/ipc-client');
     const client = new IpcClient();
     return { client, transport: client.transport };
