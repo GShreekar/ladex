@@ -3,6 +3,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use ladex_core::control::server::Endpoint;
 use ladex_core::node::{Node, NodeConfig, NodeHandle, Notice, StartError, UiAssets, WebUi};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -170,4 +171,61 @@ async fn an_idle_open_connection_does_not_hold_up_shutdown() {
 
     let shutdown = tokio::time::timeout(std::time::Duration::from_secs(10), node.shutdown()).await;
     assert!(shutdown.is_ok(), "shutdown waited on a connection that never sent a request");
+}
+
+#[tokio::test]
+async fn a_second_node_on_the_same_data_dir_is_refused_and_points_at_the_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = started(dir.path()).await;
+    let published = Endpoint::load(dir.path()).expect("the first node publishes its endpoint");
+
+    let refused = Node::start(config(dir.path())).await;
+
+    match refused {
+        Err(StartError::DataDirInUse { data_dir, running }) => {
+            assert_eq!(data_dir, dir.path());
+            assert_eq!(running, Some(published));
+        }
+        other => panic!("expected the data dir to be in use, got {:?}", other.map(|_| ())),
+    }
+    first.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_refused_second_node_leaves_the_first_running_and_its_endpoint_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = started(dir.path()).await;
+    let port = first.info().http_port;
+    let published = Endpoint::load(dir.path());
+
+    assert!(Node::start(config(dir.path())).await.is_err());
+
+    assert_eq!(get(port, "/").await.0, 200);
+    assert_eq!(Endpoint::load(dir.path()), published);
+    assert!(published.is_some());
+    first.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_data_dir_can_be_started_again_after_the_first_node_shuts_down() {
+    let dir = tempfile::tempdir().unwrap();
+    started(dir.path()).await.shutdown().await;
+
+    let second = Node::start(config(dir.path())).await;
+
+    assert!(second.is_ok());
+    second.unwrap().shutdown().await;
+}
+
+#[tokio::test]
+async fn an_endpoint_left_by_a_node_that_died_is_replaced_on_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let stale = Endpoint { port: 1, token: "stale".to_string() };
+    std::fs::write(dir.path().join("control.json"), serde_json::to_vec(&stale).unwrap()).unwrap();
+
+    let node = started(dir.path()).await;
+
+    let published = Endpoint::load(dir.path()).expect("the new node publishes its endpoint");
+    assert_ne!(published, stale);
+    node.shutdown().await;
 }

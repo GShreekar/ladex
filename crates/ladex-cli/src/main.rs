@@ -4,6 +4,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use include_dir::{include_dir, Dir};
+use ladex_core::control::server::{self as control, Endpoint};
+use ladex_core::control::{Reply, Request};
 use ladex_core::node::{self, Node, NodeConfig, NodeHandle, Notice, StartError, UiAssets, WebUi};
 use ladex_core::{auth, tls};
 
@@ -119,7 +121,7 @@ async fn run_node(args: Args, data_dir: PathBuf) {
     let config = node_config(&args, data_dir, passphrase.clone());
     let mut handle = match Node::start(config).await {
         Ok(handle) => handle,
-        Err(error) => exit_with_start_error(&error),
+        Err(error) => exit_with_start_error(&error).await,
     };
     print_startup(&handle, &args, passphrase.is_some());
 
@@ -193,8 +195,15 @@ fn parse_manual_peers(peers: &[String]) -> Vec<SocketAddr> {
         .collect()
 }
 
-fn exit_with_start_error(error: &StartError) -> ! {
+async fn exit_with_start_error(error: &StartError) -> ! {
     match error {
+        StartError::DataDirInUse { running, .. } => {
+            eprintln!("Error: {error}.");
+            if let Some(description) = describe_running_node(running.as_ref()).await {
+                eprintln!("{description}");
+            }
+            eprintln!("Commands such as `ladex send` and `ladex ls` work with that node; stop it first to start another one here.");
+        }
         StartError::EmptyPassphrase => {
             eprintln!("Error: the passphrase must not be empty.");
             std::process::exit(2);
@@ -203,6 +212,12 @@ fn exit_with_start_error(error: &StartError) -> ! {
         _ => eprintln!("Error: {error}"),
     }
     std::process::exit(1);
+}
+
+async fn describe_running_node(endpoint: Option<&Endpoint>) -> Option<String> {
+    let reply = control::call(endpoint?, &Request::Status, |_| {}).await.ok()?;
+    let Reply::Status(status) = reply else { return None };
+    Some(format!("It is {} (version {}), serving its web page on port {}.", status.node_name, status.version, status.http_port))
 }
 
 fn describe_notice(notice: &Notice) -> String {

@@ -57,10 +57,12 @@ pub async fn open(data_dir: &Path) -> io::Result<(TcpListener, Endpoint)> {
     Ok((listener, endpoint))
 }
 
-/// Forgets the endpoint when the node stops, so commands say plainly that no node is running.
+/// Forgets the endpoint, so commands say plainly that no node is running; the owner of the data directory calls this.
 pub fn close(data_dir: &Path) {
-    if let Err(e) = std::fs::remove_file(path_in(data_dir)) {
-        tracing::warn!("Control: could not remove {}: {e}", path_in(data_dir).display());
+    match std::fs::remove_file(path_in(data_dir)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!("Control: could not remove {}: {e}", path_in(data_dir).display()),
     }
 }
 

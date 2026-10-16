@@ -148,6 +148,7 @@ ladex doctor                         # check that the node is running and reacha
 - `send --to` takes a device's name or its id from `ladex devices`, and only sends files, not folders. Ctrl-C while it waits leaves the offer open.
 - `seed --watch` shares the whole folder afresh when it changes and takes the earlier version down, so downloads of the earlier version stop.
 - Commands reach the node through a port on `127.0.0.1` and a token in `control.json` in the data folder, which only your user can read.
+- A data folder belongs to one node at a time, held with a lock on `node.lock` in it. Starting `ladex` or the app on a folder that is already in use is refused, with the running node's name and port; the commands above keep working with it.
 
 ## Testing
 

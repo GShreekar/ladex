@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use include_dir::{include_dir, Dir};
-use ladex_core::node::{self, Bridge, Node, NodeConfig, NodeHandle, Reply, SocketEvent, UiAssets, WebUi};
+use ladex_core::node::{self, Bridge, Node, NodeConfig, NodeHandle, Reply, SocketEvent, StartError, UiAssets, WebUi};
 use tauri::ipc::{Channel, InvokeBody, Request};
 use tauri::{AppHandle, Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
@@ -128,12 +128,12 @@ fn run_node(app: &tauri::App) -> tauri::Result<()> {
         Ok(node) => node,
         Err(error) => {
             tracing::error!("The node could not start: {error}");
+            let message = match &error {
+                StartError::DataDirInUse { .. } => format!("{error}.\n\nUse that one, or quit it before opening LADEX again."),
+                _ => error.to_string(),
+            };
             let handle = app.handle().clone();
-            app.dialog()
-                .message(error.to_string())
-                .title("LADEX could not start")
-                .kind(MessageDialogKind::Error)
-                .show(move |_| handle.exit(1));
+            app.dialog().message(message).title("LADEX could not start").kind(MessageDialogKind::Error).show(move |_| handle.exit(1));
             return Ok(());
         }
     };

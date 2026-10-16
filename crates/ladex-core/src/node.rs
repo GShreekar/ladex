@@ -18,10 +18,12 @@ use crate::{
 
 pub mod bridge;
 pub mod local;
+pub mod lock;
 pub mod web;
 
 pub use bridge::{Bridge, Reply, SocketEvent};
 pub use local::{LinkError, LocalLink, LocalResponse, LocalUpload, SavedFile, SocketReader, SocketWriter};
+pub use lock::DataDirLock;
 pub use web::{UiAssets, WebUi};
 
 pub const DEFAULT_HTTP_PORT: u16 = 8080;
@@ -82,18 +84,40 @@ impl NodeConfig {
 #[derive(Debug)]
 pub enum StartError {
     EmptyPassphrase,
+    /// Another node already owns the data directory; `running` is where it can be reached, when it has said so.
+    DataDirInUse {
+        data_dir: PathBuf,
+        running: Option<control::server::Endpoint>,
+    },
+    DataDirUnavailable {
+        data_dir: PathBuf,
+        source: std::io::Error,
+    },
     Identity(anyhow::Error),
     Trust(anyhow::Error),
     MeshEndpoint(anyhow::Error),
-    Store { path: PathBuf, source: anyhow::Error },
-    Catalog { path: PathBuf, source: anyhow::Error },
-    Listen { port: u16, source: std::io::Error },
+    Store {
+        path: PathBuf,
+        source: anyhow::Error,
+    },
+    Catalog {
+        path: PathBuf,
+        source: anyhow::Error,
+    },
+    Listen {
+        port: u16,
+        source: std::io::Error,
+    },
 }
 
 impl std::fmt::Display for StartError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::EmptyPassphrase => f.write_str("the passphrase must not be empty"),
+            Self::DataDirInUse { data_dir, .. } => {
+                write!(f, "another LADEX node (the app or `ladex`) is already running with {}", data_dir.display())
+            }
+            Self::DataDirUnavailable { data_dir, source } => write!(f, "could not use the data folder {}: {source}", data_dir.display()),
             Self::Identity(e) | Self::Trust(e) | Self::MeshEndpoint(e) => write!(f, "{e:#}"),
             Self::Store { path, source } => write!(f, "could not open the file store at {}: {source}", path.display()),
             Self::Catalog { path, source } => write!(f, "could not open the catalog at {}: {source:#}", path.display()),
@@ -146,6 +170,8 @@ pub struct NodeHandle {
     stop_web: watch::Sender<bool>,
     open_pipe: local::OpenPipe,
     background_tasks: Vec<JoinHandle<()>>,
+    // Kept to the end so the directory is released only after everything that uses it has stopped.
+    _data_dir_lock: DataDirLock,
 }
 
 impl NodeHandle {
@@ -199,6 +225,7 @@ impl Node {
             return Err(StartError::EmptyPassphrase);
         }
         let data_dir = config.data_dir.clone();
+        let data_dir_lock = claim_data_dir(&data_dir)?;
         let mut notices = Vec::new();
 
         let (identity, key_location) = identity::load_or_create(&data_dir, config.use_keychain).map_err(StartError::Identity)?;
@@ -276,7 +303,34 @@ impl Node {
             imported_legacy_files,
             notices,
         };
-        Ok(NodeHandle { info, state, mesh_endpoint, saver, mdns, web_server, local_web_server, stop_web, open_pipe, background_tasks })
+        Ok(NodeHandle {
+            info,
+            state,
+            mesh_endpoint,
+            saver,
+            mdns,
+            web_server,
+            local_web_server,
+            stop_web,
+            open_pipe,
+            background_tasks,
+            _data_dir_lock: data_dir_lock,
+        })
+    }
+}
+
+/// Takes the data directory for this node, or says who has it; the owner is the only one to touch its files.
+fn claim_data_dir(data_dir: &std::path::Path) -> Result<DataDirLock, StartError> {
+    match DataDirLock::acquire(data_dir) {
+        Ok(lock) => {
+            // Whatever endpoint is on disk belongs to a node that is gone.
+            control::server::close(data_dir);
+            Ok(lock)
+        }
+        Err(lock::LockError::InUse) => {
+            Err(StartError::DataDirInUse { data_dir: data_dir.to_path_buf(), running: control::server::Endpoint::load(data_dir) })
+        }
+        Err(lock::LockError::Io(source)) => Err(StartError::DataDirUnavailable { data_dir: data_dir.to_path_buf(), source }),
     }
 }
 
