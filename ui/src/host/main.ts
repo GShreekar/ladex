@@ -5,6 +5,8 @@ import { LocalNodeClient } from '../client/local-node-client';
 import type { NodeTransport } from '../client/transport';
 import type { LadexClient } from '../client/types';
 import { contextFor } from '../state/context';
+import { tauriDesktop } from '../desktop/desktop';
+import { Notifier } from '../state/notifier';
 import { Room } from '../state/room.svelte';
 import { Toasts } from '../state/toasts.svelte';
 import { Transfers } from '../state/transfers.svelte';
@@ -37,8 +39,9 @@ async function connectToNode(): Promise<HostServices> {
 
 const { client, transport } = await connectToNode();
 const toasts = new Toasts();
+const notifier = isShownByTheApp() ? new Notifier(client, tauriDesktop) : undefined;
 const context: HostContext = {
-  room: new Room(client, toasts),
+  room: new Room(client, toasts, notifier),
   transfers: new Transfers(client, toasts),
   toasts,
   guestsApi: new GuestsApi(transport),

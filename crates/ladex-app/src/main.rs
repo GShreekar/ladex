@@ -2,6 +2,10 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod notify;
+mod tray;
+
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use include_dir::{include_dir, Dir};
@@ -9,13 +13,16 @@ use ladex_core::control::server::{self as control, Endpoint};
 use ladex_core::control::{Reply as CommandReply, Request as Command};
 use ladex_core::node::{self, Bridge, Node, NodeConfig, NodeHandle, Reply, SocketEvent, StartError, UiAssets, WebUi};
 use tauri::ipc::{Channel, InvokeBody, Request};
-use tauri::{AppHandle, Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+use tauri_plugin_autostart::MacosLauncher;
 use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 
 // The web UI built from `ui/`; the node serves it to browsers on the network, the window shows it itself.
 static UI_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/../../ui/dist");
 
-const WINDOW_LABEL: &str = "main";
+pub const WINDOW_LABEL: &str = "main";
+// Passed by the login item, so the app starts in the tray instead of opening a window.
+const BACKGROUND_FLAG: &str = "--background";
 const UPLOAD_ID_HEADER: &str = "x-upload-id";
 
 struct EmbeddedUi(&'static Dir<'static>);
@@ -28,6 +35,7 @@ impl UiAssets for EmbeddedUi {
 
 struct AppNode {
     bridge: Bridge,
+    downloads: PathBuf,
     handle: Mutex<Option<NodeHandle>>,
 }
 
@@ -103,6 +111,26 @@ async fn ladex_save_download(node: State<'_, AppNode>, path: String, file_name: 
     node.bridge.save_download(&path, &file_name).await.map_err(|error| error.to_string())
 }
 
+#[tauri::command]
+fn ladex_notify(app: AppHandle, title: String, body: String) {
+    if !notify::is_window_in_use(&app) {
+        notify::send(&app, &title, &body);
+    }
+}
+
+#[tauri::command]
+fn ladex_set_other_devices(app: AppHandle, count: usize) {
+    tray::set_other_devices(&app, count);
+}
+
+// Where saved files go: the folder the running node was given, else the system downloads folder.
+pub fn downloads_folder(app: &AppHandle) -> Option<PathBuf> {
+    match app.try_state::<AppNode>() {
+        Some(node) => Some(node.downloads.clone()),
+        None => app.path().download_dir().ok(),
+    }
+}
+
 // Until the first-run settings of Phase 7b, the passphrase and data folder come from the environment (the data folder as for `ladex`).
 fn node_config() -> NodeConfig {
     let data_dir = node::default_data_dir();
@@ -113,9 +141,12 @@ fn node_config() -> NodeConfig {
 }
 
 fn open_window(app: &AppHandle, url: WebviewUrl) -> tauri::Result<()> {
+    // Started at login with a tray to live in, the window waits to be opened.
+    let is_hidden = std::env::args().any(|argument| argument == BACKGROUND_FLAG) && app.try_state::<tray::Tray>().is_some();
     // Dropped files are handled by the page, which the shell's own drag-and-drop would otherwise hide them from.
     WebviewWindowBuilder::new(app, WINDOW_LABEL, url)
         .title("LADEX")
+        .visible(!is_hidden)
         .inner_size(1100.0, 760.0)
         .min_inner_size(420.0, 520.0)
         .disable_drag_drop_handler()
@@ -158,8 +189,8 @@ fn run_node(app: &tauri::App) -> tauri::Result<()> {
         tracing::warn!("{notice:?}");
     }
     let downloads = app.path().download_dir().unwrap_or_else(|_| node.info().data_dir.join("received"));
-    let bridge = Bridge::new(node.local_link(), downloads);
-    app.manage(AppNode { bridge, handle: Mutex::new(Some(node)) });
+    let bridge = Bridge::new(node.local_link(), downloads.clone());
+    app.manage(AppNode { bridge, downloads, handle: Mutex::new(Some(node)) });
     open_window(app.handle(), WebviewUrl::default())
 }
 
@@ -167,6 +198,11 @@ fn main() {
     tracing_subscriber::fmt::init();
 
     let app = tauri::Builder::default()
+        // Opening the app again brings the running one forward instead of starting a second window.
+        .plugin(tauri_plugin_single_instance::init(|app, _arguments, _working_dir| tray::show_main_window(app)))
+        .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, Some(vec![BACKGROUND_FLAG])))
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             ladex_request,
@@ -178,20 +214,49 @@ fn main() {
             ladex_socket_send,
             ladex_socket_close,
             ladex_save_download,
+            ladex_notify,
+            ladex_set_other_devices,
         ])
-        .setup(|app| Ok(run_node(app)?))
+        .setup(|app| {
+            // Without a tray (some Linux desktops have none) closing the window quits, as it always did.
+            if let Err(error) = tray::build(app.handle()) {
+                tracing::warn!("No tray icon: {error}");
+            }
+            Ok(run_node(app)?)
+        })
         .build(tauri::generate_context!())
         .expect("could not build the LADEX app");
 
-    app.run(|app, event| {
-        let RunEvent::ExitRequested { api, .. } = event else { return };
-        let Some(node) = app.try_state::<AppNode>().and_then(|node| node.take_handle()) else { return };
-        // Peers are told goodbye and state is saved before the process ends.
-        api.prevent_exit();
-        let app = app.clone();
-        tauri::async_runtime::spawn(async move {
-            node.shutdown().await;
-            app.exit(0);
-        });
+    app.run(|app, event| match event {
+        RunEvent::WindowEvent { label, event: WindowEvent::CloseRequested { api, .. }, .. } if label == WINDOW_LABEL => {
+            hide_into_tray(app, &api)
+        }
+        #[cfg(target_os = "macos")]
+        RunEvent::Reopen { .. } => tray::show_main_window(app),
+        RunEvent::ExitRequested { api, .. } => shut_down_node(app, &api),
+        _ => {}
+    });
+}
+
+// The node keeps sharing while the window is closed; quitting is done from the tray.
+fn hide_into_tray(app: &AppHandle, close: &tauri::CloseRequestApi) {
+    let Some(tray) = app.try_state::<tray::Tray>() else { return };
+    close.prevent_close();
+    if let Some(window) = app.get_webview_window(WINDOW_LABEL) {
+        let _ = window.hide();
+    }
+    if tray.should_explain_closing() {
+        notify::send(app, "LADEX is still running", "Sharing continues from the tray. Choose Quit LADEX there to stop.");
+    }
+}
+
+fn shut_down_node(app: &AppHandle, api: &tauri::ExitRequestApi) {
+    let Some(node) = app.try_state::<AppNode>().and_then(|node| node.take_handle()) else { return };
+    // Peers are told goodbye and state is saved before the process ends.
+    api.prevent_exit();
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        node.shutdown().await;
+        app.exit(0);
     });
 }

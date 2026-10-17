@@ -11,6 +11,7 @@ import type {
 } from '../client/types';
 import { TransferError } from '../client/types';
 import { saveViaBrowser } from './save';
+import type { Notifier } from './notifier';
 import type { Toasts } from './toasts.svelte';
 
 /** What this page knows about the room, kept current from the client's events. */
@@ -28,6 +29,7 @@ export class Room {
   constructor(
     readonly client: LadexClient,
     private readonly toasts: Toasts,
+    private readonly notifier?: Pick<Notifier, 'downloadSaved'>,
   ) {
     this.stopListening = client.subscribe((event) => this.apply(event));
   }
@@ -82,6 +84,7 @@ export class Room {
     this.toasts.show('info', `Saving ${ticket.filename}…`);
     const savedAt = await ticket.saveToDisk();
     this.toasts.show('success', `Saved to ${savedAt}`);
+    this.notifier?.downloadSaved(ticket.filename);
   }
 
   private apply(event: ClientEvent): void {
