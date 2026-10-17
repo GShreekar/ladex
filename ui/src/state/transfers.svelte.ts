@@ -49,7 +49,8 @@ export class Transfers {
     let sharedCount = 0;
     await runLimited(files, UPLOAD_CONCURRENCY, async (file, index) => {
       const entry = entries[index] as Transfer;
-      const outcome = await this.run(entry, (signal, onProgress) => this.client.uploadFile(file, { signal, onProgress }));
+      const onAnswered = (isAccepted: boolean) => this.answered(entry, isAccepted);
+      const outcome = await this.run(entry, (signal, onProgress) => this.client.uploadFile(file, { signal, onProgress, onAnswered }));
       if (outcome === 'shared') sharedCount++;
     });
     if (sharedCount > 0) this.toasts.show('success', `${sharedCount} file${sharedCount === 1 ? '' : 's'} shared`);
@@ -102,6 +103,17 @@ export class Transfers {
     this.items.unshift(entry);
     // Reading the proxied copy keeps later writes visible to the page.
     return this.items[0] as Transfer;
+  }
+
+  private answered(entry: Transfer, isAccepted: boolean): void {
+    if (entry.status !== 'awaiting-approval') return;
+    if (isAccepted) {
+      this.finish(entry, 'done', null);
+      this.toasts.show('success', `The host accepted ${entry.name}`);
+    } else {
+      this.finish(entry, 'failed', 'The host declined it');
+      this.toasts.show('warning', `The host declined ${entry.name}`);
+    }
   }
 
   private finish(entry: Transfer, status: TransferStatus, message: string | null): void {

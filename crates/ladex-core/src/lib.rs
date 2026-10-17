@@ -12,6 +12,7 @@ pub mod bitmap;
 pub mod catalog;
 pub mod control;
 pub mod discovery;
+pub mod doctor;
 pub mod files_api;
 pub mod guest;
 pub mod handlers;
@@ -24,12 +25,15 @@ pub mod mesh;
 pub mod node;
 pub mod pairing;
 pub mod persist;
+pub mod preferences;
 pub mod push;
 pub mod ratelimit;
 pub mod receive;
 pub mod revocation;
+pub mod saved_passphrase;
 pub mod server;
 pub mod sessions;
+pub mod settings_api;
 pub mod state;
 pub mod store;
 #[cfg(any(test, feature = "test-support"))]
@@ -130,6 +134,12 @@ pub struct NodeState {
 
     /// This machine's hostname, shown to peers.
     pub node_name: String,
+
+    /// What the person chose in the app or with `ladex settings`.
+    pub preferences: Arc<preferences::PreferencesStore>,
+
+    /// What this node was started with that nothing else here records.
+    pub started_with: Arc<control::Settings>,
 }
 
 impl NodeState {
@@ -204,6 +214,8 @@ impl NodeState {
             http_port: 0,
             local_ip: None,
             node_name: "test".to_string(),
+            preferences: Arc::new(preferences::PreferencesStore::open(&data_dir)),
+            started_with: Arc::new(control::Settings { data_dir, discovery_port: None, local_http_port: None, use_keychain: false }),
         }
     }
 }

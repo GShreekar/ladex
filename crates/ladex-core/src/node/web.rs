@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tower_service::Service;
 use warp::Filter;
 
-use crate::{handlers, server, sessions, websocket, NodeState};
+use crate::{handlers, server, sessions, settings_api, websocket, NodeState};
 
 /// The files of a built web UI, looked up by their path in the build.
 pub trait UiAssets: Send + Sync {
@@ -195,6 +195,34 @@ fn trust_routes(state: NodeState) -> impl Filter<Extract = (impl warp::Reply,), 
     list.or(revoke)
 }
 
+fn settings_routes(state: NodeState) -> impl Filter<Extract = (impl warp::Reply,), Error = warp::Rejection> + Clone {
+    let get =
+        warp::path!("api" / "preferences").and(warp::get()).and(request_context(state.clone())).and_then(settings_api::get_preferences);
+    let update = warp::path!("api" / "preferences")
+        .and(warp::put())
+        .and(require_same_origin())
+        .and(warp::body::content_length_limit(4096))
+        .and(warp::body::json())
+        .and(request_context(state.clone()))
+        .and_then(settings_api::update_preferences);
+    let passphrase = warp::path!("api" / "passphrase")
+        .and(warp::put())
+        .and(require_same_origin())
+        .and(warp::body::content_length_limit(4096))
+        .and(warp::body::json())
+        .and(request_context(state.clone()))
+        .and_then(settings_api::change_passphrase);
+    let current_passphrase =
+        warp::path!("api" / "passphrase").and(warp::get()).and(request_context(state.clone())).and_then(settings_api::show_passphrase);
+    let suggestion = warp::path!("api" / "passphrase" / "suggestion")
+        .and(warp::get())
+        .and(with_api_auth(state.clone()))
+        .and(warp::ext::optional::<server::PeerAddr>())
+        .and_then(settings_api::suggest_passphrase);
+    let doctor = warp::path!("api" / "doctor").and(warp::get()).and(request_context(state)).and_then(settings_api::diagnose);
+    get.or(update).or(passphrase).or(current_passphrase).or(suggestion).or(doctor)
+}
+
 fn page_routes(state: NodeState, ui: &WebUi) -> impl Filter<Extract = (impl warp::Reply,), Error = warp::Rejection> + Clone {
     let is_legacy = ui.is_legacy;
 
@@ -270,6 +298,7 @@ pub fn service(
         .or(session_routes(state.clone()))
         .or(pairing_routes(state.clone()))
         .or(trust_routes(state.clone()))
+        .or(settings_routes(state.clone()))
         .or(page_routes(state, ui))
         .with(cors)
         .recover(handle_rejection);

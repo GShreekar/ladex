@@ -87,3 +87,9 @@ export function categoryOf(mimeType: string, isFolder: boolean): FileCategory {
   if (DOCUMENT_TYPES.test(mimeType)) return 'document';
   return 'other';
 }
+
+/** Where whole copies of a file are kept, in words; a browser that downloaded it keeps none the room can use. */
+export function describeHolders(holderCount: number, isAvailable: boolean): string {
+  if (holderCount === 0) return isAvailable ? 'In parts on several nodes' : 'Host offline';
+  return `On ${holderCount} ${holderCount === 1 ? 'node' : 'nodes'}`;
+}

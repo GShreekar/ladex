@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { GuestClient } from '../client/guest-client';
-  import { formatAgo, formatBytes, formatSpeed } from '../client/format';
+  import { describeHolders, formatAgo, formatBytes, formatSpeed } from '../client/format';
   import { iconFor } from '../components/file-icon';
   import Icon from '../components/Icon.svelte';
   import { clock } from '../state/clock.svelte';
@@ -102,14 +102,18 @@
         </div>
         <div class="badges">
           {#if file.isAvailable}
-            <span class="badge badge-success"><Icon name="hub" size={13} /> {file.holderNames.length} {file.holderNames.length === 1 ? 'device has' : 'devices have'} it</span>
+            <span class="badge badge-success"><Icon name="hub" size={13} /> {describeHolders(file.holderNames.length, true)}</span>
           {:else}
             <span class="badge badge-warning"><Icon name="wifi-off" size={13} /> Host offline</span>
           {/if}
         </div>
-        <button class="btn btn-block" class:btn-primary={file.isAvailable} disabled={!file.isAvailable} onclick={() => room.download(file)}>
-          <Icon name="download" /> {file.isFolder ? 'Download as ZIP' : 'Download file'}
-        </button>
+        {#if file.isOwn}
+          <p class="small muted">You shared this from this device.</p>
+        {:else}
+          <button class="btn btn-block" class:btn-primary={file.isAvailable} disabled={!file.isAvailable} onclick={() => room.download(file)}>
+            <Icon name="download" /> {file.isFolder ? 'Download as ZIP' : 'Download file'}
+          </button>
+        {/if}
       </article>
     {:else}
       <div class="card empty">

@@ -18,6 +18,7 @@ import type { WireFile } from './wire';
 
 const TUS_HEADERS = { 'Tus-Resumable': '1.0.0' };
 const RESTART_DELAY_MS = 3000;
+const APPROVAL_POLL_MS = 4000;
 
 export interface GuestMe {
   id: string;
@@ -103,6 +104,7 @@ export class GuestClient implements LadexClient {
   private files: WireFile[] = [];
   private events: EventSource | null = null;
   private restartTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly approvalTimers = new Set<ReturnType<typeof setInterval>>();
   private isStopped = false;
 
   constructor(private readonly me: GuestMe) {
@@ -139,16 +141,22 @@ export class GuestClient implements LadexClient {
     if (this.restartTimer) clearTimeout(this.restartTimer);
     this.events?.close();
     this.events = null;
+    for (const timer of this.approvalTimers) clearInterval(timer);
+    this.approvalTimers.clear();
   }
 
   async uploadFile(file: File, request: FileUploadRequest): Promise<UploadOutcome> {
     if (!this.me.can_upload) throw new TransferError('This invitation does not allow uploads.');
+    let location = '';
     try {
-      return await runTusUpload(this.tusWire(request.signal), {
+      const outcome = await runTusUpload(this.tusWire(request.signal), {
         file,
         signal: request.signal,
         onProgress: request.onProgress,
+        onCreated: (created) => (location = created),
       });
+      if (outcome === 'awaiting-approval' && request.onAnswered) this.watchApproval(location, request.onAnswered);
+      return outcome;
     } catch (error) {
       if (error instanceof SessionEnded) this.endSession();
       throw error;
@@ -194,6 +202,22 @@ export class GuestClient implements LadexClient {
     this.stop();
     await fetch('/api/me', { method: 'DELETE' }).catch(() => undefined);
     this.emit({ type: 'connection', state: 'ended' });
+  }
+
+  // The node says nothing when the host answers, so the upload is asked after until it is shared or gone.
+  private watchApproval(location: string, onAnswered: (isAccepted: boolean) => void): void {
+    let isAnswered = false;
+    const timer = setInterval(async () => {
+      const response = await fetch(location, { method: 'HEAD', headers: TUS_HEADERS, cache: 'no-store' }).catch(() => null);
+      const isAccepted = response?.ok === true && response.headers.get('Ladex-Upload-State') === 'shared';
+      const isDeclined = response?.status === 404;
+      if (isAnswered || (!isAccepted && !isDeclined)) return;
+      isAnswered = true;
+      clearInterval(timer);
+      this.approvalTimers.delete(timer);
+      onAnswered(isAccepted);
+    }, APPROVAL_POLL_MS);
+    this.approvalTimers.add(timer);
   }
 
   private emit(event: ClientEvent): void {
@@ -252,6 +276,7 @@ export class GuestClient implements LadexClient {
       id: device.id,
       name: device.name || `Device ${device.id.slice(-6)}`,
       nodeName: device.node_name,
+      nodeId: device.node_id,
       kind: 'unknown',
       isSelf: false,
       latencyMs: null,
@@ -261,6 +286,7 @@ export class GuestClient implements LadexClient {
       .filter((file) => !file.parent)
       .map((file) => {
         const holderNames = file.hosts.map((nodeId) => this.nodeName(nodeId));
+        const isOwn = file.uploader_id === this.me.id;
         return {
           id: file.id,
           name: file.name,
@@ -269,9 +295,10 @@ export class GuestClient implements LadexClient {
           sizeBytes: file.is_folder ? file.folder_bytes : file.size,
           folderFileCount: file.folder_files,
           sharedAt: Date.parse(file.uploaded_at),
-          sharedBy: deviceNames.get(file.uploader_id) ?? this.nodeName(file.uploader_node),
+          sharedBy: isOwn ? 'You' : (deviceNames.get(file.uploader_id) ?? this.nodeName(file.uploader_node)),
+          isOwn,
           holderNames,
-          isAvailable: holderNames.length > 0,
+          isAvailable: file.available ?? holderNames.length > 0,
           canUnshare: false,
         };
       });

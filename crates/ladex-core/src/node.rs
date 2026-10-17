@@ -81,6 +81,22 @@ impl NodeConfig {
     }
 }
 
+impl NodeConfig {
+    /// Takes the passphrase saved in the data directory, unless one was given; true when the saved one is used.
+    pub fn use_saved_passphrase(&mut self) -> anyhow::Result<bool> {
+        if self.passphrase.is_some() {
+            return Ok(false);
+        }
+        self.passphrase = crate::saved_passphrase::load(&self.data_dir, self.use_keychain)?;
+        Ok(self.passphrase.is_some())
+    }
+
+    /// Takes the storage limit chosen in the app or with `ladex settings`.
+    pub fn use_saved_storage_limit(&mut self) {
+        self.storage_limit_bytes = crate::preferences::load(&self.data_dir).storage_limit_bytes();
+    }
+}
+
 /// Why a node could not start; nothing is left running.
 #[derive(Debug)]
 pub enum StartError {
@@ -263,6 +279,7 @@ impl Node {
                 http_port,
                 quic_port,
                 primary_ip,
+                local_http_port,
             },
         );
 
@@ -270,7 +287,7 @@ impl Node {
         let saver = persist::spawn_saver(state.clone(), &data_dir, saved.as_ref());
 
         let mut background_tasks = vec![tokio::spawn(mesh::quic::accept_loop(state.clone(), mesh_endpoint.clone()))];
-        background_tasks.extend(start_control_socket(&state, &config, local_http_port, &mut notices).await);
+        background_tasks.extend(start_control_socket(&state, &config, &mut notices).await);
         background_tasks.extend(dial_manual_peers(&state, &config.manual_peers));
         if let Some(saved) = &saved {
             persist::redial(&state, saved.peers.clone());
@@ -398,6 +415,7 @@ struct StateParts {
     http_port: u16,
     quic_port: u16,
     primary_ip: Option<IpAddr>,
+    local_http_port: Option<u16>,
 }
 
 fn new_state(config: &NodeConfig, parts: StateParts) -> NodeState {
@@ -443,6 +461,13 @@ fn new_state(config: &NodeConfig, parts: StateParts) -> NodeState {
         http_port: parts.http_port,
         local_ip: parts.primary_ip,
         node_name: types::hostname(),
+        preferences: Arc::new(crate::preferences::PreferencesStore::open(&config.data_dir)),
+        started_with: Arc::new(control::Settings {
+            data_dir: config.data_dir.clone(),
+            discovery_port: config.discovery_port,
+            local_http_port: parts.local_http_port,
+            use_keychain: config.use_keychain,
+        }),
     }
 }
 
@@ -464,15 +489,10 @@ async fn restore_state(state: &NodeState, saved: Option<&persist::Saved>, node_i
     imported
 }
 
-async fn start_control_socket(
-    state: &NodeState,
-    config: &NodeConfig,
-    local_http_port: Option<u16>,
-    notices: &mut Vec<Notice>,
-) -> Option<JoinHandle<()>> {
+async fn start_control_socket(state: &NodeState, config: &NodeConfig, notices: &mut Vec<Notice>) -> Option<JoinHandle<()>> {
     match control::server::open(&config.data_dir).await {
         Ok((listener, endpoint)) => {
-            let settings = control::Settings { data_dir: config.data_dir.clone(), discovery_port: config.discovery_port, local_http_port };
+            let settings = state.started_with.as_ref().clone();
             Some(tokio::spawn(control::server::serve(state.clone(), settings, listener, endpoint)))
         }
         Err(e) => {

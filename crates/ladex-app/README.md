@@ -20,11 +20,29 @@ cargo run -p ladex-app
 
 `ui/dist` is shared: the app embeds it directly, and `ladex` stages a copy of it from `crates/ladex-cli/build.rs`, so one `npm run build` serves both.
 
-## Settings until the first-run wizard
+## Tray, login item and notifications
+
+- **Tray (menu bar on macOS).** Closing the window hides it; the node keeps sharing. The tray menu shows how many devices are connected and has Open LADEX, Open Downloads Folder, Launch at Login and Quit LADEX. Without a tray (some Linux desktops) closing the window quits, as before.
+- **Launch at login** is off until ticked in the tray menu. The login item starts the app with `--background`, so it comes up in the tray without a window.
+- **Opening the app again** brings the running window forward instead of starting another.
+- **Notifications** are sent only while the window is hidden, minimized or unfocused: a device shares files, a file is offered to you, a download finished. They are raised by the page (`ui/src/state/notifier.ts`) because offers are addressed to the window's device.
+
+## First run
+
+The first time the app opens on a data folder it shows a short wizard before any node starts, so the node never runs open on the network: a device name, a mesh (start a new one with a generated passphrase, or join one by typing its passphrase), where received files go and how much space they may use, and whether to launch at login. The passphrase is kept in the OS keychain (a private file when there is none); the other choices are in `preferences.json` in the data folder. Nothing is asked when a node is already running on the folder or `LADEX_PASSPHRASE` is set.
+
+## Settings, network and command line
+
+- **Settings** (only on the machine running the node): the downloads folder, how files sent to this device are accepted (always ask, from paired devices, or from anyone in the mesh, with an optional size above which it still asks), the storage limit, the mesh passphrase (shown on request, to add another computer), launch at login and the theme. Changing the passphrase takes effect on a restart, which the page offers.
+- **Network** runs the same checks as `ladex doctor`: addresses, whether the page answers, whether multicast works, other nodes, storage and disk, with a report to copy into a bug report.
+- **Command line** lists the `ladex` commands that do what the app does, with the data folder the CLI will use and a copy button for each.
+- `ladex settings` does the same from a terminal; the daemon and the app read the same files.
+
+## Environment
 
 | Variable | Meaning |
 |---|---|
-| `LADEX_PASSPHRASE` | Passphrase the node joins the mesh with and requires of browsers; unset means an open node. |
+| `LADEX_PASSPHRASE` | Overrides the saved passphrase and skips the wizard. |
 | `LADEX_DATA_DIR` | Where the node keeps its files and settings; the same default as `ladex` (`~/.ladex/files`), and `ladex` reads it too, so its commands find the app's node. |
 
-Files saved from the window are written to the system downloads folder.
+Files saved from the window go to the downloads folder chosen in Settings, else the system downloads folder.

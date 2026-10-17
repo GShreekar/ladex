@@ -276,11 +276,13 @@ async fn handle_client_message(
         ClientMessage::TextMessage { session_id: sender_id, content } => {
             let content = validate::clean_message(&content).ok_or("message is empty")?;
             let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+            // Kept with the message, so it is still credited after the sender leaves.
+            let sender_name = state.local_peers.read().await.get(&sender_id).and_then(|peer| peer.nickname.clone());
             let message = TextMessage {
                 id: format!("msg_{}_{}", sender_id, now_ms),
                 content,
                 sender_id,
-                sender_name: None,
+                sender_name,
                 timestamp: chrono::Utc::now(),
                 created_at: now_ms,
             };
@@ -310,6 +312,15 @@ async fn handle_client_message(
         }
 
         ClientMessage::OfferFileTo { session_id: from, target_session_id, file_id } => {
+            if target_session_id == from {
+                return Err("you cannot offer a file to yourself".into());
+            }
+            let Some(listed) = state.catalog.listed(&file_id) else {
+                return Err("that file is no longer shared".into());
+            };
+            if listed.entry.uploader_id == target_session_id {
+                return Err("that device shared this file, so it already has it".into());
+            }
             mesh::route_to_device(
                 state,
                 &from,

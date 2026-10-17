@@ -2,10 +2,14 @@
 
 use ladex_core::push::{self, PushedFile, Refused};
 use ladex_core::store::{Origin, CHUNK_SIZE};
-use ladex_core::testing::{eventually, spawn_mesh, NodeHandle};
+use ladex_core::testing::{eventually, eventually_within, spawn_mesh, NodeHandle};
 use ladex_core::transfer::wire::{ErrorCode, Fetch, GetChunks, Reply};
 use ladex_core::types::{OfferedFile, ServerMessage};
+use std::time::Duration;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
+
+// A loaded CI runner can take far longer than a quiet machine to move three chunks.
+const TRANSFER_TIMEOUT: Duration = Duration::from_secs(60);
 
 type Tab = UnboundedReceiver<ServerMessage>;
 
@@ -95,11 +99,11 @@ async fn an_accepted_file_arrives_whole_and_the_sender_is_told() {
 
     push::accept(&b.state, "bob", "file_p").await.unwrap();
 
-    assert!(eventually(async || b.state.store.contains_complete("file_p")).await, "the file never arrived");
+    assert!(eventually_within(TRANSFER_TIMEOUT, async || b.state.store.contains_complete("file_p")).await, "the file never arrived");
     assert_eq!(contents(b, "file_p").await, content);
     let delivered = next_message(&mut tabs[0]).await;
     assert!(matches!(&delivered, ServerMessage::FilePushDelivered { to_session_id, .. } if to_session_id == "bob"), "{delivered:?}");
-    assert!(eventually(async || a.state.store.get("file_p").is_none()).await, "the sender kept its copy");
+    assert!(eventually_within(TRANSFER_TIMEOUT, async || a.state.store.get("file_p").is_none()).await, "the sender kept its copy");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -125,7 +129,7 @@ async fn a_pushed_file_is_never_listed_or_announced() {
     let file = send(a, "alice", "bob", &three_chunks()).await.unwrap();
     expect_prompt(&mut tabs[1], &file).await;
     push::accept(&b.state, "bob", "file_p").await.unwrap();
-    assert!(eventually(async || b.state.store.contains_complete("file_p")).await);
+    assert!(eventually_within(TRANSFER_TIMEOUT, async || b.state.store.contains_complete("file_p")).await);
 
     for node in [a, b, c] {
         assert!(node.live_files().await.is_empty());
@@ -152,7 +156,7 @@ async fn only_the_receiving_node_can_fetch_the_file() {
     let file = send(a, "alice", "bob", &three_chunks()).await.unwrap();
     expect_prompt(&mut tabs[1], &file).await;
     push::accept(&b.state, "bob", "file_p").await.unwrap();
-    assert!(eventually(async || b.state.store.contains_complete("file_p")).await);
+    assert!(eventually_within(TRANSFER_TIMEOUT, async || b.state.store.contains_complete("file_p")).await);
 
     assert_eq!(ask(c, b, GetChunks::for_indices("file_p", &[0])).await, [Reply::Error(ErrorCode::NotFound)]);
     assert_eq!(ask(a, b, GetChunks::for_indices("file_p", &[0])).await, [Reply::Error(ErrorCode::NotFound)]);

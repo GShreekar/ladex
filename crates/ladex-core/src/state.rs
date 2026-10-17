@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::catalog::{self, CatalogEntry, EntryKind, Refusal};
+use crate::catalog::{self, CatalogEntry, EntryKind, Listed, Refusal};
 use crate::hlc::{ClockError, Stamp};
 use crate::store::Origin;
 use crate::types::*;
@@ -103,13 +103,39 @@ pub fn hosts_of(state: &NodeState, id: &str) -> Vec<NodeId> {
     hosts
 }
 
+// A node holds a folder only when it has the listing and every file in it.
+fn view_of(state: &NodeState, listed: &Listed, children: &[&str]) -> FileView {
+    let mut view = FileView::new(listed, hosts_of(state, &listed.entry.file_id));
+    if listed.entry.is_folder() {
+        for child in children {
+            let child_hosts = hosts_of(state, child);
+            view.available &= !child_hosts.is_empty();
+            view.hosts.retain(|node| child_hosts.contains(node));
+        }
+    }
+    view
+}
+
 /// Every shared file as a browser tab shows it.
 pub fn file_views(state: &NodeState) -> Vec<FileView> {
-    state.catalog.listing().iter().map(|listed| FileView::new(listed, hosts_of(state, &listed.entry.file_id))).collect()
+    let listing = state.catalog.listing();
+    let mut children: HashMap<&str, Vec<&str>> = HashMap::new();
+    for listed in &listing {
+        if let Some(parent) = listed.entry.parent() {
+            children.entry(parent).or_default().push(&listed.entry.file_id);
+        }
+    }
+    listing.iter().map(|listed| view_of(state, listed, children.get(listed.entry.file_id.as_str()).map_or(&[], Vec::as_slice))).collect()
 }
 
 pub fn file_view(state: &NodeState, id: &str) -> Option<FileView> {
-    state.catalog.listed(id).map(|listed| FileView::new(&listed, hosts_of(state, id)))
+    let listed = state.catalog.listed(id)?;
+    if !listed.entry.is_folder() {
+        return Some(view_of(state, &listed, &[]));
+    }
+    let listing = state.catalog.listing();
+    let children: Vec<&str> = listing.iter().filter(|l| l.entry.parent() == Some(id)).map(|l| l.entry.file_id.as_str()).collect();
+    Some(view_of(state, &listed, &children))
 }
 
 pub async fn broadcast_catalog(state: &NodeState) {
@@ -168,13 +194,7 @@ pub async fn unshare(state: &NodeState, file_id: &str, device: &str, is_host: bo
         .filter(|l| l.entry.file_id == file_id || l.entry.parent() == Some(file_id))
         .map(|l| l.entry.file_id)
         .collect();
-    let mut taken_down = Vec::new();
-    for id in ids {
-        if catalog::sync::unpublish(state, &id).await.is_ok() {
-            taken_down.push(id);
-        }
-    }
-    taken_down
+    catalog::sync::unpublish_all(state, &ids).await
 }
 
 /// Evicts least-recently-used cached files so `size` more bytes fit, and tells the mesh they are gone.
@@ -589,6 +609,38 @@ mod tests {
 
         state.availability.drop_node("node_b");
         assert!(!file_view(&state, "f1").unwrap().is_available());
+    }
+
+    #[tokio::test]
+    async fn a_node_holds_a_folder_only_with_its_listing_and_every_file_in_it() {
+        let state = NodeState::for_tests_signing(None);
+        share_file(&state, entry("folder", "d", EntryKind::Folder { bytes: 20, files: 2 })).await.unwrap();
+        share_file(&state, entry("one", "d", EntryKind::File { parent: Some("folder".into()) })).await.unwrap();
+        share_file(&state, entry("two", "d", EntryKind::File { parent: Some("folder".into()) })).await.unwrap();
+        let folder = || file_view(&state, "folder").unwrap();
+        let listed_folder = || file_views(&state).into_iter().find(|v| v.id == "folder").unwrap();
+
+        state.availability.set_complete("node_b", &["folder".to_string(), "one".to_string()]);
+        assert!(folder().hosts.is_empty() && !folder().available, "half a folder is not a copy of it");
+
+        state.availability.set_complete("node_c", &["two".to_string()]);
+        assert!(folder().hosts.is_empty() && folder().available, "the parts can still be fetched from several nodes");
+
+        state.availability.set_complete("node_b", &["two".to_string()]);
+        assert_eq!(folder().hosts, ["node_b"]);
+        assert_eq!(listed_folder(), folder());
+    }
+
+    #[tokio::test]
+    async fn unsharing_a_folder_tells_the_tabs_once() {
+        let state = NodeState::for_tests_signing(None);
+        share_file(&state, entry("folder", "d", EntryKind::Folder { bytes: 20, files: 2 })).await.unwrap();
+        share_file(&state, entry("one", "d", EntryKind::File { parent: Some("folder".into()) })).await.unwrap();
+        share_file(&state, entry("two", "d", EntryKind::File { parent: Some("folder".into()) })).await.unwrap();
+        let before = *state.catalog_changes.borrow();
+
+        assert_eq!(unshare(&state, "folder", "d", false).await.len(), 3);
+        assert_eq!(*state.catalog_changes.borrow(), before + 1);
     }
 
     #[tokio::test]

@@ -1,11 +1,31 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import Icon from '../../components/Icon.svelte';
-  import { useApp } from '../../state/context';
   import { theme, type ThemePreference } from '../../state/theme.svelte';
+  import { useHost } from '../host-context';
+  import type { PreferencesView } from '../preferences-api';
+  import CommandLineSection from '../settings/CommandLineSection.svelte';
+  import PassphraseSection from '../settings/PassphraseSection.svelte';
+  import ReceivingSection from '../settings/ReceivingSection.svelte';
+  import StartupSection from '../settings/StartupSection.svelte';
+  import StorageSection from '../settings/StorageSection.svelte';
 
-  const { room } = useApp();
+  const { room, preferencesApi, desktop, toasts } = useHost();
 
   let nickname = $state('');
+  let view = $state<PreferencesView | null>(null);
+
+  // Only the machine running the node may change how it is set up.
+  const isHost = room.capabilities.canManageGuests;
+
+  onMount(async () => {
+    if (!isHost) return;
+    try {
+      view = await preferencesApi.get();
+    } catch {
+      toasts.show('error', 'Could not load the settings of this node.');
+    }
+  });
 
   const themes: Array<{ id: ThemePreference; label: string }> = [
     { id: 'system', label: 'System' },
@@ -35,6 +55,13 @@
     </section>
   {/if}
 
+  {#if isHost && view}
+    <ReceivingSection {view} onchange={(next) => (view = next)} />
+    <StorageSection {view} onchange={(next) => (view = next)} />
+    <PassphraseSection {view} onchange={(next) => (view = next)} />
+    {#if desktop}<StartupSection />{/if}
+  {/if}
+
   <section class="card">
     <h2>Appearance</h2>
     <div class="themes" role="radiogroup" aria-label="Theme">
@@ -45,6 +72,10 @@
       {/each}
     </div>
   </section>
+
+  {#if isHost && view}
+    <CommandLineSection {view} />
+  {/if}
 
   {#if room.capabilities.canLeave}
     <section class="card">

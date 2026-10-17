@@ -52,7 +52,7 @@ function loadNickname(): string {
   }
 }
 
-function saveNickname(nickname: string): void {
+export function saveNickname(nickname: string): void {
   try {
     localStorage.setItem(NICKNAME_KEY, nickname);
   } catch {
@@ -83,6 +83,10 @@ export class LocalNodeClient implements LadexClient {
   private readonly listeners = new Set<ClientListener>();
   private readonly peers = new Map<string, WirePeer>();
   private readonly nodeNames = new Map<string, string>();
+  // Names of devices seen, kept after they leave so what they shared stays credited to them.
+  private readonly deviceNames = new Map<string, string>();
+  // Files that just left the catalog, so the notice that follows can name them.
+  private readonly removedFiles = new Map<string, WireFile>();
   private readonly pendingUnshares = new Map<string, string>();
   private readonly sentFiles = new Map<string, string>();
   private readonly sessionId = loadSessionId();
@@ -206,6 +210,10 @@ export class LocalNodeClient implements LadexClient {
   }
 
   offerFile(file: SharedFile, device: Device): void {
+    if (this.files.find((listed) => listed.id === file.id)?.uploader_id === device.id) {
+      this.notify('info', `${device.name} shared "${file.name}", so it already has it`);
+      return;
+    }
     this.send({ type: 'offer_file_to', session_id: this.sessionId, target_session_id: device.id, file_id: file.id });
     this.notify('info', `Offered "${file.name}" to ${device.name}`);
   }
@@ -311,7 +319,7 @@ export class LocalNodeClient implements LadexClient {
         this.publishFiles();
         break;
       case 'file_list_update':
-        this.files = message.files;
+        this.replaceFiles(message.files);
         this.publishFiles();
         break;
       case 'file_removed':
@@ -347,7 +355,18 @@ export class LocalNodeClient implements LadexClient {
 
   private rememberPeer(peer: WirePeer): void {
     if (peer.hosting_node_id && peer.hosting_node_name) this.nodeNames.set(peer.hosting_node_id, peer.hosting_node_name);
+    const name = peer.nickname || friendlyDeviceName(peer.user_agent);
+    if (name) this.deviceNames.set(peer.session_id, name);
     this.peers.set(peer.session_id, peer);
+  }
+
+  private replaceFiles(files: WireFile[]): void {
+    const listed = new Set(files.map((file) => file.id));
+    for (const file of this.files) {
+      if (!listed.has(file.id)) this.removedFiles.set(file.id, file);
+    }
+    for (const id of listed) this.removedFiles.delete(id);
+    this.files = files;
   }
 
   private nodeName(nodeId: string): string {
@@ -359,7 +378,7 @@ export class LocalNodeClient implements LadexClient {
       return this.nickname || friendlyDeviceName(navigator.userAgent) || 'This device';
     }
     const peer = this.peers.get(sessionId);
-    return peer?.nickname || friendlyDeviceName(peer?.user_agent) || `Peer ${sessionId.slice(-6)}`;
+    return peer?.nickname || friendlyDeviceName(peer?.user_agent) || this.deviceNames.get(sessionId) || `Peer ${sessionId.slice(-6)}`;
   }
 
   private publishSelf(): void {
@@ -375,6 +394,7 @@ export class LocalNodeClient implements LadexClient {
       id: peer.session_id,
       name: this.deviceName(peer.session_id),
       nodeName: peer.hosting_node_name ?? '',
+      nodeId: peer.hosting_node_id ?? '',
       kind: deviceKindOf(peer.user_agent),
       isSelf: false,
       latencyMs: peer.node_rtt_ms ?? null,
@@ -383,6 +403,7 @@ export class LocalNodeClient implements LadexClient {
       id: this.sessionId,
       name: this.deviceName(this.sessionId),
       nodeName: this.peers.get(this.sessionId)?.hosting_node_name ?? '',
+      nodeId: this.peers.get(this.sessionId)?.hosting_node_id ?? this.status.node_id,
       kind: deviceKindOf(navigator.userAgent),
       isSelf: true,
       latencyMs: null,
@@ -391,10 +412,20 @@ export class LocalNodeClient implements LadexClient {
     this.publishSelf();
   }
 
+  // Shared by this device, or from the command line of the machine this page runs on.
+  private isOwn(file: WireFile): boolean {
+    if (file.uploader_id === '') return this.status.is_host && file.uploader_node === this.status.node_id;
+    return file.uploader_id === this.sessionId;
+  }
+
+  private holderName(nodeId: string): string {
+    return nodeId === this.status.node_id ? `${this.nodeName(nodeId)} (this node)` : this.nodeName(nodeId);
+  }
+
   private toSharedFile(file: WireFile): SharedFile {
-    const isOwn = file.uploader_id === this.sessionId;
-    const uploaderKnown = file.uploader_id !== '' && (isOwn || this.peers.has(file.uploader_id));
-    const holderNames = file.hosts.map((nodeId) => this.nodeName(nodeId));
+    const isOwn = this.isOwn(file);
+    const uploaderKnown = file.uploader_id !== '' && (this.peers.has(file.uploader_id) || this.deviceNames.has(file.uploader_id));
+    const holderNames = file.hosts.map((nodeId) => this.holderName(nodeId));
     return {
       id: file.id,
       name: file.name,
@@ -404,9 +435,10 @@ export class LocalNodeClient implements LadexClient {
       folderFileCount: file.folder_files,
       sharedAt: Date.parse(file.uploaded_at),
       sharedBy: isOwn ? 'You' : uploaderKnown ? this.deviceName(file.uploader_id) : this.nodeName(file.uploader_node),
+      isOwn,
       holderNames,
-      isAvailable: holderNames.length > 0,
-      canUnshare: isOwn || (this.status.is_host && file.uploader_node === this.status.node_id),
+      isAvailable: file.available ?? holderNames.length > 0,
+      canUnshare: file.uploader_id === this.sessionId || (this.status.is_host && file.uploader_node === this.status.node_id),
     };
   }
 
@@ -441,13 +473,17 @@ export class LocalNodeClient implements LadexClient {
   }
 
   private confirmRemoval(fileId: string): void {
+    const removed = this.removedFiles.get(fileId);
+    this.removedFiles.delete(fileId);
     const name = this.pendingUnshares.get(fileId);
-    if (name === undefined) {
-      this.notify('info', 'A shared file was removed');
+    if (name !== undefined) {
+      this.pendingUnshares.delete(fileId);
+      this.notify('success', `Unshared ${name}`);
       return;
     }
-    this.pendingUnshares.delete(fileId);
-    this.notify('success', `Unshared ${name}`);
+    // The files inside a folder go with it, and the folder's own notice covers them.
+    if (removed?.parent) return;
+    this.notify('info', removed ? `"${removed.name}" is no longer shared` : 'A shared file was removed');
   }
 
   private reportDeclined(fileId: string, fromSessionId: string): void {

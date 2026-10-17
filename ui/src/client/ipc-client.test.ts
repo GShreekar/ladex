@@ -75,6 +75,7 @@ const SHARED_FILE: SharedFile = {
   folderFileCount: 0,
   sharedAt: 0,
   sharedBy: 'You',
+  isOwn: true,
   holderNames: ['here'],
   isAvailable: true,
   canUnshare: true,

@@ -82,18 +82,26 @@ impl std::fmt::Display for KeyLocation {
     }
 }
 
-trait SecretStore {
+pub(crate) trait SecretStore {
     /// `Ok(None)` when nothing is stored yet.
     fn read(&self) -> anyhow::Result<Option<Vec<u8>>>;
     fn write(&self, secret: &[u8]) -> anyhow::Result<()>;
+    /// Forgets the secret; nothing stored is not an error.
+    fn delete(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
-struct Keychain(keyring::Entry);
+pub(crate) struct Keychain(keyring::Entry);
 
 impl Keychain {
     /// None when this machine has no usable keychain (e.g. Linux without a Secret Service).
     fn for_dir(dir: &Path) -> Option<Self> {
-        keyring::Entry::new(KEYCHAIN_SERVICE, &keychain_account(dir)).ok().map(Keychain)
+        Self::for_account(&keychain_account(dir))
+    }
+
+    pub(crate) fn for_account(account: &str) -> Option<Self> {
+        keyring::Entry::new(KEYCHAIN_SERVICE, account).ok().map(Keychain)
     }
 }
 
@@ -109,9 +117,16 @@ impl SecretStore for Keychain {
     fn write(&self, secret: &[u8]) -> anyhow::Result<()> {
         Ok(self.0.set_secret(secret)?)
     }
+
+    fn delete(&self) -> anyhow::Result<()> {
+        match self.0.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
 }
 
-struct KeyFile(PathBuf);
+pub(crate) struct KeyFile(pub(crate) PathBuf);
 
 impl SecretStore for KeyFile {
     fn read(&self) -> anyhow::Result<Option<Vec<u8>>> {
@@ -124,6 +139,14 @@ impl SecretStore for KeyFile {
 
     fn write(&self, secret: &[u8]) -> anyhow::Result<()> {
         Ok(crate::persist::write_private(&self.0, secret)?)
+    }
+
+    fn delete(&self) -> anyhow::Result<()> {
+        match std::fs::remove_file(&self.0) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 }
 

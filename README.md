@@ -138,7 +138,8 @@ ladex seed photos/ --watch           # share a folder, and share it again whenev
 ladex devices                        # list connected devices and nodes
 ladex invite                         # a one-time browser invitation as a link, a typed code and a QR code
 ladex invite --permission upload     # also read-only (default) or upload-with-approval
-ladex doctor                         # check that the node is running and reachable
+ladex doctor                         # check that the node is running and reachable (also under Network in the app)
+ladex settings                       # show the node's settings; --storage-limit-gb, --auto-accept, --downloads-dir change them
 ```
 
 - Add `--json` to any command for output a script can read. A command exits with 0 on success and 1 on failure.
@@ -147,6 +148,7 @@ ladex doctor                         # check that the node is running and reacha
 - `send` and `seed` copy what they share into the node's store, so a shared file takes its size twice on disk.
 - `send --to` takes a device's name or its id from `ladex devices`, and only sends files, not folders. Ctrl-C while it waits leaves the offer open.
 - `seed --watch` shares the whole folder afresh when it changes and takes the earlier version down, so downloads of the earlier version stop.
+- The passphrase, storage limit and downloads folder chosen in the app are kept in the data folder, so `ladex` on the same folder uses them: it takes the saved passphrase unless you pass one, and the saved storage limit unless you pass `--storage-limit-gb`.
 - Commands reach the node through a port on `127.0.0.1` and a token in `control.json` in the data folder, which only your user can read.
 - A data folder belongs to one node at a time, held with a lock on `node.lock` in it. Starting `ladex` or the app on a folder that is already in use is refused, with the running node's name and port; the commands above keep working with it.
 - A command and the node it talks to must be the same version; otherwise the command stops with "the running node is X, this command is Y — update one of them".

@@ -1,7 +1,7 @@
-export type Page = 'files' | 'transfers' | 'guests' | 'settings';
+export type Page = 'files' | 'transfers' | 'guests' | 'network' | 'settings';
 export type FileFilter = 'all' | 'documents' | 'media';
 
-const PAGES: Page[] = ['files', 'transfers', 'guests', 'settings'];
+const PAGES: Page[] = ['files', 'transfers', 'guests', 'network', 'settings'];
 
 function pageFromHash(): Page {
   const name = location.hash.slice(1);

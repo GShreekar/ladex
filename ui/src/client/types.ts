@@ -6,6 +6,8 @@ export interface Device {
   id: string;
   name: string;
   nodeName: string;
+  // The node the device is connected to; devices of one node share it.
+  nodeId: string;
   kind: DeviceKind;
   isSelf: boolean;
   latencyMs: number | null;
@@ -21,6 +23,9 @@ export interface SharedFile {
   folderFileCount: number;
   sharedAt: number;
   sharedBy: string;
+  // Shared from this device, so it already has the file.
+  isOwn: boolean;
+  // The nodes with a whole copy; browsers that downloaded it are not among them.
   holderNames: string[];
   isAvailable: boolean;
   canUnshare: boolean;
@@ -87,6 +92,8 @@ export interface UploadRequest {
 
 export interface FileUploadRequest extends UploadRequest {
   toDeviceId?: string;
+  // For an upload the host has to approve: called once, when they accept or decline it.
+  onAnswered?: (isAccepted: boolean) => void;
 }
 
 export type UploadOutcome = 'shared' | 'awaiting-approval' | 'offered';

@@ -8,6 +8,7 @@ use clap::Subcommand;
 use ladex_core::control::server::{self, Endpoint};
 use ladex_core::control::{Device, Event, GuestInvite, Invite, Node, Reply, Request};
 use ladex_core::guest::Permission;
+use ladex_core::preferences::{self, AutoAccept, AutoAcceptFrom, Preferences};
 use ladex_core::types::FileView;
 
 use crate::doctor;
@@ -56,6 +57,24 @@ pub enum Command {
     },
     /// Check that this node can be reached and has what it needs
     Doctor,
+    /// Show this node's settings, or change them: what the app's Settings page does
+    Settings {
+        /// Where files saved from the app's window go; an empty value goes back to the system's downloads folder.
+        #[arg(long)]
+        downloads_dir: Option<PathBuf>,
+        /// Most disk space, in GiB, that shared files may use.
+        #[arg(long)]
+        storage_limit_gb: Option<u64>,
+        /// Whose files the app's window accepts without asking: nobody, paired (devices on nodes paired with this one) or mesh.
+        #[arg(long)]
+        auto_accept: Option<AutoAcceptFrom>,
+        /// Ask before accepting a file larger than this many MiB, whoever sends it.
+        #[arg(long, conflicts_with = "no_size_limit")]
+        ask_above_mb: Option<u64>,
+        /// Accept files of any size from those auto_accept allows.
+        #[arg(long)]
+        no_size_limit: bool,
+    },
 }
 
 /// A running node, and how this command should show what the node tells it.
@@ -134,9 +153,49 @@ async fn execute(command: Command, data_dir: &Path, is_json: bool) -> anyhow::Re
         Command::Devices => Request::Devices,
         Command::Invite { permission } => Request::Invite { permission },
         Command::Doctor => unreachable!("doctor does not need a running node and is handled before this"),
+        Command::Settings { downloads_dir, storage_limit_gb, auto_accept, ask_above_mb, no_size_limit } => {
+            let asks_for_change =
+                downloads_dir.is_some() || storage_limit_gb.is_some() || auto_accept.is_some() || ask_above_mb.is_some() || no_size_limit;
+            let update = if asks_for_change {
+                let current = current_preferences(&session).await?;
+                Some(settings_update(current, downloads_dir, storage_limit_gb, auto_accept, ask_above_mb, no_size_limit)?)
+            } else {
+                None
+            };
+            Request::Preferences { update }
+        }
     };
     let reply = session.call(&request).await?;
     Ok(report(&reply, is_json))
+}
+
+async fn current_preferences(session: &Session) -> anyhow::Result<Preferences> {
+    match session.call(&Request::Preferences { update: None }).await? {
+        Reply::Preferences(view) => Ok(view.preferences),
+        _ => bail!("the node answered something else"),
+    }
+}
+
+// Only what was asked for changes; the node reads the downloads folder as a full path, whatever directory this ran in.
+fn settings_update(
+    current: Preferences,
+    downloads_dir: Option<PathBuf>,
+    storage_limit_gb: Option<u64>,
+    auto_accept: Option<AutoAcceptFrom>,
+    ask_above_mb: Option<u64>,
+    no_size_limit: bool,
+) -> anyhow::Result<preferences::Update> {
+    let wants_other_rule = auto_accept.is_some() || ask_above_mb.is_some() || no_size_limit;
+    let rule = wants_other_rule.then(|| AutoAccept {
+        from: auto_accept.unwrap_or(current.auto_accept.from),
+        ask_above_mib: if no_size_limit { None } else { ask_above_mb.or(current.auto_accept.ask_above_mib) },
+    });
+    let downloads_dir = match downloads_dir {
+        Some(path) if path.as_os_str().is_empty() => Some(path),
+        Some(path) => Some(std::path::absolute(&path).with_context(|| format!("could not resolve {}", path.display()))?),
+        None => None,
+    };
+    Ok(preferences::Update { is_setup_done: None, downloads_dir, storage_limit_gib: storage_limit_gb, auto_accept: rule })
 }
 
 // The node reads the paths itself, so they must not depend on the directory this command was run in.
@@ -165,7 +224,28 @@ fn print_reply(reply: &Reply) {
         Reply::Devices { devices, nodes } => print_devices(devices, nodes),
         Reply::Invite(invite) => print_invite(invite),
         Reply::Status(status) => println!("{} ({}) is running", status.node_name, status.node_id),
+        Reply::Preferences(view) => print_preferences(view),
     }
+}
+
+fn print_preferences(view: &preferences::View) {
+    let preferences = &view.preferences;
+    let downloads =
+        preferences.downloads_dir.as_ref().map_or("the system's downloads folder".to_string(), |path| path.display().to_string());
+    let auto_accept = match preferences.auto_accept.from {
+        AutoAcceptFrom::Nobody => "always ask",
+        AutoAcceptFrom::PairedDevices => "accept from devices on paired nodes",
+        AutoAcceptFrom::Mesh => "accept from anyone in this mesh",
+    };
+    let size_limit = preferences.auto_accept.ask_above_mib.map_or("no limit".to_string(), |mib| format!("ask above {mib} MiB"));
+    let rows = vec![
+        vec!["Data folder".to_string(), view.data_dir.display().to_string()],
+        vec!["Downloads folder".to_string(), downloads],
+        vec!["Storage limit".to_string(), format!("{} GiB ({} used)", preferences.storage_limit_gib, format_bytes(view.store_used_bytes))],
+        vec!["Incoming files".to_string(), format!("{auto_accept}; {size_limit}")],
+        vec!["Passphrase".to_string(), if view.has_passphrase { "set" } else { "none" }.to_string()],
+    ];
+    output::print_table(&["SETTING", "VALUE"], &rows);
 }
 
 fn size_of(file: &FileView) -> String {
@@ -185,6 +265,7 @@ fn print_files(files: &[FileView]) {
     }
     let kind = |file: &FileView| if file.is_folder { "folder" } else { "file" };
     let availability = |file: &FileView| match file.hosts.len() {
+        0 if file.available => "in parts, on several nodes".to_string(),
         0 => "nobody online has it".to_string(),
         1 => "1 node".to_string(),
         count => format!("{count} nodes"),
@@ -305,5 +386,53 @@ async fn seed(session: &Session, dir: &Path, replaces: Option<String>) -> anyhow
     match reply {
         Reply::Shared { mut files } if files.len() == 1 => Ok(files.remove(0)),
         _ => bail!("the node answered something else"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn current() -> Preferences {
+        Preferences { auto_accept: AutoAccept { from: AutoAcceptFrom::Mesh, ask_above_mib: Some(200) }, ..Preferences::default() }
+    }
+
+    fn update(auto_accept: Option<AutoAcceptFrom>, ask_above_mb: Option<u64>, no_size_limit: bool) -> preferences::Update {
+        settings_update(current(), None, None, auto_accept, ask_above_mb, no_size_limit).unwrap()
+    }
+
+    #[test]
+    fn asking_for_nothing_changes_nothing() {
+        assert_eq!(update(None, None, false), preferences::Update::default());
+    }
+
+    #[test]
+    fn changing_who_is_accepted_keeps_the_size_limit() {
+        let rule = update(Some(AutoAcceptFrom::PairedDevices), None, false).auto_accept.unwrap();
+        assert_eq!((rule.from, rule.ask_above_mib), (AutoAcceptFrom::PairedDevices, Some(200)));
+    }
+
+    #[test]
+    fn changing_the_size_limit_keeps_who_is_accepted() {
+        let rule = update(None, Some(50), false).auto_accept.unwrap();
+        assert_eq!((rule.from, rule.ask_above_mib), (AutoAcceptFrom::Mesh, Some(50)));
+    }
+
+    #[test]
+    fn removing_the_size_limit_keeps_who_is_accepted() {
+        let rule = update(None, None, true).auto_accept.unwrap();
+        assert_eq!((rule.from, rule.ask_above_mib), (AutoAcceptFrom::Mesh, None));
+    }
+
+    #[test]
+    fn an_empty_downloads_folder_is_passed_on_to_mean_the_default() {
+        let update = settings_update(current(), Some(PathBuf::new()), None, None, None, false).unwrap();
+        assert_eq!(update.downloads_dir, Some(PathBuf::new()));
+    }
+
+    #[test]
+    fn a_relative_downloads_folder_is_made_absolute() {
+        let update = settings_update(current(), Some(PathBuf::from("received")), None, None, None, false).unwrap();
+        assert!(update.downloads_dir.unwrap().is_absolute());
     }
 }
