@@ -34,7 +34,7 @@ function file(overrides: Partial<SharedFile>): SharedFile {
 }
 
 function device(overrides: Partial<Device>): Device {
-  return { id: 'device_a', name: 'Alex', nodeName: 'alex-laptop', kind: 'laptop', isSelf: false, latencyMs: null, ...overrides };
+  return { id: 'device_a', name: 'Alex', nodeName: 'alex-laptop', nodeId: 'node_a', kind: 'laptop', isSelf: false, latencyMs: null, ...overrides };
 }
 
 const offer: IncomingOffer = { fileId: 'file_a', fileName: 'holiday.jpg', sizeBytes: 10, senderName: 'Sam', senderId: 'device_s', isDirect: true };

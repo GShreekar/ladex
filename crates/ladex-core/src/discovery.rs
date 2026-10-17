@@ -13,7 +13,7 @@ use crate::mesh;
 use crate::NodeState;
 
 /// Administratively scoped IPv4 multicast address — never forwarded beyond LAN.
-const MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(239, 255, 42, 99);
+pub(crate) const MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(239, 255, 42, 99);
 
 /// Announce/listen interval.
 const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(2);
@@ -77,6 +77,21 @@ impl AnnouncePacket {
     }
 }
 
+/// A socket on the discovery port that has joined the multicast group, sharing the port with the nodes on this host.
+pub(crate) fn bind_probe_socket(discovery_port: u16) -> anyhow::Result<UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    sock.set_reuse_address(true)?;
+    #[cfg(unix)]
+    sock.set_reuse_port(true)?;
+    sock.set_nonblocking(true)?;
+    sock.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, discovery_port).into())?;
+
+    let socket = UdpSocket::from_std(sock.into())?;
+    socket.join_multicast_v4(MULTICAST_ADDR, Ipv4Addr::UNSPECIFIED)?;
+    Ok(socket)
+}
+
 /// Owns the multicast UDP socket and runs the announce and listen loops.
 pub struct DiscoveryService {
     socket: Arc<UdpSocket>,
@@ -86,16 +101,7 @@ pub struct DiscoveryService {
 impl DiscoveryService {
     /// Binds the multicast socket, with SO_REUSEADDR so several nodes can share one host.
     pub async fn bind(discovery_port: u16) -> anyhow::Result<Self> {
-        use socket2::{Domain, Protocol, Socket, Type};
-        let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-        sock.set_reuse_address(true)?;
-        #[cfg(unix)]
-        sock.set_reuse_port(true)?;
-        sock.set_nonblocking(true)?;
-        sock.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, discovery_port).into())?;
-
-        let socket = UdpSocket::from_std(sock.into())?;
-        socket.join_multicast_v4(MULTICAST_ADDR, Ipv4Addr::UNSPECIFIED)?;
+        let socket = bind_probe_socket(discovery_port)?;
         // Do NOT receive our own announces (defense-in-depth check still in listen_loop)
         socket.set_multicast_loop_v4(false)?;
         // TTL=1: never leave the local segment

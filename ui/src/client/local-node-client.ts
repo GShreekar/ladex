@@ -52,7 +52,7 @@ function loadNickname(): string {
   }
 }
 
-function saveNickname(nickname: string): void {
+export function saveNickname(nickname: string): void {
   try {
     localStorage.setItem(NICKNAME_KEY, nickname);
   } catch {
@@ -375,6 +375,7 @@ export class LocalNodeClient implements LadexClient {
       id: peer.session_id,
       name: this.deviceName(peer.session_id),
       nodeName: peer.hosting_node_name ?? '',
+      nodeId: peer.hosting_node_id ?? '',
       kind: deviceKindOf(peer.user_agent),
       isSelf: false,
       latencyMs: peer.node_rtt_ms ?? null,
@@ -383,6 +384,7 @@ export class LocalNodeClient implements LadexClient {
       id: this.sessionId,
       name: this.deviceName(this.sessionId),
       nodeName: this.peers.get(this.sessionId)?.hosting_node_name ?? '',
+      nodeId: this.peers.get(this.sessionId)?.hosting_node_id ?? this.status.node_id,
       kind: deviceKindOf(navigator.userAgent),
       isSelf: true,
       latencyMs: null,

@@ -140,3 +140,18 @@ async fn a_socket_the_node_ends_reports_that_it_closed() {
     while next_event(&mut events).await != SocketEvent::Closed {}
     assert!(bridge.send_to_socket(socket, "{}".into()).await.is_err());
 }
+
+#[tokio::test]
+async fn a_downloads_folder_chosen_later_is_where_the_next_file_goes() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = started(dir.path()).await;
+    let bridge = Bridge::new(node.local_link(), dir.path().join("downloads")).with_preferences(node.state().preferences.clone());
+    assert_eq!(bridge.downloads_folder(), dir.path().join("downloads"));
+
+    let chosen = dir.path().join("chosen");
+    let update = ladex_core::preferences::Update { downloads_dir: Some(chosen.clone()), ..Default::default() };
+    ladex_core::preferences::apply(node.state(), &update).unwrap();
+
+    assert_eq!(bridge.downloads_folder(), chosen);
+    node.shutdown().await;
+}

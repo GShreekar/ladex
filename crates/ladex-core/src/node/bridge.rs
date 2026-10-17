@@ -10,6 +10,8 @@ use hyper::Method;
 use serde::Serialize;
 use tokio::task::JoinHandle;
 
+use crate::preferences::PreferencesStore;
+
 use super::local::{LinkError, LocalLink, LocalUpload, SocketWriter};
 
 /// What the window sees of the room's WebSocket.
@@ -38,6 +40,7 @@ type Sockets = Arc<Mutex<HashMap<u64, OpenSocket>>>;
 pub struct Bridge {
     link: LocalLink,
     downloads: PathBuf,
+    preferences: Option<Arc<PreferencesStore>>,
     next_id: AtomicU64,
     uploads: Mutex<HashMap<u64, Arc<LocalUpload>>>,
     sockets: Sockets,
@@ -46,7 +49,19 @@ pub struct Bridge {
 impl Bridge {
     /// `downloads` is the folder that files the person saves are written into.
     pub fn new(link: LocalLink, downloads: PathBuf) -> Self {
-        Self { link, downloads, next_id: AtomicU64::new(1), uploads: Mutex::default(), sockets: Sockets::default() }
+        Self { link, downloads, preferences: None, next_id: AtomicU64::new(1), uploads: Mutex::default(), sockets: Sockets::default() }
+    }
+
+    /// Saves into the downloads folder the person chose, when they have chosen one.
+    pub fn with_preferences(mut self, preferences: Arc<PreferencesStore>) -> Self {
+        self.preferences = Some(preferences);
+        self
+    }
+
+    /// Where saved files go now: the chosen folder, else the one this bridge was made with.
+    pub fn downloads_folder(&self) -> PathBuf {
+        let chosen = self.preferences.as_ref().and_then(|preferences| preferences.get().downloads_dir);
+        chosen.unwrap_or_else(|| self.downloads.clone())
     }
 
     pub async fn request(&self, method: &str, path: &str, headers: &[(String, String)], body: String) -> Result<Reply, String> {
@@ -112,7 +127,7 @@ impl Bridge {
 
     /// Writes a file or folder archive from the node into the downloads folder; returns where it went.
     pub async fn save_download(&self, path: &str, file_name: &str) -> Result<String, LinkError> {
-        let saved = self.link.save_download(path, &self.downloads, file_name, |_| {}).await?;
+        let saved = self.link.save_download(path, &self.downloads_folder(), file_name, |_| {}).await?;
         Ok(saved.path.display().to_string())
     }
 }

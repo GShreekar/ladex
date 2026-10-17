@@ -5,10 +5,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, Wry};
-use tauri_plugin_autostart::ManagerExt as _;
 use tauri_plugin_opener::OpenerExt as _;
 
-use crate::{downloads_folder, WINDOW_LABEL};
+use crate::desktop::downloads_folder;
+use crate::{launch, WINDOW_LABEL};
 
 const OPEN_ID: &str = "open";
 const DOWNLOADS_ID: &str = "downloads";
@@ -18,6 +18,7 @@ const QUIT_ID: &str = "quit";
 /// Present only when the tray icon was created, which is what lets the window close into it.
 pub struct Tray {
     status: MenuItem<Wry>,
+    launch_at_login: CheckMenuItem<Wry>,
     has_explained_closing: AtomicBool,
 }
 
@@ -32,12 +33,11 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
     let status = MenuItem::with_id(app, "status", status_text(None), false, None::<&str>)?;
     let open = MenuItem::with_id(app, OPEN_ID, "Open LADEX", true, None::<&str>)?;
     let downloads = MenuItem::with_id(app, DOWNLOADS_ID, "Open Downloads Folder", true, None::<&str>)?;
-    let is_autostart_on = app.autolaunch().is_enabled().unwrap_or(false);
-    let autostart = CheckMenuItem::with_id(app, AUTOSTART_ID, "Launch at Login", true, is_autostart_on, None::<&str>)?;
+    let launch_at_login = CheckMenuItem::with_id(app, AUTOSTART_ID, "Launch at Login", true, launch::is_enabled(app), None::<&str>)?;
     let quit = MenuItem::with_id(app, QUIT_ID, "Quit LADEX", true, None::<&str>)?;
     let menu = Menu::with_items(
         app,
-        &[&status, &PredefinedMenuItem::separator(app)?, &open, &downloads, &autostart, &PredefinedMenuItem::separator(app)?, &quit],
+        &[&status, &PredefinedMenuItem::separator(app)?, &open, &downloads, &launch_at_login, &PredefinedMenuItem::separator(app)?, &quit],
     )?;
 
     let mut tray = TrayIconBuilder::with_id("main")
@@ -47,7 +47,7 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
         .on_menu_event(move |app, event| match event.id.as_ref() {
             OPEN_ID => show_main_window(app),
             DOWNLOADS_ID => open_downloads_folder(app),
-            AUTOSTART_ID => toggle_autostart(app, &autostart),
+            AUTOSTART_ID => toggle_launch_at_login(app),
             QUIT_ID => app.exit(0),
             _ => {}
         })
@@ -61,7 +61,7 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
     }
     tray.build(app)?;
 
-    app.manage(Tray { status, has_explained_closing: AtomicBool::new(false) });
+    app.manage(Tray { status, launch_at_login, has_explained_closing: AtomicBool::new(false) });
     Ok(())
 }
 
@@ -98,17 +98,16 @@ fn open_downloads_folder(app: &AppHandle) {
     }
 }
 
-fn toggle_autostart(app: &AppHandle, item: &CheckMenuItem<Wry>) {
-    let autolaunch = app.autolaunch();
-    let result = match autolaunch.is_enabled() {
-        Ok(true) => autolaunch.disable(),
-        _ => autolaunch.enable(),
-    };
-    if let Err(error) = result {
+fn toggle_launch_at_login(app: &AppHandle) {
+    if let Err(error) = launch::set_enabled(app, !launch::is_enabled(app)) {
         tracing::warn!("Could not change launching at login: {error}");
     }
-    // The system has the last word, so the tick shows what is really set.
-    let _ = item.set_checked(autolaunch.is_enabled().unwrap_or(false));
+}
+
+/// Makes the menu's tick show whether the app launches at login, whichever way that was changed.
+pub fn show_launch_at_login(app: &AppHandle, is_enabled: bool) {
+    let Some(tray) = app.try_state::<Tray>() else { return };
+    let _ = tray.launch_at_login.set_checked(is_enabled);
 }
 
 #[cfg(test)]

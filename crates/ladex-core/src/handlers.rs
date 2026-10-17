@@ -23,7 +23,7 @@ fn clearing_cookie(secure: bool) -> String {
     format!("auth=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict{}", cookie_attributes(secure))
 }
 
-fn json_error(message: &str, status: StatusCode) -> Box<dyn Reply> {
+pub(crate) fn json_error(message: &str, status: StatusCode) -> Box<dyn Reply> {
     Box::new(warp::reply::with_status(warp::reply::json(&AuthResponse { success: false, message: Some(message.to_string()) }), status))
 }
 
@@ -98,7 +98,7 @@ pub async fn logout(auth_cookie: Option<String>, peer: Option<PeerAddr>, state: 
 }
 
 // The machine running LADEX manages every device; any other device only its own session.
-fn can_manage(peer: Option<PeerAddr>) -> bool {
+pub(crate) fn can_manage(peer: Option<PeerAddr>) -> bool {
     peer_ip(peer).is_loopback()
 }
 

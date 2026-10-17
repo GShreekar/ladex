@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::guest::{self, Permission};
+use crate::preferences;
 use crate::receive::{self, ReceiveRoot};
 use crate::store::CHUNK_SIZE;
 use crate::types::{FileView, NodeId, PeerInfo, SessionId};
@@ -56,6 +57,11 @@ pub enum Request {
         permission: Permission,
     },
     Status,
+    /// Shows the preferences, after applying `update` if there is one.
+    Preferences {
+        #[serde(default)]
+        update: Option<preferences::Update>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,6 +105,7 @@ pub enum Reply {
     Devices { devices: Vec<Device>, nodes: Vec<Node> },
     Invite(Invite),
     Status(Box<Status>),
+    Preferences(Box<preferences::View>),
 }
 
 /// A browser or command-line device on the mesh.
@@ -174,6 +181,8 @@ pub struct Settings {
     /// None when discovery is switched off.
     pub discovery_port: Option<u16>,
     pub local_http_port: Option<u16>,
+    /// Whether the node's secrets live in the OS keychain, when there is one.
+    pub use_keychain: bool,
 }
 
 /// The command stopped listening, so there is nobody to finish the work for.
@@ -231,6 +240,12 @@ async fn run(state: &NodeState, settings: &Settings, request: Request, events: &
         Request::Devices => Ok(Reply::Devices { devices: devices(state).await, nodes: nodes(state).await }),
         Request::Invite { permission } => Ok(Reply::Invite(invite(state, permission))),
         Request::Status => Ok(Reply::Status(Box::new(status(state, settings).await))),
+        Request::Preferences { update } => {
+            if let Some(update) = update {
+                preferences::apply(state, &update)?;
+            }
+            Ok(Reply::Preferences(Box::new(preferences::view(state))))
+        }
     }
 }
 
@@ -330,7 +345,7 @@ fn invite(state: &NodeState, permission: Permission) -> Invite {
     }
 }
 
-async fn status(state: &NodeState, settings: &Settings) -> Status {
+pub(crate) async fn status(state: &NodeState, settings: &Settings) -> Status {
     Status {
         version: VERSION.to_string(),
         node_id: state.node_id.clone(),

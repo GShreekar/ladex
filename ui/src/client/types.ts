@@ -6,6 +6,8 @@ export interface Device {
   id: string;
   name: string;
   nodeName: string;
+  // The node the device is connected to; devices of one node share it.
+  nodeId: string;
   kind: DeviceKind;
   isSelf: boolean;
   latencyMs: number | null;

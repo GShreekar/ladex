@@ -79,9 +79,9 @@ struct Args {
     #[arg(long, default_value = "60")]
     stall_timeout_secs: u64,
 
-    /// Most disk space, in GiB, that shared files may use on this node.
-    #[arg(long, default_value = "20")]
-    storage_limit_gb: u64,
+    /// Most disk space, in GiB, that shared files may use on this node. Default: the limit set in the app or with `ladex settings`, else 20.
+    #[arg(long)]
+    storage_limit_gb: Option<u64>,
 
     /// How long a browser guest stays signed in after joining.
     #[arg(long, default_value = "8")]
@@ -118,12 +118,14 @@ async fn run_node(args: Args, data_dir: PathBuf) {
     tracing_subscriber::fmt::init();
 
     let passphrase = resolve_passphrase(&args);
-    let config = node_config(&args, data_dir, passphrase.clone());
+    let mut config = node_config(&args, data_dir, passphrase);
+    apply_saved(&mut config, &args);
+    let has_passphrase = config.passphrase.is_some();
     let mut handle = match Node::start(config).await {
         Ok(handle) => handle,
         Err(error) => exit_with_start_error(&error).await,
     };
-    print_startup(&handle, &args, passphrase.is_some());
+    print_startup(&handle, has_passphrase);
 
     tokio::select! {
         result = handle.wait() => {
@@ -138,7 +140,22 @@ async fn run_node(args: Args, data_dir: PathBuf) {
     }
 }
 
-/// The passphrase to run with: generated for --secure, otherwise the one given, with a warning if it is weak or missing.
+/// What the app or `ladex settings` saved in the data folder fills in what the command line leaves out.
+fn apply_saved(config: &mut NodeConfig, args: &Args) {
+    match config.use_saved_passphrase() {
+        Ok(true) => println!("Using the passphrase saved in {}", config.data_dir.display()),
+        Ok(false) => {}
+        Err(e) => {
+            eprintln!("Error: {e:#}");
+            std::process::exit(1);
+        }
+    }
+    if args.storage_limit_gb.is_none() {
+        config.use_saved_storage_limit();
+    }
+}
+
+/// The passphrase to run with: generated for --secure, otherwise the one given, with a warning if it is weak.
 fn resolve_passphrase(args: &Args) -> Option<String> {
     let passphrase = if args.secure {
         let generated = auth::generate_passphrase();
@@ -157,10 +174,7 @@ fn resolve_passphrase(args: &Args) -> Option<String> {
                 eprintln!("Warning: this passphrase is weak ({reason}). Prefer `ladex -s` for a generated one.");
             }
         }
-        None => eprintln!(
-            "Warning: no passphrase set — any device on this network can open the web UI and join the mesh. \
-             Use `ladex -s` to generate one."
-        ),
+        None => {}
     }
     passphrase
 }
@@ -176,7 +190,9 @@ fn node_config(args: &Args, data_dir: PathBuf, passphrase: Option<String>) -> No
     config.manual_peers = parse_manual_peers(&args.manual_peers);
     config.use_tls = !args.no_tls;
     config.use_keychain = !args.no_keychain;
-    config.storage_limit_bytes = args.storage_limit_gb.saturating_mul(1 << 30);
+    if let Some(gib) = args.storage_limit_gb {
+        config.storage_limit_bytes = gib.saturating_mul(1 << 30);
+    }
     config.stall_timeout = std::time::Duration::from_secs(args.stall_timeout_secs);
     config.guest_session_ttl = std::time::Duration::from_secs(args.guest_session_hours * 60 * 60);
     config
@@ -231,8 +247,15 @@ fn describe_notice(notice: &Notice) -> String {
     }
 }
 
-fn print_startup(handle: &NodeHandle, args: &Args, has_passphrase: bool) {
+fn print_startup(handle: &NodeHandle, has_passphrase: bool) {
     let info = handle.info();
+    let storage_limit_gib = handle.state().store.quota() >> 30;
+    if !has_passphrase {
+        eprintln!(
+            "Warning: no passphrase set — any device on this network can open the web UI and join the mesh. \
+             Use `ladex -s` to generate one, or set one in the app."
+        );
+    }
     for notice in &info.notices {
         eprintln!("{}", describe_notice(notice));
     }
@@ -242,7 +265,7 @@ fn print_startup(handle: &NodeHandle, args: &Args, has_passphrase: bool) {
              encrypted QUIC, and the passphrase itself is never sent."
         );
     }
-    println!("Shared files are kept in {} (up to {} GiB)", info.data_dir.display(), args.storage_limit_gb);
+    println!("Shared files are kept in {} (up to {} GiB)", info.data_dir.display(), storage_limit_gib);
     if info.imported_legacy_files > 0 {
         println!("Listed {} file(s) shared by an earlier version in the signed catalog", info.imported_legacy_files);
     }

@@ -11,6 +11,7 @@ import type {
 } from '../client/types';
 import { TransferError } from '../client/types';
 import { saveViaBrowser } from './save';
+import type { AutoAccept } from './auto-accept';
 import type { Notifier } from './notifier';
 import type { Toasts } from './toasts.svelte';
 
@@ -30,6 +31,7 @@ export class Room {
     readonly client: LadexClient,
     private readonly toasts: Toasts,
     private readonly notifier?: Pick<Notifier, 'downloadSaved'>,
+    private readonly autoAccept?: Pick<AutoAccept, 'shouldAccept'>,
   ) {
     this.stopListening = client.subscribe((event) => this.apply(event));
   }
@@ -87,6 +89,13 @@ export class Room {
     this.notifier?.downloadSaved(ticket.filename);
   }
 
+  // A file the person's rules accept is saved at once; any other is put to them.
+  private async receive(offer: IncomingOffer): Promise<void> {
+    const isAccepted = await this.autoAccept?.shouldAccept(offer, this.devices).catch(() => false);
+    if (isAccepted) await this.answerOffer(offer, true);
+    else this.offers.push(offer);
+  }
+
   private apply(event: ClientEvent): void {
     switch (event.type) {
       case 'connection':
@@ -105,7 +114,7 @@ export class Room {
         this.messages = event.messages;
         break;
       case 'offer':
-        this.offers.push(event.offer);
+        void this.receive(event.offer);
         break;
       case 'no-peers':
         this.hasNoPeersWarning = true;

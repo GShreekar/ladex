@@ -5,6 +5,7 @@
   import DropOverlay from './DropOverlay.svelte';
   import FilesPage from './pages/FilesPage.svelte';
   import GuestsPage from './pages/GuestsPage.svelte';
+  import NetworkPage from './pages/NetworkPage.svelte';
   import OfferDialog from './OfferDialog.svelte';
   import SettingsPage from './pages/SettingsPage.svelte';
   import { shell, type Page } from './shell-state.svelte';
@@ -18,6 +19,7 @@
     { page: 'files', label: 'Shared files', icon: 'files' },
     { page: 'transfers', label: 'Transfers', icon: 'swap', badge: transfers.active.length },
     ...(room.capabilities.canManageGuests ? [{ page: 'guests' as const, label: 'Guests', icon: 'users' as const }] : []),
+    ...(room.capabilities.canManageGuests ? [{ page: 'network' as const, label: 'Network', icon: 'wifi' as const }] : []),
     { page: 'settings', label: 'Settings', icon: 'settings' },
   ]);
 
@@ -82,6 +84,8 @@
         <TransfersPage />
       {:else if shell.page === 'guests' && room.capabilities.canManageGuests}
         <GuestsPage />
+      {:else if shell.page === 'network' && room.capabilities.canManageGuests}
+        <NetworkPage />
       {:else}
         <SettingsPage />
       {/if}

@@ -615,7 +615,7 @@ struct Registry {
 
 pub struct Store {
     layout: Layout,
-    quota: u64,
+    quota: AtomicU64,
     index: Arc<Index>,
     registry: Mutex<Registry>,
 }
@@ -634,7 +634,7 @@ impl Store {
         }
         rehash::migrate(&layout, &index)?;
 
-        let store = Self { layout, quota, index, registry: Mutex::new(Registry { blobs: HashMap::new(), used: 0 }) };
+        let store = Self { layout, quota: AtomicU64::new(quota), index, registry: Mutex::new(Registry { blobs: HashMap::new(), used: 0 }) };
         store.load_records()?;
         store.remove_unrecorded_files()?;
         Ok(store)
@@ -783,7 +783,12 @@ impl Store {
     }
 
     pub fn quota(&self) -> u64 {
-        self.quota
+        self.quota.load(Ordering::Relaxed)
+    }
+
+    /// Changes how much the store may hold from now on; files already stored are kept whatever the new limit.
+    pub fn set_quota(&self, quota: u64) {
+        self.quota.store(quota, Ordering::Relaxed);
     }
 
     /// The existing file with this id and size (to resume), or a new empty one this node published.
@@ -802,7 +807,7 @@ impl Store {
         if let Some(existing) = registry.blobs.get(id) {
             return if existing.size == size { Ok(existing.clone()) } else { Err(StoreError::SizeMismatch) };
         }
-        if registry.used.saturating_add(size) > self.quota {
+        if registry.used.saturating_add(size) > self.quota() {
             return Err(StoreError::QuotaExceeded);
         }
         if lacks_free_space(&self.layout.root, size) {
@@ -883,7 +888,7 @@ impl Store {
                     last_access_ms: blob.last_access_ms.load(Ordering::Relaxed),
                 })
                 .collect();
-            let victims = evict::pick_victims(candidates, registry.used, self.quota.saturating_sub(extra));
+            let victims = evict::pick_victims(candidates, registry.used, self.quota().saturating_sub(extra));
             victims.iter().filter_map(|id| self.detach(&mut registry, id)).collect()
         };
         for blob in &evicted {

@@ -5,7 +5,8 @@ import { LocalNodeClient } from '../client/local-node-client';
 import type { NodeTransport } from '../client/transport';
 import type { LadexClient } from '../client/types';
 import { contextFor } from '../state/context';
-import { tauriDesktop } from '../desktop/desktop';
+import { tauriDesktop, tauriSettings, tauriSetup } from '../desktop/desktop';
+import { AutoAccept } from '../state/auto-accept';
 import { Notifier } from '../state/notifier';
 import { Room } from '../state/room.svelte';
 import { Toasts } from '../state/toasts.svelte';
@@ -13,6 +14,8 @@ import { Transfers } from '../state/transfers.svelte';
 import '../styles/base.css';
 import App from './App.svelte';
 import { GuestsApi } from './guests-api';
+import { PreferencesApi } from './preferences-api';
+import SetupWizard from './SetupWizard.svelte';
 import type { HostContext } from './host-context';
 
 interface HostServices {
@@ -37,13 +40,33 @@ async function connectToNode(): Promise<HostServices> {
   return { client: new LocalNodeClient(transport), transport };
 }
 
-const { client, transport } = await connectToNode();
-const toasts = new Toasts();
-const notifier = isShownByTheApp() ? new Notifier(client, tauriDesktop) : undefined;
-const context: HostContext = {
-  room: new Room(client, toasts, notifier),
-  transfers: new Transfers(client, toasts),
-  toasts,
-  guestsApi: new GuestsApi(transport),
-};
-mount(App, { target: document.getElementById('app') as HTMLElement, context: contextFor(context) });
+const target = document.getElementById('app') as HTMLElement;
+
+// A first run has no node yet: the wizard collects the choices the node starts with.
+async function showWizardIfNeeded(): Promise<boolean> {
+  if (!isShownByTheApp()) return false;
+  const state = await tauriSetup.state();
+  if (!state.isNeeded) return false;
+  mount(SetupWizard, { target, props: { setup: tauriSetup, pickFolder: tauriSettings.pickFolder, state } });
+  return true;
+}
+
+if (!(await showWizardIfNeeded())) {
+  const { client, transport } = await connectToNode();
+  const toasts = new Toasts();
+  const preferencesApi = new PreferencesApi(transport);
+  const notifier = isShownByTheApp() ? new Notifier(client, tauriDesktop) : undefined;
+  // Only the person at the node's machine has rules for what is saved without asking.
+  const autoAccept = client.capabilities.canManageGuests
+    ? new AutoAccept({ rule: async () => (await preferencesApi.get()).preferences.auto_accept, pairedNodeIds: () => preferencesApi.pairedNodeIds() })
+    : undefined;
+  const context: HostContext = {
+    room: new Room(client, toasts, notifier, autoAccept),
+    transfers: new Transfers(client, toasts),
+    toasts,
+    guestsApi: new GuestsApi(transport),
+    preferencesApi,
+    desktop: isShownByTheApp() ? tauriSettings : null,
+  };
+  mount(App, { target, context: contextFor(context) });
+}

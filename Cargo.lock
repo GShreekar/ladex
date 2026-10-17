@@ -2677,8 +2677,10 @@ dependencies = [
 name = "ladex-app"
 version = "3.0.0-beta.2"
 dependencies = [
+ "anyhow",
  "include_dir",
  "ladex-core",
+ "serde",
  "tauri",
  "tauri-build",
  "tauri-plugin-autostart",

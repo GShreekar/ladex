@@ -252,6 +252,7 @@ export class GuestClient implements LadexClient {
       id: device.id,
       name: device.name || `Device ${device.id.slice(-6)}`,
       nodeName: device.node_name,
+      nodeId: device.node_id,
       kind: 'unknown',
       isSelf: false,
       latencyMs: null,
