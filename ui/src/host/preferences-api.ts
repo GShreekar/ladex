@@ -64,6 +64,10 @@ export class PreferencesApi {
     return this.call<PreferencesView>('PUT', '/api/passphrase', { passphrase });
   }
 
+  async currentPassphrase(): Promise<string | null> {
+    return (await this.call<{ passphrase: string | null }>('GET', '/api/passphrase')).passphrase;
+  }
+
   async suggestPassphrase(): Promise<string> {
     return (await this.call<{ passphrase: string }>('GET', '/api/passphrase/suggestion')).passphrase;
   }

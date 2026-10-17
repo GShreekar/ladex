@@ -212,13 +212,15 @@ fn settings_routes(state: NodeState) -> impl Filter<Extract = (impl warp::Reply,
         .and(warp::body::json())
         .and(request_context(state.clone()))
         .and_then(settings_api::change_passphrase);
+    let current_passphrase =
+        warp::path!("api" / "passphrase").and(warp::get()).and(request_context(state.clone())).and_then(settings_api::show_passphrase);
     let suggestion = warp::path!("api" / "passphrase" / "suggestion")
         .and(warp::get())
         .and(with_api_auth(state.clone()))
         .and(warp::ext::optional::<server::PeerAddr>())
         .and_then(settings_api::suggest_passphrase);
     let doctor = warp::path!("api" / "doctor").and(warp::get()).and(request_context(state)).and_then(settings_api::diagnose);
-    get.or(update).or(passphrase).or(suggestion).or(doctor)
+    get.or(update).or(passphrase).or(current_passphrase).or(suggestion).or(doctor)
 }
 
 fn page_routes(state: NodeState, ui: &WebUi) -> impl Filter<Extract = (impl warp::Reply,), Error = warp::Rejection> + Clone {

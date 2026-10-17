@@ -77,16 +77,20 @@
 </script>
 
 {#if room.hasNoPeersWarning}
-  <div class="banner" role="alert">
-    <Icon name="wifi-off" size={22} />
+  <div class="banner" role="status">
+    <Icon name="info" size={22} />
     <div>
-      <strong>No other LADEX devices found on this network.</strong>
+      <strong>This is the only computer running LADEX on this network so far.</strong>
       <p class="small">
-        Check that every device is on the same Wi-Fi, that AP/client isolation is off on the router (common on guest
-        networks and phone hotspots), and that a firewall isn't blocking LADEX's ports.
+        Phones and other browsers can still join as guests with a QR code. If LADEX is running on another computer too,
+        check that both are on the same Wi-Fi, that client isolation is off on the router (common on guest networks and
+        phone hotspots), and that a firewall isn't blocking LADEX.
       </p>
       {#if room.capabilities.canManageGuests}
-        <button class="btn btn-small" onclick={() => shell.go('network')}><Icon name="wifi" size={15} /> Check the network</button>
+        <div class="banner-actions">
+          <button class="btn btn-small" onclick={() => shell.go('guests')}><Icon name="qr" size={15} /> Invite a phone</button>
+          <button class="btn btn-small" onclick={() => shell.go('network')}><Icon name="wifi" size={15} /> Check the network</button>
+        </div>
       {/if}
     </div>
     <button class="btn btn-ghost btn-icon" aria-label="Dismiss" onclick={() => room.dismissNoPeersWarning()}><Icon name="x" /></button>
@@ -170,13 +174,19 @@
     margin-bottom: 16px;
     padding: 14px 16px;
     border-radius: var(--radius-md);
-    background: var(--warning-tint);
-    color: var(--warning);
+    background: var(--accent-tint);
+    color: var(--on-accent-tint);
   }
 
   .banner > div {
     flex: 1;
     color: var(--text);
+  }
+
+  .banner-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
   }
 
   .start {

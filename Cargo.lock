@@ -2659,7 +2659,7 @@ dependencies = [
 
 [[package]]
 name = "ladex"
-version = "3.0.0-beta.2"
+version = "3.0.0-rc.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -2675,7 +2675,7 @@ dependencies = [
 
 [[package]]
 name = "ladex-app"
-version = "3.0.0-beta.2"
+version = "3.0.0-rc.1"
 dependencies = [
  "anyhow",
  "include_dir",
@@ -2694,7 +2694,7 @@ dependencies = [
 
 [[package]]
 name = "ladex-core"
-version = "3.0.0-beta.2"
+version = "3.0.0-rc.1"
 dependencies = [
  "anyhow",
  "blake3",

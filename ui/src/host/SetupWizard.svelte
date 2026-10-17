@@ -32,6 +32,7 @@
   let isWorking = $state(false);
   let failure = $state<string | null>(null);
   let shouldLaunchAtLogin = $state(false);
+  let copyState = $state<'idle' | 'copied' | 'failed'>('idle');
   // What the machine offered when the wizard opened is only the starting point of the answers.
   let answers = $state<SetupAnswers>(
     untrack(() => ({
@@ -50,6 +51,16 @@
 
   async function remakePassphrase(): Promise<void> {
     answers.createdPassphrase = await setup.suggestPassphrase();
+    copyState = 'idle';
+  }
+
+  async function copyPassphrase(): Promise<void> {
+    try {
+      await navigator.clipboard.writeText(answers.createdPassphrase);
+      copyState = 'copied';
+    } catch {
+      copyState = 'failed';
+    }
   }
 
   async function chooseFolder(): Promise<void> {
@@ -118,14 +129,20 @@
         <div class="passphrase">
           <span class="small faint">YOUR PASSPHRASE</span>
           <strong class="code">{answers.createdPassphrase}</strong>
-          <button type="button" class="btn btn-small" onclick={remakePassphrase}><Icon name="refresh" size={15} /> Make another</button>
+          <div class="row">
+            <button type="button" class="btn btn-small" onclick={copyPassphrase}>
+              <Icon name={copyState === 'copied' ? 'check' : 'copy'} size={15} /> {copyState === 'copied' ? 'Copied' : 'Copy'}
+            </button>
+            <button type="button" class="btn btn-small" onclick={remakePassphrase}><Icon name="refresh" size={15} /> Make another</button>
+          </div>
+          {#if copyState === 'failed'}<span class="small faint">Could not copy. Select it and copy it by hand.</span>{/if}
         </div>
-        <p class="small muted">Write it down or keep this window’s copy: you type it on each device you add. Anyone who has it can join, so share it only with people you trust.</p>
+        <p class="small muted">You type it on each computer you add to the mesh; you can see it again later in Settings. Phones don’t need it: they join by scanning a QR code. Anyone who has it can join, so share it only with people you trust.</p>
       {:else}
         <label class="field">
           <span class="label">Passphrase of the mesh</span>
           <input class="input code-input" bind:value={answers.joinedPassphrase} autocomplete="off" spellcheck="false" placeholder="Shown on the device that started it" />
-          <span class="small faint">Find it in Settings on a device that is already part of the mesh.</span>
+          <span class="small faint">On a computer already in the mesh, open Settings and choose Show passphrase.</span>
         </label>
       {/if}
     {:else if step === 'files'}

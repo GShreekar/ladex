@@ -39,6 +39,8 @@
   }
 
   onMount(() => {
+    // Whoever opens this page has come to invite someone, so the QR code is there without another click.
+    void invite();
     void refresh();
     const timer = setInterval(refresh, REFRESH_MS);
     return () => clearInterval(timer);
@@ -58,6 +60,13 @@
     } finally {
       isIssuing = false;
     }
+  }
+
+  // The QR code on screen must grant what is selected, or the guest would join with the wrong permission.
+  function choosePermission(option: GuestPermission): void {
+    if (option === permission) return;
+    permission = option;
+    void invite();
   }
 
   async function signOut(guest: GuestSummary): Promise<void> {
@@ -104,7 +113,7 @@
 
     <div class="roles" role="radiogroup" aria-label="What the guest may do">
       {#each permissions as option (option)}
-        <button role="radio" aria-checked={permission === option} class:active={permission === option} onclick={() => (permission = option)}>
+        <button role="radio" aria-checked={permission === option} class:active={permission === option} onclick={() => choosePermission(option)}>
           {PERMISSION_LABELS[option]}
         </button>
       {/each}

@@ -21,6 +21,11 @@ struct Suggestion {
 }
 
 #[derive(Serialize)]
+struct CurrentPassphrase {
+    passphrase: Option<String>,
+}
+
+#[derive(Serialize)]
 struct Diagnosis {
     checks: Vec<doctor::Check>,
 }
@@ -59,6 +64,12 @@ pub async fn change_passphrase(request: NewPassphrase, peer: Option<PeerAddr>, s
         Ok(()) => Ok(reply_with_view(&state)),
         Err(e) => Ok(json_error(&format!("{e:#}"), StatusCode::BAD_REQUEST)),
     }
+}
+
+/// The passphrase the running node uses, so the person at its machine can add another computer to the mesh.
+pub async fn show_passphrase(peer: Option<PeerAddr>, state: NodeState) -> Result<Box<dyn Reply>, Rejection> {
+    let current = CurrentPassphrase { passphrase: state.passphrase.as_deref().map(String::from) };
+    Ok(host_only(peer).unwrap_or_else(|| Box::new(warp::reply::json(&current))))
 }
 
 pub async fn suggest_passphrase(peer: Option<PeerAddr>) -> Result<Box<dyn Reply>, Rejection> {
@@ -108,6 +119,17 @@ mod tests {
             change_passphrase(NewPassphrase { passphrase: "new-one".into() }, lan_peer(), state.clone()).await.unwrap().into_response();
         assert_eq!(reply.status(), StatusCode::FORBIDDEN);
         assert!(!state.preferences.needs_restart());
+    }
+
+    #[tokio::test]
+    async fn only_this_machine_can_see_the_passphrase() {
+        let state = NodeState::for_tests(Some("correct-horse"));
+        let refused = show_passphrase(lan_peer(), state.clone()).await.unwrap().into_response();
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+
+        let shown = show_passphrase(this_machine(), state).await.unwrap().into_response();
+        let body = http_body_util::BodyExt::collect(shown.into_body()).await.unwrap().to_bytes();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["passphrase"], "correct-horse");
     }
 
     #[tokio::test]

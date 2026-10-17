@@ -1,5 +1,6 @@
 <script lang="ts">
   import { TransferError } from '../../client/types';
+  import CopyButton from '../../components/CopyButton.svelte';
   import Icon from '../../components/Icon.svelte';
   import { useHost } from '../host-context';
   import type { PreferencesView } from '../preferences-api';
@@ -11,6 +12,19 @@
   let isChanging = $state(false);
   let draft = $state('');
   let isRestarting = $state(false);
+  let shown = $state<string | null>(null);
+
+  async function toggleShown(): Promise<void> {
+    if (shown !== null) {
+      shown = null;
+      return;
+    }
+    try {
+      shown = (await preferencesApi.currentPassphrase()) ?? '';
+    } catch (error) {
+      toasts.show('error', error instanceof TransferError ? error.message : 'Could not read the passphrase.');
+    }
+  }
 
   async function suggest(): Promise<void> {
     try {
@@ -82,11 +96,45 @@
     </form>
     <p class="small faint">Other devices will need the new passphrase to join. Changing it does not disconnect them until they restart.</p>
   {:else}
-    <div><button class="btn" onclick={startChanging}>Change passphrase…</button></div>
+    {#if shown}
+      <div class="current">
+        <code>{shown}</code>
+        <CopyButton text={shown} label="Copy the passphrase" />
+      </div>
+      <p class="small faint">Type it on the computer you are adding. Phones join by QR code instead.</p>
+    {/if}
+    <div class="buttons">
+      {#if view.has_passphrase}
+        <button class="btn" onclick={toggleShown}><Icon name="lock" size={16} /> {shown ? 'Hide passphrase' : 'Show passphrase'}</button>
+      {/if}
+      <button class="btn" onclick={startChanging}>Change passphrase…</button>
+    </div>
   {/if}
 </section>
 
 <style>
+  .current {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 12px;
+    border-radius: var(--radius-sm);
+    background: var(--surface-low);
+  }
+
+  .current code {
+    flex: 1;
+    font-size: 16px;
+    letter-spacing: 0.05em;
+    word-break: break-all;
+  }
+
+  .buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
   section {
     display: flex;
     flex-direction: column;
