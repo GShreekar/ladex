@@ -40,6 +40,7 @@ export interface TusUploadOptions {
   file: File;
   signal: AbortSignal;
   onProgress: (bytesSent: number) => void;
+  onCreated?: (location: string) => void;
   pause?: (milliseconds: number) => Promise<void>;
 }
 
@@ -57,6 +58,7 @@ export async function runTusUpload(wire: TusWire, options: TusUploadOptions): Pr
   const pause = options.pause ?? sleep;
 
   const created = await wire.create(file.size, file.name, file.type || 'application/octet-stream');
+  options.onCreated?.(created.location);
   let state = created.state;
   let offset = 0;
   let failures = 0;

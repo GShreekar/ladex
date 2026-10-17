@@ -71,6 +71,26 @@ pub async fn unpublish(state: &NodeState, file_id: &str) -> Result<Remove, Unpub
     Ok(remove)
 }
 
+/// Takes down several files at once, telling the mesh and the tabs once; returns the ids taken down.
+pub async fn unpublish_all(state: &NodeState, file_ids: &[String]) -> Vec<String> {
+    let mut removes = Vec::new();
+    let mut taken_down = Vec::new();
+    for id in file_ids {
+        if let Ok(remove) = state.catalog.unpublish(&state.identity, &state.clock, id) {
+            removes.push(Op::Remove(remove));
+            taken_down.push(id.clone());
+        }
+    }
+    if taken_down.is_empty() {
+        return taken_down;
+    }
+    for batch in removes.chunks(MAX_OPS_PER_MESSAGE) {
+        push(state, batch.to_vec()).await;
+    }
+    state::catalog_changed(state, &taken_down).await;
+    taken_down
+}
+
 async fn push(state: &NodeState, ops: Vec<Op>) {
     let peers = state.mesh_peers.read().await;
     for handle in peers.values() {

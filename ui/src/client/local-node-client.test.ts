@@ -116,7 +116,73 @@ describe('LocalNodeClient', () => {
     socket.deliver({ type: 'peer_joined', peer: { session_id: 'peer_x', hosting_node_id: 'node_b', hosting_node_name: 'Daniel’s laptop' }, total_peers: 2 });
     socket.deliver({ type: 'file_list_update', files: [wireFile()] });
     const [file] = lastOf(events, 'files').files as [SharedFile];
-    expect(file.holderNames).toEqual(['node node_a', 'Daniel’s laptop']);
+    expect(file.holderNames).toEqual(['node node_a (this node)', 'Daniel’s laptop']);
+  });
+
+  it('marks a file this device shared as its own, so it is not offered as a download', async () => {
+    const { socket, events } = await startClient();
+    const self = socket.sent[0]?.session_id as string;
+    socket.deliver({ type: 'file_list_update', files: [wireFile({ uploader_id: self, uploader_node: 'node_a' }), wireFile({ id: 'file_b' })] });
+    const [own, other] = lastOf(events, 'files').files as [SharedFile, SharedFile];
+    expect([own.isOwn, own.sharedBy, own.canUnshare]).toEqual([true, 'You', true]);
+    expect(other.isOwn).toBe(false);
+  });
+
+  it('counts a file shared from this machine’s command line as its own only on that machine', async () => {
+    const shared = wireFile({ uploader_id: '', uploader_node: 'node_a' });
+    const host = await startClient(true);
+    host.socket.deliver({ type: 'file_list_update', files: [shared] });
+    expect(lastOf(host.events, 'files').files[0]?.isOwn).toBe(true);
+
+    const visitor = await startClient(false);
+    visitor.socket.deliver({ type: 'file_list_update', files: [shared] });
+    expect(lastOf(visitor.events, 'files').files[0]?.isOwn).toBe(false);
+  });
+
+  it('keeps crediting a file to the device that shared it after that device leaves', async () => {
+    const { socket, events } = await startClient();
+    socket.deliver({ type: 'peer_joined', peer: { session_id: 'peer_other', nickname: 'Sam', hosting_node_id: 'node_b', hosting_node_name: 'b' }, total_peers: 2 });
+    socket.deliver({ type: 'peer_left', session_id: 'peer_other', total_peers: 1 });
+    socket.deliver({ type: 'file_list_update', files: [wireFile()] });
+    expect(lastOf(events, 'files').files[0]?.sharedBy).toBe('Sam');
+  });
+
+  it('shows a folder whose parts are spread over several nodes as available', async () => {
+    const { socket, events } = await startClient();
+    socket.deliver({ type: 'file_list_update', files: [wireFile({ is_folder: true, hosts: [], available: true })] });
+    expect(lastOf(events, 'files').files[0]).toMatchObject({ isAvailable: true, holderNames: [] });
+  });
+
+  it('gives one notice when a folder is unshared, naming it', async () => {
+    const { socket, events } = await startClient();
+    const folder = wireFile({ id: 'folder_1', name: 'Photos', is_folder: true });
+    const inside = [wireFile({ id: 'file_1', parent: 'folder_1' }), wireFile({ id: 'file_2', parent: 'folder_1' })];
+    socket.deliver({ type: 'file_list_update', files: [folder, ...inside] });
+    socket.deliver({ type: 'file_list_update', files: [] });
+    for (const id of ['file_1', 'folder_1', 'file_2']) socket.deliver({ type: 'file_removed', file_id: id });
+    const notices = events.filter((event) => event.type === 'notice').map((event) => event.notice.text);
+    expect(notices).toEqual(['"Photos" is no longer shared']);
+  });
+
+  it('confirms an unshare once even for a folder with files in it', async () => {
+    const { client, socket, events } = await startClient();
+    const folder = wireFile({ id: 'folder_1', name: 'Photos', is_folder: true });
+    socket.deliver({ type: 'file_list_update', files: [folder, wireFile({ id: 'file_1', parent: 'folder_1' })] });
+    client.unshare(lastOf(events, 'files').files[0] as SharedFile);
+    socket.deliver({ type: 'file_list_update', files: [] });
+    socket.deliver({ type: 'file_removed', file_id: 'file_1' });
+    socket.deliver({ type: 'file_removed', file_id: 'folder_1' });
+    const notices = events.filter((event) => event.type === 'notice').map((event) => event.notice.text);
+    expect(notices).toEqual(['Unshared Photos']);
+  });
+
+  it('does not offer a file to the device that shared it', async () => {
+    const { client, socket, events } = await startClient();
+    socket.deliver({ type: 'file_list_update', files: [wireFile()] });
+    const sharer = { id: 'peer_other', name: 'Sam', nodeName: 'b', nodeId: 'node_b', kind: 'laptop' as const, isSelf: false, latencyMs: null };
+    client.offerFile(lastOf(events, 'files').files[0] as SharedFile, sharer);
+    expect(socket.sent.some((message) => message.type === 'offer_file_to')).toBe(false);
+    expect(lastOf(events, 'notice').notice.text).toBe('Sam shared "slides.pdf", so it already has it');
   });
 
   it('marks a file with no holders as unavailable', async () => {

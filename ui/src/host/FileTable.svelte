@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { formatAgo, formatBytes } from '../client/format';
+  import { describeHolders, formatAgo, formatBytes } from '../client/format';
   import type { SharedFile } from '../client/types';
   import { iconFor } from '../components/file-icon';
   import Icon from '../components/Icon.svelte';
@@ -12,6 +12,11 @@
 
   function describe(file: SharedFile): string {
     return file.isFolder ? `Folder · ${file.folderFileCount} file${file.folderFileCount === 1 ? '' : 's'}` : file.mimeType;
+  }
+
+  function holdersTitle(file: SharedFile): string {
+    if (file.holderNames.length === 0) return 'No single node has all of it; it is fetched from several';
+    return `Whole copies on ${file.holderNames.join(', ')}`;
   }
 
   function startDrag(event: DragEvent, file: SharedFile): void {
@@ -54,9 +59,9 @@
             <td class="hide-narrow nowrap">{file.sharedBy}</td>
             <td>
               {#if file.isAvailable}
-                <span class="badge badge-success" title={file.holderNames.join(', ')}>
+                <span class="badge badge-success" title={holdersTitle(file)}>
                   <Icon name="hub" size={13} />
-                  {file.holderNames.length} {file.holderNames.length === 1 ? 'device has' : 'devices have'} it
+                  {describeHolders(file.holderNames.length, true)}
                 </span>
               {:else}
                 <span class="badge" title="Every device that has this file is offline"><Icon name="wifi-off" size={13} /> Host offline</span>
@@ -65,7 +70,9 @@
             <td class="hide-narrow nowrap small muted">{formatAgo(file.sharedAt, clock.now)}</td>
             <td class="actions-column">
               <div class="actions">
-                {#if file.isAvailable}
+                {#if file.isOwn}
+                  <span class="badge" title="Shared from this device, so it already has it">Yours</span>
+                {:else if file.isAvailable}
                   <button class="btn btn-primary btn-small" onclick={() => room.download(file)}>
                     <Icon name="download" size={15} /> {file.isFolder ? 'Zip' : 'Download'}
                   </button>
@@ -160,6 +167,7 @@
 
   .actions {
     display: flex;
+    align-items: center;
     justify-content: flex-end;
     gap: 4px;
   }

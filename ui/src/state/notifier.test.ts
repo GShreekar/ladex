@@ -26,6 +26,7 @@ function file(overrides: Partial<SharedFile>): SharedFile {
     folderFileCount: 0,
     sharedAt: 0,
     sharedBy: 'Alex',
+    isOwn: false,
     holderNames: [],
     isAvailable: true,
     canUnshare: false,
@@ -70,8 +71,14 @@ describe('Notifier', () => {
 
   it('does_not_announce_what_this_device_shared_itself', () => {
     deliver({ type: 'files', files: [] });
-    deliver({ type: 'files', files: [file({ id: 'mine', canUnshare: true })] });
+    deliver({ type: 'files', files: [file({ id: 'mine', isOwn: true, canUnshare: true })] });
     expect(desktop.notifications).toEqual([]);
+  });
+
+  it('announces_a_guest_upload_to_this_node_even_though_this_machine_may_unshare_it', () => {
+    deliver({ type: 'files', files: [] });
+    deliver({ type: 'files', files: [file({ id: 'guest', sharedBy: 'Phone', canUnshare: true })] });
+    expect(desktop.notifications.map((notification) => notification.title)).toEqual(['Phone shared slides.pdf']);
   });
 
   it('treats_the_catalog_after_a_reconnect_as_a_catch_up', () => {

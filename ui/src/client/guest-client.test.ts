@@ -101,6 +101,46 @@ describe('GuestClient', () => {
     expect(filesEvent).toMatchObject({ files: [{ name: 'notes.txt', sharedBy: 'Daniel’s Laptop', holderNames: ['Maya’s MacBook'], isAvailable: true }] });
   });
 
+  it('marks what this guest uploaded as its own', async () => {
+    const { client, events } = startGuest();
+    await client.start();
+    const upload = { id: 'file_g', name: 'clip.mp4', size: 10, mime_type: 'video/mp4', uploader_id: 'g1', uploader_node: 'node_a',
+      hosts: ['node_a'], uploaded_at: '2026-10-13T12:00:00Z', is_folder: false, parent: null, folder_bytes: 0, folder_files: 0 };
+    FakeEventSource.instances[0]?.deliver('catalog', { files: [upload] });
+    await settle();
+    const filesEvent = events.findLast((event) => event.type === 'files');
+    expect(filesEvent).toMatchObject({ files: [{ isOwn: true, sharedBy: 'You' }] });
+  });
+
+  it('learns when the host accepts or declines an upload that waited for them', async () => {
+    vi.useFakeTimers();
+    try {
+      for (const [answer, expected] of [['shared', true], ['gone', false]] as const) {
+        let uploadState = 'awaiting-approval';
+        vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: RequestInit) => {
+          if (init?.method === 'POST') {
+            return new Response(null, { status: 201, headers: { Location: '/uploads/up_1', 'Ladex-Upload-State': 'awaiting-approval' } });
+          }
+          if (uploadState === 'gone') return new Response(null, { status: 404 });
+          return new Response(null, { status: 200, headers: { 'Ladex-Upload-State': uploadState } });
+        }));
+        const client = new GuestClient(ME);
+        const answers: boolean[] = [];
+        const request = { signal: new AbortController().signal, onProgress: () => {}, onAnswered: (isAccepted: boolean) => answers.push(isAccepted) };
+        expect(await client.uploadFile(new File([], 'clip.mp4'), request)).toBe('awaiting-approval');
+
+        await vi.advanceTimersByTimeAsync(10_000);
+        expect(answers).toEqual([]);
+        uploadState = answer;
+        await vi.advanceTimersByTimeAsync(10_000);
+        expect(answers).toEqual([expected]);
+        client.stop();
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('ends the session when the node says so', async () => {
     const { client, events } = startGuest();
     await client.start();
@@ -112,7 +152,7 @@ describe('GuestClient', () => {
     const { client } = startGuest();
     const ticket = await client.prepareDownload({
       id: 'folder_1', name: 'Photos', mimeType: 'inode/directory', isFolder: true, sizeBytes: 0, folderFileCount: 3,
-      sharedAt: 0, sharedBy: '', holderNames: [], isAvailable: true, canUnshare: false,
+      sharedAt: 0, sharedBy: '', isOwn: false, holderNames: [], isAvailable: true, canUnshare: false,
     });
     expect(ticket).toEqual({ url: '/blobs/folder_1.zip', filename: 'Photos.zip' });
   });

@@ -46,7 +46,7 @@ export class Notifier {
     const known = this.knownFileIds;
     this.knownFileIds = new Set(files.map((file) => file.id));
     if (!known) return;
-    const fromOthers = files.filter((file) => !known.has(file.id) && !file.canUnshare);
+    const fromOthers = files.filter((file) => !known.has(file.id) && !file.isOwn);
     for (const [sharer, shared] of groupBySharer(fromOthers)) {
       const [first] = shared;
       const what = shared.length === 1 && first ? first.name : `${shared.length} files`;

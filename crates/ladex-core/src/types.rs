@@ -67,8 +67,11 @@ pub struct FileView {
     pub uploader_id: SessionId,
     /// The node that published it.
     pub uploader_node: NodeId,
-    /// Nodes that have the whole file and can serve it.
+    /// Nodes that have the whole file and can serve it; for a folder, its listing and every file in it.
     pub hosts: Vec<NodeId>,
+    /// Whether it can be downloaded now; a folder can be even when no single node holds all of it.
+    #[serde(default)]
+    pub available: bool,
     /// When it was shared, for display.
     pub uploaded_at: chrono::DateTime<chrono::Utc>,
     pub created_at: u64,
@@ -94,6 +97,7 @@ impl FileView {
             mime_type: entry.mime_type.clone(),
             uploader_id: entry.uploader_id.clone(),
             uploader_node: listed.publisher.clone(),
+            available: !hosts.is_empty(),
             hosts,
             uploaded_at: chrono::DateTime::from_timestamp_millis(entry.created_at_ms as i64).unwrap_or_default(),
             created_at: entry.created_at_ms,
@@ -106,7 +110,7 @@ impl FileView {
     }
 
     pub fn is_available(&self) -> bool {
-        !self.hosts.is_empty()
+        self.available
     }
 }
 

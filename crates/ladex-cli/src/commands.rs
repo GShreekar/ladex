@@ -265,6 +265,7 @@ fn print_files(files: &[FileView]) {
     }
     let kind = |file: &FileView| if file.is_folder { "folder" } else { "file" };
     let availability = |file: &FileView| match file.hosts.len() {
+        0 if file.available => "in parts, on several nodes".to_string(),
         0 => "nobody online has it".to_string(),
         1 => "1 node".to_string(),
         count => format!("{count} nodes"),

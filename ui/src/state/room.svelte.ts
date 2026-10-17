@@ -96,6 +96,14 @@ export class Room {
     else this.offers.push(offer);
   }
 
+  // An offer of a catalog file that has since been unshared could only fail; an offer can arrive before its file does.
+  private dropOffersOfUnsharedFiles(files: SharedFile[]): void {
+    const listed = new Set(files.map((file) => file.id));
+    const wasListed = new Set(this.files.map((file) => file.id));
+    const isGone = (offer: IncomingOffer) => !offer.isDirect && wasListed.has(offer.fileId) && !listed.has(offer.fileId);
+    if (this.offers.some(isGone)) this.offers = this.offers.filter((offer) => !isGone(offer));
+  }
+
   private apply(event: ClientEvent): void {
     switch (event.type) {
       case 'connection':
@@ -108,6 +116,7 @@ export class Room {
         this.devices = event.devices;
         break;
       case 'files':
+        this.dropOffersOfUnsharedFiles(event.files);
         this.files = event.files;
         break;
       case 'messages':

@@ -18,6 +18,8 @@ export interface WireFile {
   uploader_id: string;
   uploader_node: string;
   hosts: string[];
+  // Older nodes leave it out; then a file is available when a node hosts it.
+  available?: boolean;
   uploaded_at: string;
   is_folder: boolean;
   parent: string | null;
