@@ -38,7 +38,7 @@
           <th>Name</th>
           <th class="hide-narrow">Size</th>
           <th class="hide-narrow">Shared by</th>
-          <th>Available on</th>
+          <th class="hide-phone">Available on</th>
           <th class="hide-narrow">When</th>
           <th class="actions-column"><span class="sr-only">Actions</span></th>
         </tr>
@@ -51,13 +51,13 @@
                 <span class="icon"><Icon name={iconFor(file)} size={20} /></span>
                 <div class="names">
                   <span class="name truncate" title={file.name}>{file.name}</span>
-                  <span class="type truncate">{describe(file)}</span>
+                  <span class="type truncate">{describe(file)}<span class="narrow-only"> · {formatBytes(file.sizeBytes)}</span></span>
                 </div>
               </div>
             </td>
             <td class="hide-narrow nowrap muted">{formatBytes(file.sizeBytes)}</td>
             <td class="hide-narrow nowrap">{file.sharedBy}</td>
-            <td>
+            <td class="hide-phone">
               {#if file.isAvailable}
                 <span class="badge badge-success" title={holdersTitle(file)}>
                   <Icon name="hub" size={13} />
@@ -183,9 +183,30 @@
     text-align: center;
   }
 
+  .narrow-only {
+    display: none;
+  }
+
   @media (max-width: 720px) {
     .hide-narrow {
       display: none;
+    }
+
+    .narrow-only {
+      display: inline;
+    }
+  }
+
+  /* A phone has room for the name and the download button; the button already says when a file is unavailable. */
+  @media (max-width: 600px) {
+    .hide-phone {
+      display: none;
+    }
+
+    th,
+    td {
+      padding-left: 12px;
+      padding-right: 12px;
     }
   }
 </style>

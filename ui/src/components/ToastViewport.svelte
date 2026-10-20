@@ -32,8 +32,8 @@
 <style>
   .viewport {
     position: fixed;
-    right: 16px;
-    bottom: 16px;
+    right: calc(16px + var(--safe-right));
+    bottom: calc(16px + var(--bottom-bar-height) + var(--safe-bottom));
     z-index: 100;
     display: flex;
     flex-direction: column;

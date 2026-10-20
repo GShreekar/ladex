@@ -84,13 +84,29 @@ async fn next_address(state: &NodeState, peer_node_id: &NodeId) -> Option<Socket
     Some(target.addr)
 }
 
+// Given with `--peer`, or still in the list of addresses the person added.
+fn is_address_wanted(state: &NodeState, addr: SocketAddr) -> bool {
+    state.started_with.manual_peers.contains(&addr) || state.preferences.get().peer_addresses.contains(&addr)
+}
+
+/// Starts keeping the node at `addr` connected, as `keep_connected` does, without waiting for it.
+pub fn keep_connected_in_background(state: &NodeState, addr: SocketAddr) {
+    let state = state.clone();
+    tokio::spawn(async move { keep_connected(&state, addr).await });
+}
+
 /// Joins the node at `addr`, retrying until it answers, and from then on redials it whenever the connection is lost.
+/// Retrying stops once the address is no longer wanted, as when the person removes it.
 pub async fn keep_connected(state: &NodeState, addr: SocketAddr) {
     let mut failures = 0;
     let mut auth_failed = false;
     let peer_node_id = loop {
         if failures > 0 {
             tokio::time::sleep(retry_delay(failures, auth_failed, rand::random())).await;
+            if !is_address_wanted(state, addr) {
+                tracing::info!("Mesh: no longer connecting to {addr}, which was removed");
+                return;
+            }
         }
         match quic::join(state, addr).await {
             Ok(peer_node_id) => break peer_node_id,

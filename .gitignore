@@ -17,3 +17,6 @@ ui/dist
 
 # Built by the release workflow and carried by the installers
 crates/ladex-app/binaries
+# Signing keys never belong in the repo.
+*.jks
+*.keystore

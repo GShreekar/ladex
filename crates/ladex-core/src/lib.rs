@@ -219,7 +219,13 @@ impl NodeState {
             local_ip: None,
             node_name: "test".to_string(),
             preferences: Arc::new(preferences::PreferencesStore::open(&data_dir)),
-            started_with: Arc::new(control::Settings { data_dir, discovery_port: None, local_http_port: None, use_keychain: false }),
+            started_with: Arc::new(control::Settings {
+                data_dir,
+                discovery_port: None,
+                local_http_port: None,
+                use_keychain: false,
+                manual_peers: Vec::new(),
+            }),
         }
     }
 }

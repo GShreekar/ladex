@@ -1,0 +1,126 @@
+name: Android app
+
+on:
+  # Each push to a Phase 8 branch leaves signed APKs to try on a phone.
+  push:
+    branches: ['phase8/**']
+  workflow_dispatch:
+  # The release workflow builds the APKs it publishes with this.
+  workflow_call:
+    outputs:
+      certificate_sha256:
+        description: The SHA-256 of the certificate the APKs are signed with, for the release notes.
+        value: ${{ jobs.apk.outputs.certificate_sha256 }}
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  apk:
+    name: Signed APKs
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      certificate_sha256: ${{ steps.verify.outputs.certificate_sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android-apk
+
+      - name: Build the web UI the app embeds
+        working-directory: ui
+        run: |
+          npm ci
+          npm run build
+
+      # The runner image carries the SDK and NDK; Tauri finds the NDK through NDK_HOME.
+      - name: Point Tauri at the NDK
+        run: echo "NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+
+      - name: Unpack the release key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [[ -z "$KEYSTORE_BASE64" ]]; then
+            echo "::error::The ANDROID_KEYSTORE_BASE64 secret is missing, so the APKs cannot be signed."
+            exit 1
+          fi
+          keystore="$RUNNER_TEMP/ladex-release.jks"
+          echo "$KEYSTORE_BASE64" | base64 --decode > "$keystore"
+          {
+            echo "storeFile=$keystore"
+            echo "storePassword=$KEYSTORE_PASSWORD"
+            echo "keyAlias=$KEY_ALIAS"
+            echo "keyPassword=$KEY_PASSWORD"
+          } > crates/ladex-app/gen/android/keystore.properties
+
+      - name: Work out the version
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "ladex-app") | .version')
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "VERSION_CODE=$(.github/scripts/android-version-code.sh "$version")" >> "$GITHUB_ENV"
+
+      - name: Build the APKs
+        working-directory: crates/ladex-app
+        run: |
+          npx --yes @tauri-apps/cli@2.11 android build --ci --apk --split-per-abi \
+            --target aarch64 armv7 x86_64 \
+            --config "{\"bundle\":{\"android\":{\"versionCode\":$VERSION_CODE}}}"
+
+      # Named for what they run on, so people pick the right one from the release page.
+      - name: Name the APKs
+        run: |
+          mkdir apk
+          outputs=crates/ladex-app/gen/android/app/build/outputs/apk
+          cp "$outputs/arm64/release/app-arm64-release.apk" "apk/ladex-v$VERSION-android-arm64.apk"
+          cp "$outputs/arm/release/app-arm-release.apk" "apk/ladex-v$VERSION-android-armv7.apk"
+          cp "$outputs/x86_64/release/app-x86_64-release.apk" "apk/ladex-v$VERSION-android-x86_64.apk"
+          ls -l apk
+
+      - name: Check every APK is signed with the release key
+        id: verify
+        run: |
+          apksigner="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)/apksigner"
+          fingerprints=$(for apk in apk/*.apk; do
+            "$apksigner" verify --print-certs "$apk" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p'
+          done | sort -u)
+          if [[ $(echo "$fingerprints" | grep -c .) -ne 1 ]]; then
+            echo "::error::The APKs are not all signed with one key: '$fingerprints'"
+            exit 1
+          fi
+          echo "Signed with certificate SHA-256 $fingerprints"
+          echo "certificate_sha256=$fingerprints" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ladex-android-apk
+          path: apk/*.apk
+          if-no-files-found: error
+
+      - name: Forget the release key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/ladex-release.jks" crates/ladex-app/gen/android/keystore.properties

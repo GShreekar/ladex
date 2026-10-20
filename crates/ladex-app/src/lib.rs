@@ -6,6 +6,7 @@ mod desktop;
 mod ipc;
 #[cfg(desktop)]
 mod launch;
+mod logging;
 mod notify;
 mod paths;
 mod running;
@@ -121,7 +122,7 @@ fn set_up_desktop(app: &AppHandle) {
 /// Builds and runs the app until it quits; Android calls this when the app is opened.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tracing_subscriber::fmt::init();
+    logging::init();
 
     let app = with_desktop_plugins(tauri::Builder::default())
         .plugin(tauri_plugin_notification::init())

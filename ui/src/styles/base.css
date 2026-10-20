@@ -7,6 +7,17 @@
   box-sizing: border-box;
 }
 
+/* Phones draw the page under the status bar, the notch and the gesture bar; these keep content clear of them. */
+:root {
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
+  --viewport-height: calc(100dvh - var(--safe-top));
+  /* Raised by the app's bottom navigation on phones, so toasts stay above it. */
+  --bottom-bar-height: 0px;
+}
+
 html,
 body {
   margin: 0;
@@ -16,6 +27,20 @@ body {
   font-size: 14px;
   line-height: 20px;
   -webkit-font-smoothing: antialiased;
+}
+
+body {
+  padding: var(--safe-top) var(--safe-right) 0 var(--safe-left);
+}
+
+/* Scrolled content would otherwise show through the transparent status bar. */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0 0 auto;
+  z-index: 100;
+  height: var(--safe-top);
+  background: var(--surface);
 }
 
 h1, h2, h3, p {
@@ -212,6 +237,23 @@ button {
 
 .progress.is-done > span {
   background: var(--success);
+}
+
+/* A finger needs a bigger target than a mouse pointer; 16px text also stops phones zooming into a focused field. */
+@media (pointer: coarse) {
+  .btn,
+  .btn-small,
+  .input {
+    height: 44px;
+  }
+
+  .btn-icon {
+    width: 44px;
+  }
+
+  .input {
+    font-size: 16px;
+  }
 }
 
 .sr-only {

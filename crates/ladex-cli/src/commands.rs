@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{anyhow, bail, Context};
-use clap::Subcommand;
+use clap::{Args, Subcommand};
 use ladex_core::control::server::{self, Endpoint};
 use ladex_core::control::{Device, Event, GuestInvite, Invite, Node, Reply, Request};
 use ladex_core::guest::sessions::GuestSummary;
@@ -106,24 +106,45 @@ pub enum Command {
         /// on or off; without it, shows whether it is on.
         state: Option<autostart::Switch>,
     },
-    /// Show this node's settings, or change them: what the app's Settings page does
-    Settings {
-        /// Where files saved from the app's window go; an empty value goes back to the system's downloads folder.
-        #[arg(long)]
-        downloads_dir: Option<PathBuf>,
-        /// Most disk space, in GiB, that shared files may use.
-        #[arg(long)]
-        storage_limit_gb: Option<u64>,
-        /// Whose files the app's window accepts without asking: nobody, paired (devices on nodes paired with this one) or mesh.
-        #[arg(long)]
-        auto_accept: Option<AutoAcceptFrom>,
-        /// Ask before accepting a file larger than this many MiB, whoever sends it.
-        #[arg(long, conflicts_with = "no_size_limit")]
-        ask_above_mb: Option<u64>,
-        /// Accept files of any size from those auto_accept allows.
-        #[arg(long)]
-        no_size_limit: bool,
-    },
+    /// Show this node's settings, or change them: what the app's Settings and Network pages do
+    Settings(SettingsChange),
+}
+
+#[derive(Args, Default)]
+pub struct SettingsChange {
+    /// Where files saved from the app's window go; an empty value goes back to the system's downloads folder.
+    #[arg(long)]
+    downloads_dir: Option<PathBuf>,
+    /// Most disk space, in GiB, that shared files may use.
+    #[arg(long)]
+    storage_limit_gb: Option<u64>,
+    /// Whose files the app's window accepts without asking: nobody, paired (devices on nodes paired with this one) or mesh.
+    #[arg(long)]
+    auto_accept: Option<AutoAcceptFrom>,
+    /// Ask before accepting a file larger than this many MiB, whoever sends it.
+    #[arg(long, conflicts_with = "no_size_limit")]
+    ask_above_mb: Option<u64>,
+    /// Accept files of any size from those auto_accept allows.
+    #[arg(long)]
+    no_size_limit: bool,
+    /// Keep the node at this address connected (IP, or IP:port), for networks where discovery cannot find it. Repeatable.
+    #[arg(long, value_name = "ADDRESS")]
+    add_peer: Vec<String>,
+    /// Stop connecting to a node added with --add-peer. Repeatable.
+    #[arg(long, value_name = "ADDRESS")]
+    remove_peer: Vec<String>,
+}
+
+impl SettingsChange {
+    fn asks_for_change(&self) -> bool {
+        self.downloads_dir.is_some()
+            || self.storage_limit_gb.is_some()
+            || self.auto_accept.is_some()
+            || self.ask_above_mb.is_some()
+            || self.no_size_limit
+            || !self.add_peer.is_empty()
+            || !self.remove_peer.is_empty()
+    }
 }
 
 #[derive(Subcommand)]
@@ -251,12 +272,10 @@ async fn execute(command: Command, data_dir: &Path, is_json: bool) -> anyhow::Re
         Command::Doctor | Command::Passphrase { .. } | Command::Autostart { .. } => {
             unreachable!("these do not need a running node and are handled before this")
         }
-        Command::Settings { downloads_dir, storage_limit_gb, auto_accept, ask_above_mb, no_size_limit } => {
-            let asks_for_change =
-                downloads_dir.is_some() || storage_limit_gb.is_some() || auto_accept.is_some() || ask_above_mb.is_some() || no_size_limit;
-            let update = if asks_for_change {
+        Command::Settings(change) => {
+            let update = if change.asks_for_change() {
                 let current = current_preferences(&session).await?;
-                Some(settings_update(current, downloads_dir, storage_limit_gb, auto_accept, ask_above_mb, no_size_limit)?)
+                Some(settings_update(current, change)?)
             } else {
                 None
             };
@@ -275,25 +294,34 @@ async fn current_preferences(session: &Session) -> anyhow::Result<Preferences> {
 }
 
 // Only what was asked for changes; the node reads the downloads folder as a full path, whatever directory this ran in.
-fn settings_update(
-    current: Preferences,
-    downloads_dir: Option<PathBuf>,
-    storage_limit_gb: Option<u64>,
-    auto_accept: Option<AutoAcceptFrom>,
-    ask_above_mb: Option<u64>,
-    no_size_limit: bool,
-) -> anyhow::Result<preferences::Update> {
-    let wants_other_rule = auto_accept.is_some() || ask_above_mb.is_some() || no_size_limit;
+fn settings_update(current: Preferences, change: SettingsChange) -> anyhow::Result<preferences::Update> {
+    let wants_other_rule = change.auto_accept.is_some() || change.ask_above_mb.is_some() || change.no_size_limit;
     let rule = wants_other_rule.then(|| AutoAccept {
-        from: auto_accept.unwrap_or(current.auto_accept.from),
-        ask_above_mib: if no_size_limit { None } else { ask_above_mb.or(current.auto_accept.ask_above_mib) },
+        from: change.auto_accept.unwrap_or(current.auto_accept.from),
+        ask_above_mib: if change.no_size_limit { None } else { change.ask_above_mb.or(current.auto_accept.ask_above_mib) },
     });
-    let downloads_dir = match downloads_dir {
+    let wants_other_peers = !change.add_peer.is_empty() || !change.remove_peer.is_empty();
+    let peer_addresses = if wants_other_peers { Some(changed_peer_addresses(&current, &change)?) } else { None };
+    let downloads_dir = match change.downloads_dir {
         Some(path) if path.as_os_str().is_empty() => Some(path),
         Some(path) => Some(std::path::absolute(&path).with_context(|| format!("could not resolve {}", path.display()))?),
         None => None,
     };
-    Ok(preferences::Update { is_setup_done: None, downloads_dir, storage_limit_gib: storage_limit_gb, auto_accept: rule })
+    Ok(preferences::Update {
+        is_setup_done: None,
+        downloads_dir,
+        storage_limit_gib: change.storage_limit_gb,
+        auto_accept: rule,
+        peer_addresses,
+    })
+}
+
+// The saved list with the additions and without the removals, compared as addresses so "10.0.0.2" removes "10.0.0.2:8080".
+fn changed_peer_addresses(current: &Preferences, change: &SettingsChange) -> anyhow::Result<Vec<String>> {
+    let removed = preferences::checked_peer_addresses(&change.remove_peer)?;
+    let added = preferences::checked_peer_addresses(&change.add_peer)?;
+    let kept = current.peer_addresses.iter().chain(&added).filter(|address| !removed.contains(address));
+    Ok(kept.map(ToString::to_string).collect())
 }
 
 // The node reads the paths itself, so they must not depend on the directory this command was run in.
@@ -396,8 +424,17 @@ fn print_preferences(view: &preferences::View) {
         vec!["Storage limit".to_string(), format!("{} GiB ({} used)", preferences.storage_limit_gib, format_bytes(view.store_used_bytes))],
         vec!["Incoming files".to_string(), format!("{auto_accept}; {size_limit}")],
         vec!["Passphrase".to_string(), if view.has_passphrase { "set" } else { "none" }.to_string()],
+        vec!["Devices added by address".to_string(), peer_addresses_text(&preferences.peer_addresses)],
+        vec!["This device's address".to_string(), view.this_address.clone().unwrap_or_else(|| "none (no network)".to_string())],
     ];
     output::print_table(&["SETTING", "VALUE"], &rows);
+}
+
+fn peer_addresses_text(addresses: &[std::net::SocketAddr]) -> String {
+    if addresses.is_empty() {
+        return "none".to_string();
+    }
+    addresses.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
 }
 
 fn size_of(file: &FileView) -> String {
@@ -550,7 +587,17 @@ mod tests {
     }
 
     fn update(auto_accept: Option<AutoAcceptFrom>, ask_above_mb: Option<u64>, no_size_limit: bool) -> preferences::Update {
-        settings_update(current(), None, None, auto_accept, ask_above_mb, no_size_limit).unwrap()
+        settings_update(current(), SettingsChange { auto_accept, ask_above_mb, no_size_limit, ..Default::default() }).unwrap()
+    }
+
+    fn with_peer(address: &str) -> Preferences {
+        Preferences { peer_addresses: vec![address.parse().unwrap()], ..current() }
+    }
+
+    fn peers_after(current: Preferences, add_peer: &[&str], remove_peer: &[&str]) -> Option<Vec<String>> {
+        let to_strings = |addresses: &[&str]| addresses.iter().map(ToString::to_string).collect();
+        let change = SettingsChange { add_peer: to_strings(add_peer), remove_peer: to_strings(remove_peer), ..Default::default() };
+        settings_update(current, change).unwrap().peer_addresses
     }
 
     #[test]
@@ -578,13 +625,35 @@ mod tests {
 
     #[test]
     fn an_empty_downloads_folder_is_passed_on_to_mean_the_default() {
-        let update = settings_update(current(), Some(PathBuf::new()), None, None, None, false).unwrap();
+        let update = settings_update(current(), SettingsChange { downloads_dir: Some(PathBuf::new()), ..Default::default() }).unwrap();
         assert_eq!(update.downloads_dir, Some(PathBuf::new()));
     }
 
     #[test]
     fn a_relative_downloads_folder_is_made_absolute() {
-        let update = settings_update(current(), Some(PathBuf::from("received")), None, None, None, false).unwrap();
-        assert!(update.downloads_dir.unwrap().is_absolute());
+        let change = SettingsChange { downloads_dir: Some(PathBuf::from("received")), ..Default::default() };
+        assert!(settings_update(current(), change).unwrap().downloads_dir.unwrap().is_absolute());
+    }
+
+    #[test]
+    fn an_added_peer_joins_the_saved_ones() {
+        let peers = peers_after(with_peer("10.0.0.2:8080"), &["10.0.0.3:9000"], &[]);
+        assert_eq!(peers, Some(vec!["10.0.0.2:8080".to_string(), "10.0.0.3:9000".to_string()]));
+    }
+
+    #[test]
+    fn a_peer_is_removed_by_its_ip_alone_when_it_uses_the_default_port() {
+        assert_eq!(peers_after(with_peer("10.0.0.2:8080"), &[], &["10.0.0.2"]), Some(Vec::new()));
+    }
+
+    #[test]
+    fn not_touching_peers_leaves_them_out_of_the_update() {
+        assert_eq!(peers_after(with_peer("10.0.0.2:8080"), &[], &[]), None);
+    }
+
+    #[test]
+    fn a_mistyped_peer_is_refused() {
+        let change = SettingsChange { add_peer: vec!["my-laptop".to_string()], ..Default::default() };
+        assert!(settings_update(current(), change).is_err());
     }
 }

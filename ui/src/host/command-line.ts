@@ -35,6 +35,7 @@ export function settingsCommands(view: PreferencesView): CommandHint[] {
     { label: 'Set the storage limit', command: ladex(view, 'settings', '--storage-limit-gb', String(preferences.storage_limit_gib)) },
     { label: 'Set the incoming files rule', command: ladex(view, 'settings', '--auto-accept', rule.from, ...sizeLimit) },
     ...(downloads.length ? [{ label: 'Set the downloads folder', command: ladex(view, 'settings', ...downloads) }] : []),
+    { label: 'Add a device by address', command: ladex(view, 'settings', '--add-peer', '<address>') },
   ];
 }
 
