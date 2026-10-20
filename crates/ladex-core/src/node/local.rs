@@ -95,11 +95,12 @@ pub struct LocalLink {
     open_pipe: OpenPipe,
     node_stopped: watch::Receiver<bool>,
     login_token: Arc<Mutex<Option<String>>>,
+    runtime: tokio::runtime::Handle,
 }
 
 impl LocalLink {
-    pub(crate) fn new(state: NodeState, open_pipe: OpenPipe, node_stopped: watch::Receiver<bool>) -> Self {
-        Self { state, open_pipe, node_stopped, login_token: Arc::new(Mutex::new(None)) }
+    pub(crate) fn new(state: NodeState, open_pipe: OpenPipe, node_stopped: watch::Receiver<bool>, runtime: tokio::runtime::Handle) -> Self {
+        Self { state, open_pipe, node_stopped, login_token: Arc::new(Mutex::new(None)), runtime }
     }
 
     /// Sends a request and waits for the whole answer; `headers` are added to the ones the link always sends.
@@ -111,6 +112,7 @@ impl LocalLink {
     }
 
     /// Starts a PUT whose body is written piece by piece with `LocalUpload::write`; `content_length` is the total to be written.
+    /// Safe to call from any thread: the request runs on the node's runtime.
     pub fn begin_upload(&self, path: &str, headers: &[(String, String)], content_length: u64) -> LocalUpload {
         let (pieces, receiver) = mpsc::channel::<Bytes>(UPLOAD_BACKLOG);
         let frames = stream::unfold(receiver, |mut receiver| async { receiver.recv().await.map(|piece| (piece, receiver)) })
@@ -120,7 +122,7 @@ impl LocalLink {
 
         let link = self.clone();
         let path = path.to_string();
-        let answer = tokio::spawn(async move {
+        let answer = self.runtime.spawn(async move {
             let response = link.send(Method::PUT, &path, &headers, StreamBody::new(frames)).await?;
             let status = response.status().as_u16();
             let body = response.into_body().collect().await.map_err(broken)?.to_bytes();

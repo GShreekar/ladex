@@ -187,6 +187,8 @@ pub struct NodeHandle {
     local_web_server: Option<JoinHandle<()>>,
     stop_web: watch::Sender<bool>,
     open_pipe: local::OpenPipe,
+    // The runtime the node runs on, for work a caller outside it (such as a GUI thread) starts.
+    runtime: tokio::runtime::Handle,
     background_tasks: Vec<JoinHandle<()>>,
     // Kept to the end so the directory is released only after everything that uses it has stopped.
     _data_dir_lock: DataDirLock,
@@ -203,7 +205,7 @@ impl NodeHandle {
 
     /// An in-process way into this node's web server, for a window that lives in the same process.
     pub fn local_link(&self) -> LocalLink {
-        LocalLink::new(self.state.clone(), self.open_pipe.clone(), self.stop_web.subscribe())
+        LocalLink::new(self.state.clone(), self.open_pipe.clone(), self.stop_web.subscribe(), self.runtime.clone())
     }
 
     /// Resolves when the web server stops, which it only does on an error.
@@ -332,6 +334,7 @@ impl Node {
             local_web_server,
             stop_web,
             open_pipe,
+            runtime: tokio::runtime::Handle::current(),
             background_tasks,
             _data_dir_lock: data_dir_lock,
         })

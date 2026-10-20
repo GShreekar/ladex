@@ -95,6 +95,31 @@ async fn a_shared_file_goes_up_by_id_and_comes_down_into_the_downloads_folder() 
     node.shutdown().await;
 }
 
+// The app calls begin_upload from its GUI thread, which has no Tokio runtime of its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upload_can_begin_on_a_thread_outside_the_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = started(dir.path()).await;
+    let bridge = std::sync::Arc::new(Bridge::new(node.local_link(), dir.path().join("downloads")));
+    let (sender, mut events) = mpsc::unbounded_channel();
+    let socket = bridge.open_socket(move |event| drop(sender.send(event))).await.unwrap();
+    let join = json!({ "type": "join", "session_id": SESSION, "user_agent": "test", "nickname": null });
+    bridge.send_to_socket(socket, join.to_string()).await.unwrap();
+    next_message_of_type(&mut events, "peer_joined").await;
+
+    let upload = std::thread::spawn({
+        let bridge = bridge.clone();
+        move || bridge.begin_upload("/api/files/file_gui", &headers(5), 5)
+    })
+    .join()
+    .expect("beginning an upload off the runtime panicked");
+    bridge.write_upload(upload, b"hello".to_vec()).await.unwrap();
+
+    let reply = bridge.finish_upload(upload).await.unwrap();
+    assert_eq!(reply.status, 201, "{}", reply.body);
+    node.shutdown().await;
+}
+
 #[tokio::test]
 async fn an_unknown_upload_id_is_an_error_and_an_aborted_one_is_forgotten() {
     let dir = tempfile::tempdir().unwrap();
