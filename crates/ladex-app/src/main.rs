@@ -2,6 +2,8 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[cfg(target_os = "macos")]
+mod cli_link;
 mod desktop;
 mod ipc;
 mod launch;
@@ -117,6 +119,8 @@ fn main() {
             if let Err(error) = tray::build(app.handle()) {
                 tracing::warn!("No tray icon: {error}");
             }
+            #[cfg(target_os = "macos")]
+            cli_link::ensure_linked(app.handle());
             Ok(start(app.handle())?)
         })
         .build(tauri::generate_context!())

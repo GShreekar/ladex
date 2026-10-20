@@ -20,6 +20,22 @@ cargo run -p ladex-app
 
 `ui/dist` is shared: the app embeds it directly, and `ladex` stages a copy of it from `crates/ladex-cli/build.rs`, so one `npm run build` serves both.
 
+## Installers
+
+The release workflow builds them from one tag, after checking the tag matches the version in `Cargo.toml` and `ui/package.json`. Each installer carries the `ladex` CLI as well (Tauri's `externalBin`, added by `tauri.release.conf.json` so plain `cargo run` doesn't need it). To build one locally:
+
+```sh
+(cd ui && npm ci && npm run build)
+cargo build --release -p ladex
+mkdir -p crates/ladex-app/binaries
+cp target/release/ladex crates/ladex-app/binaries/ladex-$(rustc -vV | sed -n 's/host: //p')
+(cd crates/ladex-app && npx @tauri-apps/cli@2.11 build --config tauri.release.conf.json)
+```
+
+- **Windows (NSIS):** installs for all users. `windows/installer-hooks.nsh` adds inbound firewall rules for `ladex-app.exe` and `ladex.exe` and puts the install folder on the machine PATH (through `windows/cli-path.ps1`). Uninstalling removes both. There is no MSI because MSI refuses prerelease versions such as `3.0.0-rc.1`.
+- **macOS (.dmg):** ad-hoc signed, with the Local Network usage string and the `_ladex._tcp` Bonjour type from `Info.plist`. On launch from Applications, `src/cli_link.rs` links `/usr/local/bin/ladex` to the bundled CLI. It asks for an administrator password once if it needs to, and never replaces a `ladex` that it did not install.
+- **Linux:** a `.deb` that installs `ladex-app` and `ladex` into `/usr/bin`, and an AppImage. `install.sh` stays the route for the CLI alone.
+
 ## Tray, login item and notifications
 
 - **Tray (menu bar on macOS).** Closing the window hides it; the node keeps sharing. The tray menu shows how many devices are connected and has Open LADEX, Open Downloads Folder, Launch at Login and Quit LADEX. Without a tray (some Linux desktops) closing the window quits, as before.

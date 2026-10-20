@@ -14,3 +14,6 @@ Thumbs.db
 docs
 ui/node_modules
 ui/dist
+
+# Built by the release workflow and carried by the installers
+crates/ladex-app/binaries

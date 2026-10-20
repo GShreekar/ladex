@@ -25,7 +25,17 @@ A fast, secure, serverless file-sharing tool built with Rust for local networks,
 
 ## Installation
 
-### Quick Install
+### Desktop app
+
+Every [GitHub Release](https://github.com/GShreekar/ladex/releases) has installers for the app, and each one also installs the `ladex` command:
+
+- **Windows:** `LADEX_*_x64-setup.exe`. It installs for all users, puts `ladex` on PATH and adds the Windows Firewall rules.
+- **macOS:** `LADEX_*_aarch64.dmg` (Apple silicon) or `LADEX_*_x64.dmg` (Intel). Drag LADEX to Applications. On first run it offers to link `ladex` into `/usr/local/bin`.
+- **Linux:** `LADEX_*_amd64.deb` (puts `ladex` in `/usr/bin`) or `LADEX_*_amd64.AppImage` (the app only).
+
+The installers are not signed yet. The release notes say how to get past SmartScreen and Gatekeeper.
+
+### Quick Install (command line only)
 
 **Linux/macOS:**
 ```bash
