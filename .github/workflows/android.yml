@@ -38,7 +38,9 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: ui/package-lock.json
+          cache-dependency-path: |
+            ui/package-lock.json
+            crates/ladex-app/package-lock.json
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -84,10 +86,12 @@ jobs:
           echo "VERSION=$version" >> "$GITHUB_ENV"
           echo "VERSION_CODE=$(.github/scripts/android-version-code.sh "$version")" >> "$GITHUB_ENV"
 
+      # Gradle calls back into this same Tauri CLI to build the Rust library for each ABI.
       - name: Build the APKs
         working-directory: crates/ladex-app
         run: |
-          npx --yes @tauri-apps/cli@2.11 android build --ci --apk --split-per-abi \
+          npm ci
+          npm run tauri -- android build --ci --apk --split-per-abi \
             --target aarch64 armv7 x86_64 \
             --config "{\"bundle\":{\"android\":{\"versionCode\":$VERSION_CODE}}}"
 

@@ -1,0 +1,11 @@
+{
+  "name": "ladex-app-tools",
+  "private": true,
+  "description": "The Tauri CLI, pinned: the Android build calls back into it with `npm run tauri`.",
+  "scripts": {
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.11.5"
+  }
+}
