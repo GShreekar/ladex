@@ -3,8 +3,10 @@
 use std::sync::{Arc, Mutex, RwLock};
 
 use include_dir::{include_dir, Dir};
-use ladex_core::node::{self, Bridge, Node, NodeConfig, NodeHandle, StartError, UiAssets};
+use ladex_core::node::{Bridge, Node, NodeConfig, NodeHandle, StartError, UiAssets};
 use tauri::{AppHandle, Manager};
+
+use crate::paths::AppPaths;
 
 // The web UI built from `ui/`; the node serves it to browsers on the network, the window shows it itself.
 static UI_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/../../ui/dist");
@@ -59,8 +61,9 @@ pub fn passphrase_from_environment() -> Option<String> {
 }
 
 // What was chosen in the wizard or settings is in the data folder; the environment still wins for anyone who sets it.
-fn node_config() -> Result<NodeConfig, StartFailure> {
-    let mut config = NodeConfig::new(node::default_data_dir(), Arc::new(EmbeddedUi(&UI_DIR)));
+fn node_config(paths: &AppPaths) -> Result<NodeConfig, StartFailure> {
+    let mut config = NodeConfig::new(paths.data_dir.clone(), Arc::new(EmbeddedUi(&UI_DIR)));
+    config.certificate_dir = paths.certificate_dir.clone();
     config.passphrase = passphrase_from_environment();
     config.use_saved_passphrase().map_err(StartFailure::Saved)?;
     config.use_saved_storage_limit();
@@ -68,11 +71,12 @@ fn node_config() -> Result<NodeConfig, StartFailure> {
 }
 
 async fn start(app: &AppHandle) -> Result<Running, StartFailure> {
-    let node = Node::start(node_config()?).await.map_err(StartFailure::Node)?;
+    let paths = app.state::<AppPaths>();
+    let node = Node::start(node_config(&paths)?).await.map_err(StartFailure::Node)?;
     for notice in &node.info().notices {
         tracing::warn!("{notice:?}");
     }
-    let downloads = app.path().download_dir().unwrap_or_else(|_| node.info().data_dir.join("received"));
+    let downloads = paths.default_downloads.clone().unwrap_or_else(|| node.info().data_dir.join("received"));
     let bridge = Bridge::new(node.local_link(), downloads).with_preferences(node.state().preferences.clone());
     Ok(Running { bridge: Arc::new(bridge), handle: Mutex::new(Some(node)) })
 }

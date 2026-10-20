@@ -37,6 +37,7 @@ pub fn local_ipv4_addresses() -> Vec<IpAddr> {
     }
 }
 
+/// The folder the guest certificate is cached in when the shell does not choose one: `~/.ladex`.
 pub fn config_dir() -> PathBuf {
     let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home).join(".ladex")
@@ -113,9 +114,8 @@ fn generate(names: &[String]) -> anyhow::Result<(CertificateDer<'static>, Vec<u8
 }
 
 /// The server's TLS config from the cached certificate if it still covers `wanted`, else a new one, plus its SHA-256 fingerprint.
-pub fn prepare_server_identity(wanted: &[String]) -> anyhow::Result<(Arc<rustls::ServerConfig>, Vec<u8>)> {
-    let dir = config_dir();
-    let cached = read_cached(&dir);
+pub fn prepare_server_identity(dir: &Path, wanted: &[String]) -> anyhow::Result<(Arc<rustls::ServerConfig>, Vec<u8>)> {
+    let cached = read_cached(dir);
 
     if let Some(c) = &cached {
         if wanted.iter().all(|name| c.sans.contains(name)) {
@@ -138,7 +138,7 @@ pub fn prepare_server_identity(wanted: &[String]) -> anyhow::Result<(Arc<rustls:
     tracing::info!("TLS: generating a new self-signed certificate ({} names)", names.len());
     let (cert, key) = generate(&names)?;
 
-    match create_private_dir(&dir)
+    match create_private_dir(dir)
         .and_then(|_| write_private(&dir.join("key.der"), &key))
         .and_then(|_| std::fs::write(dir.join("cert.der"), &cert))
         .and_then(|_| std::fs::write(dir.join("cert.sans"), names.join("\n")))

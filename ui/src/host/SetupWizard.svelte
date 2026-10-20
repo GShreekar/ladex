@@ -19,7 +19,8 @@
     setup,
     pickFolder,
     state: initial,
-  }: { setup: DesktopSetup; pickFolder: DesktopSettings['pickFolder']; state: SetupState } = $props();
+    isMobile,
+  }: { setup: DesktopSetup; pickFolder: DesktopSettings['pickFolder']; state: SetupState; isMobile: boolean } = $props();
 
   const TITLES: Record<SetupStep, string> = {
     welcome: 'Welcome to LADEX',
@@ -150,7 +151,7 @@
         <span class="label">Save received files in</span>
         <div class="row">
           <code class="path truncate">{folder}</code>
-          <button type="button" class="btn" onclick={chooseFolder}>Change…</button>
+          {#if !isMobile}<button type="button" class="btn" onclick={chooseFolder}>Change…</button>{/if}
         </div>
       </div>
       <label class="field">
@@ -167,14 +168,18 @@
         <li><Icon name="check-circle" size={18} /> Received files go to <code class="truncate">{folder}</code></li>
         <li><Icon name="check-circle" size={18} /> Up to {answers.storageLimitGib} GB of shared files</li>
       </ul>
-      <label class="choice">
-        <input type="checkbox" bind:checked={shouldLaunchAtLogin} />
-        <span>
-          <strong>Start LADEX when I log in</strong>
-          <span class="small faint">It waits in the tray, so files can reach you without opening a window.</span>
-        </span>
-      </label>
-      <p class="small muted">Next you can invite a phone by QR code and share a folder. Closing the window keeps LADEX running in the tray.</p>
+      {#if isMobile}
+        <p class="small muted">Next you can invite another phone by QR code and share files.</p>
+      {:else}
+        <label class="choice">
+          <input type="checkbox" bind:checked={shouldLaunchAtLogin} />
+          <span>
+            <strong>Start LADEX when I log in</strong>
+            <span class="small faint">It waits in the tray, so files can reach you without opening a window.</span>
+          </span>
+        </label>
+        <p class="small muted">Next you can invite a phone by QR code and share a folder. Closing the window keeps LADEX running in the tray.</p>
+      {/if}
     {/if}
 
     {#if problem && step !== 'welcome'}<p class="problem small" role="alert">{problem}</p>{/if}

@@ -90,6 +90,52 @@ jobs:
       - name: Clippy
         run: cargo clippy -p ladex-app --all-targets -- -D warnings
 
+  android:
+    name: Android app
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # The oldest Android the app supports (7.0); the runner image already has the NDK.
+      ANDROID_API: "24"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.0"
+          targets: aarch64-linux-android
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android
+
+      - name: Build the web UI the app embeds
+        working-directory: ui
+        run: |
+          npm ci
+          npm run build
+
+      - name: Point Cargo at the NDK's compiler and linker
+        run: |
+          bin="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "CC_aarch64_linux_android=$bin/aarch64-linux-android$ANDROID_API-clang" >> "$GITHUB_ENV"
+          echo "AR_aarch64_linux_android=$bin/llvm-ar" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$bin/aarch64-linux-android$ANDROID_API-clang" >> "$GITHUB_ENV"
+
+      # Fails if a desktop-only dependency or API creeps back into the Android build.
+      - name: Clippy
+        run: cargo clippy -p ladex-app --target aarch64-linux-android -- -D warnings
+
+      - name: Link the library Android loads
+        run: cargo build -p ladex-app --lib --target aarch64-linux-android
+
   fmt:
     name: Format
     runs-on: ubuntu-latest

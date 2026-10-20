@@ -5,7 +5,7 @@ import { LocalNodeClient } from '../client/local-node-client';
 import type { NodeTransport } from '../client/transport';
 import type { LadexClient } from '../client/types';
 import { contextFor } from '../state/context';
-import { tauriDesktop, tauriSettings, tauriSetup } from '../desktop/desktop';
+import { isMobileApp, tauriDesktop, tauriSettings, tauriSetup } from '../desktop/desktop';
 import { AutoAccept } from '../state/auto-accept';
 import { Notifier } from '../state/notifier';
 import { Room } from '../state/room.svelte';
@@ -44,15 +44,17 @@ async function connectToNode(): Promise<HostServices> {
 const target = document.getElementById('app') as HTMLElement;
 
 // A first run has no node yet: the wizard collects the choices the node starts with.
-async function showWizardIfNeeded(): Promise<boolean> {
+async function showWizardIfNeeded(isMobile: boolean): Promise<boolean> {
   if (!isShownByTheApp()) return false;
   const state = await tauriSetup.state();
   if (!state.isNeeded) return false;
-  mount(SetupWizard, { target, props: { setup: tauriSetup, pickFolder: tauriSettings.pickFolder, state } });
+  mount(SetupWizard, { target, props: { setup: tauriSetup, pickFolder: tauriSettings.pickFolder, state, isMobile } });
   return true;
 }
 
-if (!(await showWizardIfNeeded())) {
+const isMobile = isShownByTheApp() && (await isMobileApp());
+
+if (!(await showWizardIfNeeded(isMobile))) {
   const { client, transport } = await connectToNode();
   const toasts = new Toasts();
   const preferencesApi = new PreferencesApi(transport);
@@ -69,6 +71,7 @@ if (!(await showWizardIfNeeded())) {
     pairingApi: new PairingApi(transport),
     preferencesApi,
     desktop: isShownByTheApp() ? tauriSettings : null,
+    isMobile,
   };
   mount(App, { target, context: contextFor(context) });
 }
