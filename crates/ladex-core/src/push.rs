@@ -245,6 +245,25 @@ async fn withdraw(state: &NodeState, file: &PushedFile) {
     websocket::send_to(state, &file.from_session, declined).await;
 }
 
+/// A device turns down a file offered to it: one sent to it alone is declined at its node, and the device that offered
+/// a catalog file is just told.
+pub async fn decline_offer(state: &NodeState, device: &SessionId, file_id: &str, offered_by: &SessionId) {
+    if !decline(state, device, file_id).await {
+        let declined = ServerMessage::FileOfferDeclined { file_id: file_id.to_string(), from_session_id: device.clone() };
+        crate::mesh::route_to_device(state, device, offered_by, declined).await;
+    }
+}
+
+/// The receiving device has saved the file, so this node's copy is no longer needed.
+pub async fn finish(state: &NodeState, device: &str, file_id: &str) {
+    let Some(push) = state.pushes.take_if(file_id, |push| push.file.to_session == device && push.is_accepted) else { return };
+    // The fetch may not have reported the file complete yet, and with the push gone it never would.
+    if !push.is_sender {
+        send_to_node(state, &push.other_node, MeshMessage::PushReceived { file_id: file_id.to_string() }).await;
+    }
+    state.store.remove(file_id);
+}
+
 /// The receiving node passes on its device's answer.
 pub async fn on_answer(state: &NodeState, from: &NodeId, file_id: &str, accepted: bool) {
     let is_from_receiver = |push: &Push| push.is_sender && push.other_node == *from;

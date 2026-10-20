@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { daemonCommand, dataDirVariable, nodeCommands, quote, settingsCommands } from './command-line';
+import { autostartCommand, daemonCommand, dataDirVariable, nodeCommands, quote, settingsCommands } from './command-line';
 import type { PreferencesView } from './preferences-api';
 
 function view(overrides: Partial<PreferencesView> = {}): PreferencesView {
@@ -67,6 +67,17 @@ describe('commands', () => {
 
   it('run_the_node_without_the_app_with_its_storage_limit', () => {
     expect(daemonCommand(view()).command).toBe('ladex --storage-limit-gb 20');
+  });
+
+  it('cover_what_only_the_app_did_before', () => {
+    const commands = nodeCommands(view()).map((hint) => hint.command);
+    expect(commands).toEqual(expect.arrayContaining(['ladex receive', 'ladex unshare <name>', 'ladex guests', 'ladex chat "<message>"']));
+    expect(settingsCommands(view()).map((hint) => hint.command)).toContain('ladex passphrase set --generate');
+  });
+
+  it('start_the_node_at_login_on_its_own_data_folder', () => {
+    const custom = view({ is_default_data_dir: false, data_dir: '/srv/ladex' });
+    expect(autostartCommand(custom).command).toBe('ladex --data-dir /srv/ladex autostart on');
   });
 });
 

@@ -1,6 +1,6 @@
 <script lang="ts">
   import CopyButton from '../../components/CopyButton.svelte';
-  import { daemonCommand, dataDirVariable, nodeCommands, settingsCommands } from '../command-line';
+  import { autostartCommand, daemonCommand, dataDirVariable, nodeCommands, settingsCommands } from '../command-line';
   import type { PreferencesView } from '../preferences-api';
 
   let { view }: { view: PreferencesView } = $props();
@@ -8,7 +8,7 @@
   const groups = $derived([
     { title: 'Work with this node', hints: nodeCommands(view) },
     { title: 'Settings', hints: settingsCommands(view) },
-    { title: 'Without the app', hints: [daemonCommand(view)] },
+    { title: 'Without the app', hints: [daemonCommand(view), autostartCommand(view)] },
   ]);
 </script>
 

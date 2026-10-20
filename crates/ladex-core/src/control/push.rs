@@ -32,14 +32,14 @@ async fn find_device(state: &NodeState, wanted: &str) -> anyhow::Result<Device> 
     }
 }
 
-// The command line as a device: a push has to come from one, and its answers are sent to it.
-struct CommandLineDevice {
-    id: SessionId,
-    inbox: UnboundedReceiver<ServerMessage>,
+// The command line as a device: a push has to come from one, and its answers and offers are sent to it.
+pub(super) struct CommandLineDevice {
+    pub(super) id: SessionId,
+    pub(super) inbox: UnboundedReceiver<ServerMessage>,
 }
 
 impl CommandLineDevice {
-    async fn join(state: &NodeState) -> Self {
+    pub(super) async fn join(state: &NodeState, name: &str) -> Self {
         let id = share::new_id("cli");
         let (tab, inbox) = mpsc::unbounded_channel();
         state.local_senders.write().await.insert(id.clone(), tab);
@@ -52,7 +52,7 @@ impl CommandLineDevice {
             left: false,
             left_at: None,
             hosting_node_name: Some(state.node_name.clone()),
-            nickname: Some(validate::clean_label(&state.node_name, validate::MAX_NICKNAME_CHARS)).filter(|name| !name.is_empty()),
+            nickname: Some(validate::clean_label(name, validate::MAX_NICKNAME_CHARS)).filter(|name| !name.is_empty()),
             version: state.clock.now(),
         };
         let total_peers = {
@@ -65,7 +65,7 @@ impl CommandLineDevice {
         Self { id, inbox }
     }
 
-    async fn leave(self, state: &NodeState) {
+    pub(super) async fn leave(self, state: &NodeState) {
         state.local_senders.write().await.remove(&self.id);
         websocket::cleanup_peer(state, &self.id).await;
     }
@@ -78,7 +78,7 @@ pub(super) async fn send_to_device(state: &NodeState, paths: &[PathBuf], wanted:
     for path in paths {
         total += share::regular_file_size(path).map_err(|e| anyhow!("{e:#} (only files can be sent to one device)"))?;
     }
-    let mut sender = CommandLineDevice::join(state).await;
+    let mut sender = CommandLineDevice::join(state, &state.node_name).await;
     let outcome = offer_and_wait(state, &mut sender, paths, &target, &mut Progress::new(events, total)).await;
     sender.leave(state).await;
     outcome

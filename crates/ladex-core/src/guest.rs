@@ -123,6 +123,85 @@ pub async fn share_upload(state: &NodeState, upload: &uploads::Upload, blob: &Bl
     state::share_file(state, entry).await.map_err(ShareError::Refused)
 }
 
+/// A guest's upload waiting for the person at the node's machine to accept it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaitingUpload {
+    pub id: String,
+    pub guest_id: String,
+    pub guest: Option<String>,
+    pub name: String,
+    pub size: u64,
+    pub mime_type: String,
+    pub waiting_secs: u64,
+}
+
+/// The guests' uploads waiting for approval, oldest first.
+pub fn waiting_uploads(state: &NodeState) -> Vec<WaitingUpload> {
+    let uploads = state.guests.uploads.awaiting_approval().into_iter();
+    uploads
+        .map(|upload| WaitingUpload {
+            guest: state.guests.sessions.label_of(&upload.guest_id),
+            waiting_secs: upload.age().as_secs(),
+            id: upload.id,
+            guest_id: upload.guest_id,
+            name: upload.name,
+            size: upload.size,
+            mime_type: upload.mime_type,
+        })
+        .collect()
+}
+
+/// Accepts a waiting upload and lists it as shared by its guest.
+pub async fn approve_upload(state: &NodeState, id: &str) -> Result<FileView, ApprovalError> {
+    // Moved first, so two approvals at once cannot both list the file.
+    let upload = state
+        .guests
+        .uploads
+        .transition(id, uploads::UploadState::AwaitingApproval, uploads::UploadState::Shared)
+        .ok_or(ApprovalError::NotWaiting)?;
+    let Some(blob) = state.store.get(id) else {
+        state.guests.uploads.remove(id);
+        return Err(ApprovalError::NotWaiting);
+    };
+    match share_upload(state, &upload, &blob).await {
+        Ok(file) => {
+            tracing::info!("Guest: {} from {} accepted by the host", file.name, upload.guest_id);
+            Ok(file)
+        }
+        Err(e) => {
+            state.guests.uploads.transition(id, uploads::UploadState::Shared, uploads::UploadState::AwaitingApproval);
+            Err(ApprovalError::Share(e))
+        }
+    }
+}
+
+/// Throws away a waiting upload; false if no such upload is waiting.
+pub fn deny_upload(state: &NodeState, id: &str) -> bool {
+    let waiting = state.guests.uploads.get(id).filter(|upload| upload.state == uploads::UploadState::AwaitingApproval);
+    let Some(upload) = waiting else { return false };
+    state.guests.uploads.remove(&upload.id);
+    state.store.remove(&upload.id);
+    tracing::info!("Guest: {} from {} declined by the host", upload.name, upload.guest_id);
+    true
+}
+
+#[derive(Debug)]
+pub enum ApprovalError {
+    NotWaiting,
+    Share(ShareError),
+}
+
+impl std::fmt::Display for ApprovalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ApprovalError::NotWaiting => f.write_str("no such upload is waiting"),
+            ApprovalError::Share(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for ApprovalError {}
+
 #[derive(Debug)]
 pub enum ShareError {
     Incomplete,

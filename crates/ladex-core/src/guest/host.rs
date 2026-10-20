@@ -4,12 +4,11 @@ use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
 use hyper::http::request::Parts;
 use hyper::{Method, StatusCode};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use super::api::{refuse, require_same_origin, GuestApi, Outcome};
 use super::invites::display_code;
-use super::uploads::{Upload, UploadState};
-use super::{invite_link, revoke_guest, share_upload, Permission};
+use super::{approve_upload, deny_upload, invite_link, revoke_guest, waiting_uploads, ApprovalError, Permission};
 use crate::files_api::json;
 use crate::server::{peer_ip, PeerAddr};
 use crate::tls;
@@ -20,17 +19,6 @@ const MAX_REQUEST_BYTES: usize = 1024;
 struct InviteRequest {
     #[serde(default)]
     permission: Permission,
-}
-
-#[derive(Serialize)]
-struct WaitingUpload {
-    id: String,
-    guest_id: String,
-    guest: Option<String>,
-    name: String,
-    size: u64,
-    mime_type: String,
-    waiting_secs: u64,
 }
 
 impl GuestApi {
@@ -46,7 +34,7 @@ impl GuestApi {
             (Method::POST, ["invites"]) => self.issue_invite(body).await,
             (Method::GET, ["sessions"]) => Ok(json(StatusCode::OK, &serde_json::json!({ "guests": self.state.guests.sessions.list() }))),
             (Method::DELETE, ["sessions", id]) => self.sign_out(id),
-            (Method::GET, ["uploads"]) => Ok(self.waiting_uploads()),
+            (Method::GET, ["uploads"]) => Ok(json(StatusCode::OK, &serde_json::json!({ "uploads": waiting_uploads(&self.state) }))),
             (Method::POST, ["uploads", id, "approve"]) => self.approve(id).await,
             (Method::POST, ["uploads", id, "deny"]) => self.deny(id),
             _ => Err(refuse(StatusCode::NOT_FOUND, "not found")),
@@ -93,57 +81,18 @@ impl GuestApi {
         }
     }
 
-    fn waiting_uploads(&self) -> hyper::Response<crate::server::ServerBody> {
-        let waiting: Vec<WaitingUpload> = self
-            .state
-            .guests
-            .uploads
-            .awaiting_approval()
-            .into_iter()
-            .map(|upload| WaitingUpload {
-                guest: self.state.guests.sessions.label_of(&upload.guest_id),
-                waiting_secs: upload.age().as_secs(),
-                id: upload.id,
-                guest_id: upload.guest_id,
-                name: upload.name,
-                size: upload.size,
-                mime_type: upload.mime_type,
-            })
-            .collect();
-        json(StatusCode::OK, &serde_json::json!({ "uploads": waiting }))
-    }
-
     async fn approve(&self, id: &str) -> Outcome {
-        let state = &self.state;
-        let not_found = || refuse(StatusCode::NOT_FOUND, "no such upload is waiting");
-        // Moved first, so two approvals at once cannot both list the file.
-        let upload: Upload =
-            state.guests.uploads.transition(id, UploadState::AwaitingApproval, UploadState::Shared).ok_or_else(not_found)?;
-        let Some(blob) = state.store.get(id) else {
-            state.guests.uploads.remove(id);
-            return Err(not_found());
-        };
-        match share_upload(state, &upload, &blob).await {
-            Ok(file) => {
-                tracing::info!("Guest: {} from {} accepted by the host", file.name, upload.guest_id);
-                Ok(json(StatusCode::OK, &serde_json::json!({ "success": true, "file": file })))
-            }
-            Err(e) => {
-                state.guests.uploads.transition(id, UploadState::Shared, UploadState::AwaitingApproval);
-                Err(refuse(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))
-            }
+        match approve_upload(&self.state, id).await {
+            Ok(file) => Ok(json(StatusCode::OK, &serde_json::json!({ "success": true, "file": file }))),
+            Err(ApprovalError::NotWaiting) => Err(refuse(StatusCode::NOT_FOUND, "no such upload is waiting")),
+            Err(e) => Err(refuse(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
         }
     }
 
     fn deny(&self, id: &str) -> Outcome {
-        let state = &self.state;
-        let waiting = state.guests.uploads.get(id).filter(|upload| upload.state == UploadState::AwaitingApproval);
-        let Some(upload) = waiting else {
-            return Err(refuse(StatusCode::NOT_FOUND, "no such upload is waiting"));
-        };
-        state.guests.uploads.remove(&upload.id);
-        state.store.remove(&upload.id);
-        tracing::info!("Guest: {} from {} declined by the host", upload.name, upload.guest_id);
-        Ok(json(StatusCode::OK, &serde_json::json!({ "success": true })))
+        match deny_upload(&self.state, id) {
+            true => Ok(json(StatusCode::OK, &serde_json::json!({ "success": true }))),
+            false => Err(refuse(StatusCode::NOT_FOUND, "no such upload is waiting")),
+        }
     }
 }

@@ -5,7 +5,7 @@ use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 use super::Permission;
@@ -22,7 +22,7 @@ pub struct GuestSession {
     pub expires_in: Duration,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GuestSummary {
     pub id: String,
     pub label: String,

@@ -150,6 +150,20 @@ ladex invite                         # a one-time browser invitation as a link, 
 ladex invite --permission upload     # also read-only (default) or upload-with-approval
 ladex doctor                         # check that the node is running and reachable (also under Network in the app)
 ladex settings                       # show the node's settings; --storage-limit-gb, --auto-accept, --downloads-dir change them
+ladex unshare report.pdf             # stop sharing something this node shared
+ladex receive                        # be a device others can send files to (--name, -o DIR, --yes)
+ladex chat                           # read the room chat; ladex chat "hello" posts to it
+ladex guests                         # browser guests and their uploads; sign-out, approve and deny act on them
+ladex passphrase                     # show the mesh passphrase; passphrase set [--generate] changes it
+ladex autostart on                   # start this node when you log in (off turns it off)
+```
+
+Everything the app does can be done this way, with no app installed. On a machine with only the command line:
+
+```bash
+ladex passphrase set --generate      # make up a mesh passphrase (or `passphrase set` and type one from another machine)
+ladex                                # start the node; it uses the saved passphrase
+ladex autostart on                   # and from now on, start it at login
 ```
 
 - Add `--json` to any command for output a script can read. A command exits with 0 on success and 1 on failure.
@@ -158,6 +172,10 @@ ladex settings                       # show the node's settings; --storage-limit
 - `send` and `seed` copy what they share into the node's store, so a shared file takes its size twice on disk.
 - `send --to` takes a device's name or its id from `ladex devices`, and only sends files, not folders. Ctrl-C while it waits leaves the offer open.
 - `seed --watch` shares the whole folder afresh when it changes and takes the earlier version down, so downloads of the earlier version stop.
+- `receive` keeps running as a device called after the node (or `--name`), so others can send it files with `send --to` or from the app. Files the incoming files rule allows (`ladex settings --auto-accept`) are saved at once; you are asked about the rest, and with no terminal to ask at they are declined unless you pass `--yes`.
+- `chat` posts as this node, under its name.
+- `passphrase` works with or without a running node: with one, a new passphrase takes effect when the node restarts; without one, it is saved in the data folder for the next `ladex` or app start.
+- `autostart` uses a systemd user service on Linux (`systemctl --user`; add `loginctl enable-linger` to start it at boot without logging in), a launch agent on macOS, and a Run entry on Windows, whose console window starts minimized. It runs `ladex --data-dir DIR` with the passphrase and storage limit saved in that folder.
 - The passphrase, storage limit and downloads folder chosen in the app are kept in the data folder, so `ladex` on the same folder uses them: it takes the saved passphrase unless you pass one, and the saved storage limit unless you pass `--storage-limit-gb`.
 - Commands reach the node through a port on `127.0.0.1` and a token in `control.json` in the data folder, which only your user can read.
 - A data folder belongs to one node at a time, held with a lock on `node.lock` in it. Starting `ladex` or the app on a folder that is already in use is refused, with the running node's name and port; the commands above keep working with it.
@@ -168,7 +186,7 @@ ladex settings                       # show the node's settings; --storage-limit
 ```bash
 cargo test                         # unit tests: storage, scheduling, merging, sessions, handshake, zip, ...
 (cd ui && npm test)                # the web UI
-cargo build && for t in data folder restart push cli; do node tests/e2e/$t.test.js; done   # real nodes, real HTTP
+cargo build && for t in data folder restart push cli parity; do node tests/e2e/$t.test.js; done   # real nodes, real HTTP
 ```
 
 ## Command Line Options

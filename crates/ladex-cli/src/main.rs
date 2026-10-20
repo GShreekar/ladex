@@ -12,9 +12,12 @@ use ladex_core::{auth, tls};
 // The web UI built from `ui/` by build.rs.
 static UI_DIR: Dir = include_dir!("$OUT_DIR/ui");
 
+mod autostart;
 mod commands;
 mod doctor;
 mod output;
+mod passphrase;
+mod receive;
 
 #[derive(Parser)]
 #[command(name = "ladex", version)]

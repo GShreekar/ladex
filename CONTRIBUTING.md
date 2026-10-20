@@ -25,7 +25,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --exclude ladex-app --all-targets -- -D warnings
 cargo test --workspace --exclude ladex-app
 (cd ui && npm ci && npm run check && npm test)
-cargo build && for t in data folder restart push cli; do node tests/e2e/$t.test.js; done
+cargo build && for t in data folder restart push cli parity; do node tests/e2e/$t.test.js; done
 ```
 
 `tests/e2e/swarm.test.js` (a source killed mid-transfer, `kill -9` on a receiver, ten receivers) moves a few hundred MiB and takes a couple of minutes, so it is not in that list; run it with `cargo build --release` and `LADEX_BIN=target/release/ladex`. The check that ten nodes get a file within about twice the time one does is `crates/ladex-core/tests/swarm.rs`, where `LinkedMesh::limit_bandwidth` gives each node a network card of fixed speed.
