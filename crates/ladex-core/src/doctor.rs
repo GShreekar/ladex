@@ -125,7 +125,11 @@ fn check_passphrase(status: &Status) -> Check {
 
 fn check_discovery(status: &Status, is_multicast_heard: Option<bool>) -> Check {
     let Some(port) = status.discovery_port else {
-        return check("Discovery", Verdict::Warning, "switched off; other nodes must be given with --peer");
+        return check(
+            "Discovery",
+            Verdict::Warning,
+            "switched off; add other nodes by address (Network page, or ladex settings --add-peer)",
+        );
     };
     let announcing = format!("announcing on UDP port {port}; nodes connect on UDP port {}", status.quic_port);
     match is_multicast_heard {

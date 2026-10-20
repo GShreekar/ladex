@@ -44,7 +44,7 @@
 
 <style>
   main {
-    min-height: 100vh;
+    min-height: var(--viewport-height);
     display: grid;
     place-items: center;
     padding: 16px;

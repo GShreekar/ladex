@@ -277,6 +277,8 @@ pub struct Settings {
     pub local_http_port: Option<u16>,
     /// Whether the node's secrets live in the OS keychain, when there is one.
     pub use_keychain: bool,
+    /// The peers given when the node started (`--peer`), kept connected for as long as it runs.
+    pub manual_peers: Vec<SocketAddr>,
 }
 
 /// The command stopped listening, so there is nobody to finish the work for.

@@ -1,13 +1,14 @@
 //! What a person chooses about their node in the app or with `ladex settings`: kept in the data directory, so the app
 //! and the daemon on one data directory behave the same.
 
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::RwLock;
 
 use serde::{Deserialize, Serialize};
 
-use crate::node::DEFAULT_STORAGE_LIMIT_GIB;
+use crate::node::{DEFAULT_HTTP_PORT, DEFAULT_STORAGE_LIMIT_GIB};
 use crate::{persist, NodeState};
 
 const FILE_NAME: &str = "preferences.json";
@@ -75,11 +76,19 @@ pub struct Preferences {
     pub downloads_dir: Option<PathBuf>,
     pub storage_limit_gib: u64,
     pub auto_accept: AutoAccept,
+    /// Other nodes this one keeps connected by address, for networks where discovery cannot find them.
+    pub peer_addresses: Vec<SocketAddr>,
 }
 
 impl Default for Preferences {
     fn default() -> Self {
-        Self { is_setup_done: false, downloads_dir: None, storage_limit_gib: DEFAULT_STORAGE_LIMIT_GIB, auto_accept: AutoAccept::default() }
+        Self {
+            is_setup_done: false,
+            downloads_dir: None,
+            storage_limit_gib: DEFAULT_STORAGE_LIMIT_GIB,
+            auto_accept: AutoAccept::default(),
+            peer_addresses: Vec::new(),
+        }
     }
 }
 
@@ -98,11 +107,14 @@ pub struct Update {
     pub downloads_dir: Option<PathBuf>,
     pub storage_limit_gib: Option<u64>,
     pub auto_accept: Option<AutoAccept>,
+    /// The whole list, as typed: `192.168.1.20:8080`, or just the IP for the default port.
+    pub peer_addresses: Option<Vec<String>>,
 }
 
 #[derive(Debug)]
 pub enum Invalid {
     StorageLimit,
+    PeerAddress(String),
     StorageBelowUsed { used_bytes: u64 },
     DownloadsDir { path: PathBuf, reason: String },
     Save(std::io::Error),
@@ -119,6 +131,7 @@ impl std::fmt::Display for Invalid {
                     used_bytes.div_ceil(BYTES_PER_MIB)
                 )
             }
+            Self::PeerAddress(text) => write!(f, "{text:?} is not a device address; type its IP, such as 192.168.1.20:{DEFAULT_HTTP_PORT}"),
             Self::DownloadsDir { path, reason } => write!(f, "cannot save files into {}: {reason}", path.display()),
             Self::Save(e) => write!(f, "could not save the preferences: {e}"),
         }
@@ -167,6 +180,9 @@ impl PreferencesStore {
         }
         if let Some(auto_accept) = update.auto_accept {
             next.auto_accept = auto_accept;
+        }
+        if let Some(addresses) = &update.peer_addresses {
+            next.peer_addresses = checked_peer_addresses(addresses)?;
         }
         self.save(&next)?;
         *self.current.write().unwrap() = next.clone();
@@ -220,16 +236,40 @@ fn checked_downloads_dir(path: &Path) -> Result<Option<PathBuf>, Invalid> {
     Ok(Some(path.to_path_buf()))
 }
 
+/// Reads typed addresses, leaving out repeats; a missing port is the one nodes use unless told otherwise.
+pub fn checked_peer_addresses(texts: &[String]) -> Result<Vec<SocketAddr>, Invalid> {
+    let mut addresses = Vec::new();
+    for text in texts {
+        let address = parse_peer_address(text.trim()).ok_or_else(|| Invalid::PeerAddress(text.clone()))?;
+        if !addresses.contains(&address) {
+            addresses.push(address);
+        }
+    }
+    Ok(addresses)
+}
+
+fn parse_peer_address(text: &str) -> Option<SocketAddr> {
+    let address = match text.parse::<SocketAddr>() {
+        Ok(address) => address,
+        Err(_) => SocketAddr::new(text.parse::<IpAddr>().ok()?, DEFAULT_HTTP_PORT),
+    };
+    (address.port() != 0 && !address.ip().is_unspecified()).then_some(address)
+}
+
 /// The free space on the disk that holds `path`, even when the folder is not there yet.
 pub fn free_space_at(path: &Path) -> Option<u64> {
     let existing = path.ancestors().find(|ancestor| ancestor.exists())?;
     fs4::available_space(existing).ok()
 }
 
-/// Applies a change to a running node: saved, and the storage limit takes effect at once.
+/// Applies a change to a running node: saved, and the storage limit and new peer addresses take effect at once.
 pub fn apply(state: &NodeState, update: &Update) -> Result<Preferences, Invalid> {
+    let before = state.preferences.get();
     let preferences = state.preferences.update(update, state.store.used_bytes())?;
     state.store.set_quota(preferences.storage_limit_bytes());
+    for &address in preferences.peer_addresses.iter().filter(|address| !before.peer_addresses.contains(address)) {
+        crate::mesh::dialer::keep_connected_in_background(state, address);
+    }
     Ok(preferences)
 }
 
@@ -246,6 +286,8 @@ pub struct View {
     pub disk_free_bytes: Option<u64>,
     /// "windows" or "unix": which shell quoting a copied command needs.
     pub platform: String,
+    /// What another device types to add this one by address; None while this node has no network address.
+    pub this_address: Option<String>,
 }
 
 pub fn view(state: &NodeState) -> View {
@@ -258,6 +300,7 @@ pub fn view(state: &NodeState) -> View {
         store_used_bytes: state.store.used_bytes(),
         disk_free_bytes: fs4::available_space(&data_dir).ok(),
         platform: if cfg!(windows) { "windows" } else { "unix" }.to_string(),
+        this_address: state.local_ip.map(|ip| SocketAddr::new(ip, state.quic_port).to_string()),
         data_dir,
     }
 }
@@ -282,6 +325,59 @@ mod tests {
 
     fn limit(gib: u64) -> Update {
         Update { storage_limit_gib: Some(gib), ..Default::default() }
+    }
+
+    fn addresses(texts: &[&str]) -> Result<Vec<SocketAddr>, Invalid> {
+        checked_peer_addresses(&texts.iter().map(ToString::to_string).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn a_peer_address_with_a_port_is_kept_as_typed() {
+        assert_eq!(addresses(&["192.168.1.20:9000"]).unwrap(), vec!["192.168.1.20:9000".parse().unwrap()]);
+    }
+
+    #[test]
+    fn a_peer_address_without_a_port_gets_the_default_one() {
+        assert_eq!(addresses(&["192.168.1.20"]).unwrap(), vec![SocketAddr::from(([192, 168, 1, 20], DEFAULT_HTTP_PORT))]);
+    }
+
+    #[test]
+    fn spaces_around_a_peer_address_are_ignored() {
+        assert_eq!(addresses(&[" 10.0.0.2:8080 "]).unwrap(), vec!["10.0.0.2:8080".parse().unwrap()]);
+    }
+
+    #[test]
+    fn the_same_peer_address_twice_is_kept_once() {
+        assert_eq!(addresses(&["10.0.0.2", "10.0.0.2:8080"]).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_name_is_not_a_peer_address() {
+        assert!(matches!(addresses(&["my-laptop"]), Err(Invalid::PeerAddress(_))));
+    }
+
+    #[test]
+    fn an_unspecified_ip_is_not_a_peer_address() {
+        assert!(matches!(addresses(&["0.0.0.0:8080"]), Err(Invalid::PeerAddress(_))));
+    }
+
+    #[test]
+    fn port_zero_is_not_a_peer_address() {
+        assert!(matches!(addresses(&["10.0.0.2:0"]), Err(Invalid::PeerAddress(_))));
+    }
+
+    #[test]
+    fn saved_peer_addresses_are_there_after_a_restart() {
+        let (dir, store) = store();
+        store.update(&Update { peer_addresses: Some(vec!["10.0.0.2".to_string()]), ..Default::default() }, 0).unwrap();
+        assert_eq!(PreferencesStore::open(dir.path()).get().peer_addresses.len(), 1);
+    }
+
+    #[test]
+    fn preferences_saved_before_peer_addresses_existed_still_load() {
+        let (dir, _store) = store();
+        std::fs::write(dir.path().join(FILE_NAME), br#"{"is_setup_done":true,"storage_limit_gib":5}"#).unwrap();
+        assert!(load(dir.path()).peer_addresses.is_empty());
     }
 
     #[test]

@@ -294,7 +294,7 @@ impl Node {
 
         let mut background_tasks = vec![tokio::spawn(mesh::quic::accept_loop(state.clone(), mesh_endpoint.clone()))];
         background_tasks.extend(start_control_socket(&state, &config, &mut notices).await);
-        background_tasks.extend(keep_manual_peers_connected(&state, &config.manual_peers));
+        background_tasks.extend(keep_manual_peers_connected(&state, &peers_by_address(&state)));
         if let Some(saved) = &saved {
             persist::redial(&state, saved.peers.clone());
         }
@@ -475,6 +475,7 @@ fn new_state(config: &NodeConfig, parts: StateParts) -> NodeState {
             discovery_port: config.discovery_port,
             local_http_port: parts.local_http_port,
             use_keychain: config.use_keychain,
+            manual_peers: config.manual_peers.clone(),
         }),
     }
 }
@@ -508,6 +509,17 @@ async fn start_control_socket(state: &NodeState, config: &NodeConfig, notices: &
             None
         }
     }
+}
+
+// The `--peer` addresses and the ones added in the app or with `ladex settings`, each once.
+fn peers_by_address(state: &NodeState) -> Vec<SocketAddr> {
+    let mut addresses = state.started_with.manual_peers.clone();
+    for address in state.preferences.get().peer_addresses {
+        if !addresses.contains(&address) {
+            addresses.push(address);
+        }
+    }
+    addresses
 }
 
 fn keep_manual_peers_connected(state: &NodeState, peers: &[SocketAddr]) -> Vec<JoinHandle<()>> {

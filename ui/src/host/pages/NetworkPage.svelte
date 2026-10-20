@@ -5,6 +5,7 @@
   import type { IconName } from '../../components/icons';
   import { useHost } from '../host-context';
   import { formatReport, worstVerdict } from '../doctor-report';
+  import AddressSection from '../network/AddressSection.svelte';
   import PairingSection from '../network/PairingSection.svelte';
   import TrustSection from '../network/TrustSection.svelte';
   import type { TrustedNode } from '../pairing-api';
@@ -101,6 +102,7 @@
     </section>
   {/if}
 
+  <AddressSection />
   <PairingSection onpaired={loadTrusted} />
   <TrustSection nodes={trusted} onchange={loadTrusted} />
 </div>

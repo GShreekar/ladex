@@ -200,8 +200,8 @@
   main {
     display: grid;
     place-items: center;
-    min-height: 100vh;
-    padding: 24px 16px;
+    min-height: var(--viewport-height);
+    padding: 24px 16px calc(24px + var(--safe-bottom));
   }
 
   .wizard {
