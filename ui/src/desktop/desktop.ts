@@ -49,6 +49,9 @@ interface WireSetupState {
   data_dir: string;
 }
 
+/** Whether the app runs on a phone, which has no tray, login item, folder picker or command line. */
+export const isMobileApp = (): Promise<boolean> => invoke<boolean>('ladex_is_mobile');
+
 export const tauriDesktop: DesktopShell = {
   notify: (title, body) => void invoke('ladex_notify', { title, body }).catch(() => {}),
   setOtherDevices: (count) => void invoke('ladex_set_other_devices', { count }).catch(() => {}),

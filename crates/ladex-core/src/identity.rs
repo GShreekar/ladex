@@ -11,6 +11,7 @@ use crate::types::NodeId;
 
 const NODE_ID_CHARS: usize = 20;
 const KEY_FILE: &str = "identity.key";
+#[cfg(not(target_os = "android"))]
 const KEYCHAIN_SERVICE: &str = "ladex";
 
 pub struct Identity {
@@ -92,7 +93,12 @@ pub(crate) trait SecretStore {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 pub(crate) struct Keychain(keyring::Entry);
+
+// Android has no keychain the core can reach, so secrets stay in files in the app's private storage.
+#[cfg(target_os = "android")]
+pub(crate) enum Keychain {}
 
 impl Keychain {
     /// None when this machine has no usable keychain (e.g. Linux without a Secret Service).
@@ -100,11 +106,29 @@ impl Keychain {
         Self::for_account(&keychain_account(dir))
     }
 
+    #[cfg(not(target_os = "android"))]
     pub(crate) fn for_account(account: &str) -> Option<Self> {
         keyring::Entry::new(KEYCHAIN_SERVICE, account).ok().map(Keychain)
     }
+
+    #[cfg(target_os = "android")]
+    pub(crate) fn for_account(_account: &str) -> Option<Self> {
+        None
+    }
 }
 
+#[cfg(target_os = "android")]
+impl SecretStore for Keychain {
+    fn read(&self) -> anyhow::Result<Option<Vec<u8>>> {
+        match *self {}
+    }
+
+    fn write(&self, _secret: &[u8]) -> anyhow::Result<()> {
+        match *self {}
+    }
+}
+
+#[cfg(not(target_os = "android"))]
 impl SecretStore for Keychain {
     fn read(&self) -> anyhow::Result<Option<Vec<u8>>> {
         match self.0.get_secret() {

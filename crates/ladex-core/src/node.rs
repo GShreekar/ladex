@@ -42,6 +42,8 @@ const ISOLATION_DIAGNOSTIC_DELAY: Duration = Duration::from_secs(10);
 /// How a node is set up; `NodeConfig::new` gives the defaults the `ladex` command uses.
 pub struct NodeConfig {
     pub data_dir: PathBuf,
+    /// Where the guest page's TLS certificate is kept, so guests see the same one each run.
+    pub certificate_dir: PathBuf,
     /// The built web UI the node serves to browsers.
     pub ui_assets: Arc<dyn UiAssets>,
     /// Required for browser logins and proven (never sent) in the mesh handshake; None = open node.
@@ -66,6 +68,7 @@ impl NodeConfig {
     pub fn new(data_dir: PathBuf, ui_assets: Arc<dyn UiAssets>) -> Self {
         Self {
             data_dir,
+            certificate_dir: tls::config_dir(),
             ui_assets,
             passphrase: None,
             http_port: DEFAULT_HTTP_PORT,
@@ -372,7 +375,7 @@ fn prepare_tls(config: &NodeConfig, local_ips: &[IpAddr], notices: &mut Vec<Noti
     tls::install_crypto_provider();
     let mut names: Vec<String> = vec!["localhost".to_string(), "127.0.0.1".to_string(), "ladex.local".to_string()];
     names.extend(local_ips.iter().map(IpAddr::to_string));
-    match tls::prepare_server_identity(&names) {
+    match tls::prepare_server_identity(&config.certificate_dir, &names) {
         Ok((server_config, fingerprint)) => (Some(server_config), fingerprint),
         Err(e) => {
             notices.push(Notice::CertificateUnavailable(e.to_string()));

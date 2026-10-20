@@ -10,7 +10,7 @@
   import StartupSection from '../settings/StartupSection.svelte';
   import StorageSection from '../settings/StorageSection.svelte';
 
-  const { room, preferencesApi, desktop, toasts } = useHost();
+  const { room, preferencesApi, desktop, isMobile, toasts } = useHost();
 
   let nickname = $state('');
   let view = $state<PreferencesView | null>(null);
@@ -59,7 +59,7 @@
     <ReceivingSection {view} onchange={(next) => (view = next)} />
     <StorageSection {view} onchange={(next) => (view = next)} />
     <PassphraseSection {view} onchange={(next) => (view = next)} />
-    {#if desktop}<StartupSection />{/if}
+    {#if desktop && !isMobile}<StartupSection />{/if}
   {/if}
 
   <section class="card">
@@ -73,7 +73,7 @@
     </div>
   </section>
 
-  {#if isHost && view}
+  {#if isHost && view && !isMobile}
     <CommandLineSection {view} />
   {/if}
 

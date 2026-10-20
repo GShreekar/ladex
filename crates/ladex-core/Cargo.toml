@@ -45,11 +45,14 @@ crc32fast.workspace = true
 blake3.workspace = true
 rayon.workspace = true
 ed25519-dalek.workspace = true
-keyring.workspace = true
 data-encoding.workspace = true
 redb.workspace = true
 quinn.workspace = true
 rustls.workspace = true
+
+# Android has no keyring backend that works without the app's Java context; secrets use private files there.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+keyring.workspace = true
 
 [dev-dependencies]
 # Turns on the testing module for this crate's own integration tests in tests/.

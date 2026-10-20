@@ -5,7 +5,7 @@
 
   let { view, onchange }: { view: PreferencesView; onchange: (view: PreferencesView) => void } = $props();
 
-  const { preferencesApi, desktop, toasts } = useHost();
+  const { preferencesApi, desktop, isMobile, toasts } = useHost();
 
   const DEFAULT_SIZE_LIMIT_MIB = 500;
   const rules: Array<{ id: AutoAcceptFrom; label: string; hint: string }> = [
@@ -67,8 +67,8 @@
       <span class="label" id="downloads-label">Save received files in</span>
       <div class="row">
         <code class="path truncate" aria-labelledby="downloads-label">{downloadsFolder ?? 'the system downloads folder'}</code>
-        <button class="btn" onclick={chooseFolder}>Change…</button>
-        {#if view.preferences.downloads_dir}
+        {#if !isMobile}<button class="btn" onclick={chooseFolder}>Change…</button>{/if}
+        {#if view.preferences.downloads_dir && !isMobile}
           <button class="btn btn-ghost" onclick={() => save({ downloads_dir: '' })}>Use the default</button>
         {/if}
       </div>
