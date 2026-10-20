@@ -18,7 +18,7 @@ use super::endpoint::{Accepting, MeshEndpoint, PeerConnection, HUNG_UP};
 use super::frames::{FrameSender, FramedStream};
 use super::{
     authenticate_inbound, complete_pairing, connection_ended, dialer, dispatch, handshake_local, keeps_open_connection, note_clock_skew,
-    start_session, AuthFailure, Intro, MeshMessage, Session, MAX_MESH_MESSAGE_BYTES, PROTOCOL_VERSION,
+    start_session, AlreadyConnected, AuthFailure, Intro, MeshMessage, Session, MAX_MESH_MESSAGE_BYTES, PROTOCOL_VERSION,
 };
 use crate::handshake::{self, Failure, Reason};
 use crate::transfer::wire::Fetch;
@@ -75,22 +75,28 @@ enum Purpose {
     Pair,
 }
 
+/// The node a dial reached.
+struct Reached {
+    node_id: NodeId,
+    name: String,
+}
+
 /// Dials the node `expected` at `addr`, authenticates it and starts the control loop.
 pub async fn connect(state: &NodeState, addr: SocketAddr, expected: &NodeId) -> anyhow::Result<()> {
     dial(state, addr, Target::Node(expected), Purpose::Join).await.map(drop)
 }
 
-/// Dials whichever node is at `addr`, authenticates it and starts the control loop.
-pub async fn join(state: &NodeState, addr: SocketAddr) -> anyhow::Result<()> {
-    dial(state, addr, Target::Address, Purpose::Join).await.map(drop)
+/// Dials whichever node is at `addr`, authenticates it and starts the control loop; returns its node id.
+pub async fn join(state: &NodeState, addr: SocketAddr) -> anyhow::Result<NodeId> {
+    dial(state, addr, Target::Address, Purpose::Join).await.map(|reached| reached.node_id)
 }
 
 /// Pairs with the node at `addr` once both people confirm the code; returns its name.
 pub async fn pair(state: &NodeState, addr: SocketAddr) -> anyhow::Result<String> {
-    dial(state, addr, Target::Address, Purpose::Pair).await
+    dial(state, addr, Target::Address, Purpose::Pair).await.map(|reached| reached.name)
 }
 
-async fn dial(state: &NodeState, addr: SocketAddr, target: Target<'_>, purpose: Purpose) -> anyhow::Result<String> {
+async fn dial(state: &NodeState, addr: SocketAddr, target: Target<'_>, purpose: Purpose) -> anyhow::Result<Reached> {
     let endpoint = state.mesh_endpoint.as_ref().context("this node has no QUIC endpoint")?;
     // In tests a FaultyLink may stand between two nodes, and every dial between them must go through it.
     #[cfg(any(test, feature = "test-support"))]
@@ -104,11 +110,15 @@ async fn dial(state: &NodeState, addr: SocketAddr, target: Target<'_>, purpose: 
     }
     let (send, recv) = connection.connection.open_bi().await?;
     let mut stream = FramedStream::new(send, recv, OPENING_MAX_FRAME);
-    let peer = open_outbound(state, &connection, &mut stream, purpose).await.map_err(|e| failure_error(addr, e))?;
+    let peer = match open_outbound(state, &connection, &mut stream, purpose).await {
+        Ok(peer) => peer,
+        Err(Failure::RejectedBy(Reason::Duplicate)) => return Err(AlreadyConnected(connection.node_id.clone()).into()),
+        Err(failure) => return Err(failure_error(addr, failure)),
+    };
     tracing::info!("Mesh: {addr} authenticated over QUIC (peer: {})", peer.node_id);
-    let name = peer.name.clone();
+    let reached = Reached { node_id: peer.node_id.clone(), name: peer.name.clone() };
     begin(state, connection, peer, stream, state.node_id.clone()).await;
-    Ok(name)
+    Ok(reached)
 }
 
 /// Accepts mesh connections until the endpoint closes, each on its own task.

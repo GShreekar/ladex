@@ -289,7 +289,7 @@ impl Node {
 
         let mut background_tasks = vec![tokio::spawn(mesh::quic::accept_loop(state.clone(), mesh_endpoint.clone()))];
         background_tasks.extend(start_control_socket(&state, &config, &mut notices).await);
-        background_tasks.extend(dial_manual_peers(&state, &config.manual_peers));
+        background_tasks.extend(keep_manual_peers_connected(&state, &config.manual_peers));
         if let Some(saved) = &saved {
             persist::redial(&state, saved.peers.clone());
         }
@@ -438,6 +438,7 @@ fn new_state(config: &NodeConfig, parts: StateParts) -> NodeState {
         pairings: Arc::new(pairing::Pairings::new()),
         mesh_peers: Arc::new(RwLock::new(HashMap::new())),
         dial_targets: Default::default(),
+        kept_peers: Default::default(),
         mesh_endpoint: Some(parts.mesh_endpoint),
         quic_port: parts.quic_port,
         passphrase: config.passphrase.clone(),
@@ -503,16 +504,14 @@ async fn start_control_socket(state: &NodeState, config: &NodeConfig, notices: &
     }
 }
 
-fn dial_manual_peers(state: &NodeState, peers: &[SocketAddr]) -> Vec<JoinHandle<()>> {
+fn keep_manual_peers_connected(state: &NodeState, peers: &[SocketAddr]) -> Vec<JoinHandle<()>> {
     peers
         .iter()
         .map(|&addr| {
             let state = state.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(MANUAL_PEER_DELAY).await;
-                if let Err(e) = mesh::quic::join(&state, addr).await {
-                    tracing::warn!("Manual peer connect to {addr} failed: {e}");
-                }
+                mesh::dialer::keep_connected(&state, addr).await;
             })
         })
         .collect()

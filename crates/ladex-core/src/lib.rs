@@ -76,6 +76,9 @@ pub struct NodeState {
     /// Peers this node is dialing, as the lower node id of the two.
     pub dial_targets: mesh::dialer::DialTargets,
 
+    /// Peers given by address, which this node keeps connected itself.
+    pub kept_peers: mesh::dialer::KeptPeers,
+
     /// The QUIC endpoint other nodes connect to; None for unit tests that need no network.
     pub mesh_endpoint: Option<Arc<mesh::endpoint::MeshEndpoint>>,
 
@@ -185,6 +188,7 @@ impl NodeState {
             pairings: Arc::new(pairing::Pairings::new()),
             mesh_peers: Arc::new(RwLock::new(HashMap::new())),
             dial_targets: Default::default(),
+            kept_peers: Default::default(),
             mesh_endpoint: None,
             quic_port: 0,
             passphrase: passphrase.map(String::from),

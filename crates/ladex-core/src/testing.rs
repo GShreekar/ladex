@@ -159,7 +159,7 @@ impl NodeHandle {
 
     /// Joins whichever node is at `peer`, as `--peer` does.
     pub async fn connect(&self, peer: SocketAddr) -> anyhow::Result<()> {
-        mesh::quic::join(&self.state, peer).await
+        mesh::quic::join(&self.state, peer).await.map(drop)
     }
 
     /// Joins `peer` by its node id, as discovery would after hearing its announce.

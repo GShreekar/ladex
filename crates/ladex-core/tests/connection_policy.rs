@@ -60,6 +60,47 @@ async fn the_higher_node_never_dials() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn the_higher_node_dials_a_peer_it_was_given_by_address() {
+    let nodes = spawn_pair().await;
+    let (lower, higher) = by_node_id(&nodes);
+    higher.state.kept_peers.lock().unwrap().insert(lower.state.node_id.clone());
+    mesh::dialer::dial(&higher.state, &lower.state.node_id, lower.addr);
+    assert!(eventually(async || connected_by(&nodes, higher).await).await);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_given_by_address_is_retried_until_it_answers() {
+    let nodes = spawn_pair().await;
+    let (lower, higher) = by_node_id(&nodes);
+    let relay = UdpRelay::start(lower.addr).await;
+    relay.go_silent();
+    let keeping = tokio::spawn({
+        let state = higher.state.clone();
+        let addr = relay.addr();
+        async move { mesh::dialer::keep_connected(&state, addr).await }
+    });
+    tokio::time::sleep(SHORT_SILENCE).await;
+    assert!(apart(lower, higher).await);
+
+    relay.resume();
+    assert!(eventually_within(IDLE_TIMEOUT_WAIT, async || fully_connected(&nodes).await).await, "never retried");
+    keeping.await.unwrap();
+    assert!(higher.state.kept_peers.lock().unwrap().contains(lower.node_id()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_given_by_address_that_is_already_connected_is_kept() {
+    let nodes = spawn_pair().await;
+    let (lower, higher) = by_node_id(&nodes);
+    lower.connect_quic(higher).await.unwrap();
+    assert!(eventually(async || connected_by(&nodes, lower).await).await);
+
+    mesh::dialer::keep_connected(&higher.state, lower.addr).await;
+    assert!(higher.state.kept_peers.lock().unwrap().contains(lower.node_id()));
+    assert!(connected_by(&nodes, lower).await);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn the_dial_loop_ends_once_connected() {
     let nodes = spawn_pair().await;
     let (lower, higher) = by_node_id(&nodes);
