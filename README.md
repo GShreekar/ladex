@@ -167,8 +167,8 @@ ladex settings                       # show the node's settings; --storage-limit
 
 ```bash
 cargo test                         # unit tests: storage, scheduling, merging, sessions, handshake, zip, ...
-node --test tests/js/*.test.js    # browser-side name handling; shares test cases with the Rust side
-cargo build && for t in data folder client restart push cli; do node tests/e2e/$t.test.js; done   # real nodes, real HTTP
+(cd ui && npm test)                # the web UI
+cargo build && for t in data folder restart push cli; do node tests/e2e/$t.test.js; done   # real nodes, real HTTP
 ```
 
 ## Command Line Options

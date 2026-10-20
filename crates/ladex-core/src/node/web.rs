@@ -12,47 +12,28 @@ pub trait UiAssets: Send + Sync {
     fn file(&self, path: &str) -> Option<&[u8]>;
 }
 
-/// The web UI a node serves, and whether it is the previous one.
-#[derive(Clone)]
-pub struct WebUi {
-    pub assets: Arc<dyn UiAssets>,
-    pub is_legacy: bool,
-}
-
 #[derive(Debug)]
 struct Unauthorized;
 impl warp::reject::Reject for Unauthorized {}
-
-#[derive(Debug)]
-struct AuthenticationRequired;
-impl warp::reject::Reject for AuthenticationRequired {}
 
 #[derive(Debug)]
 struct InvalidOrigin;
 impl warp::reject::Reject for InvalidOrigin {}
 
 /// Resolves the browser's login session; `None` without a passphrase, otherwise a missing session is rejected.
-fn with_session(state: NodeState, api: bool) -> impl Filter<Extract = (Option<sessions::SessionHandle>,), Error = warp::Rejection> + Clone {
+fn with_session(state: NodeState) -> impl Filter<Extract = (Option<sessions::SessionHandle>,), Error = warp::Rejection> + Clone {
     warp::cookie::optional("auth").and(warp::any().map(move || state.clone())).and_then(
         move |token: Option<String>, state: NodeState| async move {
             if state.passphrase.is_none() {
                 return Ok(None);
             }
-            match token.and_then(|t| state.sessions.authenticate(&t)) {
-                Some(session) => Ok(Some(session)),
-                None if api => Err(warp::reject::custom(Unauthorized)),
-                None => Err(warp::reject::custom(AuthenticationRequired)),
-            }
+            token.and_then(|t| state.sessions.authenticate(&t)).map(Some).ok_or_else(|| warp::reject::custom(Unauthorized))
         },
     )
 }
 
-fn with_auth(state: NodeState) -> impl Filter<Extract = (), Error = warp::Rejection> + Clone {
-    with_session(state, false).map(|_| ()).untuple_one()
-}
-
 fn with_api_auth(state: NodeState) -> impl Filter<Extract = (), Error = warp::Rejection> + Clone {
-    with_session(state, true).map(|_| ()).untuple_one()
+    with_session(state).map(|_| ()).untuple_one()
 }
 
 // WebSocket upgrades bypass the same-origin policy and CORS, so any web page could open one to this node.
@@ -71,9 +52,7 @@ fn require_same_origin() -> impl Filter<Extract = (), Error = warp::Rejection> +
 }
 
 async fn handle_rejection(err: warp::Rejection) -> Result<Box<dyn warp::Reply>, Infallible> {
-    if err.find::<AuthenticationRequired>().is_some() {
-        Ok(Box::new(warp::redirect::temporary(warp::http::Uri::from_static("/login"))) as Box<dyn warp::Reply>)
-    } else if err.find::<Unauthorized>().is_some() {
+    if err.find::<Unauthorized>().is_some() {
         Ok(Box::new(warp::reply::with_status("Unauthorized", warp::http::StatusCode::UNAUTHORIZED)) as Box<dyn warp::Reply>)
     } else if err.find::<InvalidOrigin>().is_some() {
         Ok(Box::new(warp::reply::with_status("Forbidden", warp::http::StatusCode::FORBIDDEN)) as Box<dyn warp::Reply>)
@@ -96,23 +75,8 @@ fn request_context(state: NodeState) -> impl Filter<Extract = (Option<server::Pe
     with_api_auth(state.clone()).and(warp::ext::optional::<server::PeerAddr>()).and(warp::any().map(move || state.clone()))
 }
 
-fn sign_in_routes(state: NodeState, ui: &WebUi) -> impl Filter<Extract = (impl warp::Reply,), Error = warp::Rejection> + Clone {
-    // The new UI shows its own sign-in; only the previous one has a page for it.
-    let is_legacy = ui.is_legacy;
-    let assets = ui.assets.clone();
-    let login_state = state.clone();
-    let login = warp::path("login").and(warp::get()).and(warp::any().map(move || login_state.clone())).and_then(move |state: NodeState| {
-        let assets = assets.clone();
-        async move {
-            if is_legacy && state.passphrase.is_some() {
-                embedded_file(assets.as_ref(), "login.html")
-            } else {
-                let redirect = warp::redirect::temporary(warp::http::Uri::from_static("/"));
-                Ok::<_, warp::Rejection>(Box::new(redirect) as Box<dyn warp::Reply>)
-            }
-        }
-    });
-
+// The page shows its own sign-in form and posts the passphrase here.
+fn sign_in_routes(state: NodeState) -> impl Filter<Extract = (impl warp::Reply,), Error = warp::Rejection> + Clone {
     let auth_state = state.clone();
     let auth = warp::path("auth")
         .and(warp::post())
@@ -132,14 +96,14 @@ fn sign_in_routes(state: NodeState, ui: &WebUi) -> impl Filter<Extract = (impl w
         .and(warp::any().map(move || logout_state.clone()))
         .and_then(handlers::logout);
 
-    login.or(auth).or(logout)
+    auth.or(logout)
 }
 
 fn session_routes(state: NodeState) -> impl Filter<Extract = (impl warp::Reply,), Error = warp::Rejection> + Clone {
     let list_state = state.clone();
     let list = warp::path!("api" / "sessions")
         .and(warp::get())
-        .and(with_session(state.clone(), true))
+        .and(with_session(state.clone()))
         .and(warp::ext::optional::<server::PeerAddr>())
         .and(warp::any().map(move || list_state.clone()))
         .and_then(handlers::list_sessions);
@@ -148,7 +112,7 @@ fn session_routes(state: NodeState) -> impl Filter<Extract = (impl warp::Reply,)
     let revoke = warp::path!("api" / "sessions" / String)
         .and(warp::delete())
         .and(require_same_origin())
-        .and(with_session(state, true))
+        .and(with_session(state))
         .and(warp::ext::optional::<server::PeerAddr>())
         .and(warp::any().map(move || revoke_state.clone()))
         .and_then(handlers::revoke_session);
@@ -223,9 +187,8 @@ fn settings_routes(state: NodeState) -> impl Filter<Extract = (impl warp::Reply,
     get.or(update).or(passphrase).or(current_passphrase).or(suggestion).or(doctor)
 }
 
-fn page_routes(state: NodeState, ui: &WebUi) -> impl Filter<Extract = (impl warp::Reply,), Error = warp::Rejection> + Clone {
-    let is_legacy = ui.is_legacy;
-
+// The page itself is public code that signs the person in; what it reads and changes needs a session.
+fn page_routes(state: NodeState, ui: &Arc<dyn UiAssets>) -> impl Filter<Extract = (impl warp::Reply,), Error = warp::Rejection> + Clone {
     let auth_status_state = state.clone();
     let auth_status = warp::path("auth-status")
         .and(warp::get())
@@ -234,32 +197,19 @@ fn page_routes(state: NodeState, ui: &WebUi) -> impl Filter<Extract = (impl warp
         .and(warp::any().map(move || auth_status_state.clone()))
         .and_then(handlers::check_auth_status);
 
-    let legacy_assets = ui.assets.clone();
-    let legacy_static = warp::path("static").and(warp::path::tail()).and_then(move |tail: warp::filters::path::Tail| {
-        let assets = legacy_assets.clone();
-        async move {
-            if !is_legacy {
-                return Err(warp::reject::not_found());
-            }
-            let lookup = tail.as_str().trim_start_matches('/');
-            embedded_file(assets.as_ref(), if lookup.is_empty() { "index.html" } else { lookup })
-        }
-    });
-
     // Built files carry a content hash in their name, so a browser may keep them for good.
-    let built_assets = ui.assets.clone();
+    let built_assets = ui.clone();
     let assets = warp::path("assets").and(warp::path::tail()).and_then(move |tail: warp::filters::path::Tail| {
         let assets = built_assets.clone();
         async move {
-            if is_legacy {
-                return Err(warp::reject::not_found());
-            }
             let reply = embedded_file(assets.as_ref(), &format!("assets/{}", tail.as_str()))?;
-            Ok(Box::new(warp::reply::with_header(reply, "cache-control", "public, max-age=31536000, immutable")) as Box<dyn warp::Reply>)
+            Ok::<_, warp::Rejection>(
+                Box::new(warp::reply::with_header(reply, "cache-control", "public, max-age=31536000, immutable")) as Box<dyn warp::Reply>
+            )
         }
     });
 
-    let favicon_assets = ui.assets.clone();
+    let favicon_assets = ui.clone();
     let favicon = warp::path("favicon.ico").or(warp::path("favicon.svg")).unify().and(warp::get()).and_then(move || {
         let assets = favicon_assets.clone();
         async move { embedded_file(assets.as_ref(), "favicon.svg") }
@@ -267,34 +217,32 @@ fn page_routes(state: NodeState, ui: &WebUi) -> impl Filter<Extract = (impl warp
 
     let websocket_state = state.clone();
     let websocket = warp::path("ws")
-        .and(with_session(state.clone(), false))
+        .and(with_session(state.clone()))
         .and(warp::ext::optional::<server::PeerAddr>())
         .and(require_same_origin())
         .and(warp::ws())
         .and(warp::any().map(move || websocket_state.clone()))
         .and_then(websocket::websocket_handler);
 
-    // The new UI is public code and signs the person in itself; the previous one is only handed to a signed-in browser.
-    let index_gate = if is_legacy { with_auth(state).boxed() } else { warp::any().boxed() };
-    let index_assets = ui.assets.clone();
-    let index = warp::path::end().and(index_gate).and_then(move || {
+    let index_assets = ui.clone();
+    let index = warp::path::end().and_then(move || {
         let assets = index_assets.clone();
         async move { embedded_file(assets.as_ref(), "index.html") }
     });
 
-    auth_status.or(legacy_static).or(assets).or(favicon).or(websocket).or(index)
+    auth_status.or(assets).or(favicon).or(websocket).or(index)
 }
 
 /// The HTTP service for this node's own page; guests and file transfers are served beside it by `server::Chain`.
 pub fn service(
     state: NodeState,
-    ui: &WebUi,
+    ui: &Arc<dyn UiAssets>,
 ) -> impl Service<hyper::Request<hyper::body::Incoming>, Response = warp::reply::Response, Error = Infallible, Future: Send>
        + Clone
        + Send
        + 'static {
     let cors = warp::cors().allow_any_origin().allow_headers(vec!["content-type"]).allow_methods(vec!["GET", "POST", "PUT", "DELETE"]);
-    let routes = sign_in_routes(state.clone(), ui)
+    let routes = sign_in_routes(state.clone())
         .or(session_routes(state.clone()))
         .or(pairing_routes(state.clone()))
         .or(trust_routes(state.clone()))
@@ -312,7 +260,7 @@ mod tests {
     const LAN_IP: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 20));
 
     async fn status_for(state: &NodeState, cookie: Option<&str>) -> u16 {
-        let protected = with_session(state.clone(), true).map(|_| "ok").recover(|_| async { Ok::<_, Infallible>("denied") });
+        let protected = with_session(state.clone()).map(|_| "ok").recover(|_| async { Ok::<_, Infallible>("denied") });
         let mut request = warp::test::request().path("/api");
         if let Some(token) = cookie {
             request = request.header("cookie", format!("auth={token}"));

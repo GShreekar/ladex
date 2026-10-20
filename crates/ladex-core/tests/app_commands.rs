@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use ladex_core::control::server::{self, Endpoint};
 use ladex_core::control::{Reply, Request};
-use ladex_core::node::{Bridge, Node, NodeConfig, NodeHandle, SocketEvent, UiAssets, WebUi};
+use ladex_core::node::{Bridge, Node, NodeConfig, NodeHandle, SocketEvent, UiAssets};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
@@ -21,7 +21,7 @@ impl UiAssets for StubUi {
 }
 
 async fn started(data_dir: &Path) -> NodeHandle {
-    let mut config = NodeConfig::new(data_dir.to_path_buf(), WebUi { assets: Arc::new(StubUi), is_legacy: false });
+    let mut config = NodeConfig::new(data_dir.to_path_buf(), Arc::new(StubUi));
     config.http_port = 0;
     config.discovery_port = None;
     config.use_tls = false;

@@ -3,7 +3,7 @@
 use std::sync::{Arc, Mutex, RwLock};
 
 use include_dir::{include_dir, Dir};
-use ladex_core::node::{self, Bridge, Node, NodeConfig, NodeHandle, StartError, UiAssets, WebUi};
+use ladex_core::node::{self, Bridge, Node, NodeConfig, NodeHandle, StartError, UiAssets};
 use tauri::{AppHandle, Manager};
 
 // The web UI built from `ui/`; the node serves it to browsers on the network, the window shows it itself.
@@ -60,8 +60,7 @@ pub fn passphrase_from_environment() -> Option<String> {
 
 // What was chosen in the wizard or settings is in the data folder; the environment still wins for anyone who sets it.
 fn node_config() -> Result<NodeConfig, StartFailure> {
-    let assets: Arc<dyn UiAssets> = Arc::new(EmbeddedUi(&UI_DIR));
-    let mut config = NodeConfig::new(node::default_data_dir(), WebUi { assets, is_legacy: false });
+    let mut config = NodeConfig::new(node::default_data_dir(), Arc::new(EmbeddedUi(&UI_DIR)));
     config.passphrase = passphrase_from_environment();
     config.use_saved_passphrase().map_err(StartFailure::Saved)?;
     config.use_saved_storage_limit();

@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use ladex_core::control::server::{self, Endpoint};
 use ladex_core::control::{Reply, Request};
-use ladex_core::node::{Node, NodeConfig, NodeHandle, Notice, StartError, UiAssets, WebUi};
+use ladex_core::node::{Node, NodeConfig, NodeHandle, Notice, StartError, UiAssets};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -24,8 +24,7 @@ impl UiAssets for StubUi {
 }
 
 fn config(data_dir: &std::path::Path) -> NodeConfig {
-    let web_ui = WebUi { assets: Arc::new(StubUi), is_legacy: false };
-    let mut config = NodeConfig::new(data_dir.to_path_buf(), web_ui);
+    let mut config = NodeConfig::new(data_dir.to_path_buf(), Arc::new(StubUi));
     config.http_port = 0;
     config.discovery_port = None;
     config.use_tls = false;

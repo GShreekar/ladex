@@ -6,7 +6,7 @@ use std::{env, fs};
 
 const PLACEHOLDER_PAGE: &str = "<!doctype html><meta charset=\"utf-8\"><title>LADEX</title>\
 <p style=\"font-family:sans-serif;padding:2rem\">This build of LADEX has no web UI: it was built without Node.js. \
-Install Node 20 or newer and rebuild, or start the node with <code>--legacy-ui</code>.</p>";
+Install Node 20 or newer and rebuild.</p>";
 
 fn main() {
     let ui_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("../../ui");

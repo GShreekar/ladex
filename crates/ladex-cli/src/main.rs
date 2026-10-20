@@ -6,11 +6,9 @@ use std::sync::Arc;
 use include_dir::{include_dir, Dir};
 use ladex_core::control::server::{self as control, Endpoint};
 use ladex_core::control::{Reply, Request};
-use ladex_core::node::{self, Node, NodeConfig, NodeHandle, Notice, StartError, UiAssets, WebUi};
+use ladex_core::node::{self, Node, NodeConfig, NodeHandle, Notice, StartError, UiAssets};
 use ladex_core::{auth, tls};
 
-// The previous web UI, served only with --legacy-ui.
-static LEGACY_UI_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/../../static");
 // The web UI built from `ui/` by build.rs.
 static UI_DIR: Dir = include_dir!("$OUT_DIR/ui");
 
@@ -90,17 +88,13 @@ struct Args {
     /// Keep this node's private key in a file in the data directory instead of the OS keychain.
     #[arg(long)]
     no_keychain: bool,
-
-    /// Serve the previous web UI instead of the new one. Deprecated: it is removed in the next release.
-    #[arg(long)]
-    legacy_ui: bool,
 }
 
-struct EmbeddedUi(&'static Dir<'static>);
+struct EmbeddedUi;
 
 impl UiAssets for EmbeddedUi {
     fn file(&self, path: &str) -> Option<&[u8]> {
-        self.0.get_file(path).map(|file| file.contents())
+        UI_DIR.get_file(path).map(|file| file.contents())
     }
 }
 
@@ -180,8 +174,7 @@ fn resolve_passphrase(args: &Args) -> Option<String> {
 }
 
 fn node_config(args: &Args, data_dir: PathBuf, passphrase: Option<String>) -> NodeConfig {
-    let assets: Arc<dyn UiAssets> = Arc::new(EmbeddedUi(if args.legacy_ui { &LEGACY_UI_DIR } else { &UI_DIR }));
-    let mut config = NodeConfig::new(data_dir, WebUi { assets, is_legacy: args.legacy_ui });
+    let mut config = NodeConfig::new(data_dir, Arc::new(EmbeddedUi));
     config.passphrase = passphrase;
     config.http_port = args.port;
     config.quic_port = args.quic_port;
