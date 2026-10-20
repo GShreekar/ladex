@@ -5,9 +5,12 @@
   import type { IconName } from '../../components/icons';
   import { useHost } from '../host-context';
   import { formatReport, worstVerdict } from '../doctor-report';
+  import PairingSection from '../network/PairingSection.svelte';
+  import TrustSection from '../network/TrustSection.svelte';
+  import type { TrustedNode } from '../pairing-api';
   import type { Check, Verdict } from '../preferences-api';
 
-  const { preferencesApi, toasts } = useHost();
+  const { pairingApi, preferencesApi, toasts } = useHost();
 
   const icons: Record<Verdict, IconName> = { ok: 'check-circle', warning: 'alert', problem: 'alert' };
   const summaries: Record<Verdict, string> = {
@@ -17,6 +20,7 @@
   };
 
   let checks = $state<Check[]>([]);
+  let trusted = $state<TrustedNode[]>([]);
   let isChecking = $state(false);
   let hasChecked = $state(false);
 
@@ -44,12 +48,23 @@
     }
   }
 
-  onMount(run);
+  async function loadTrusted(): Promise<void> {
+    try {
+      trusted = await pairingApi.trustedNodes();
+    } catch (error) {
+      toasts.show('error', error instanceof TransferError ? error.message : 'Could not list the trusted nodes.');
+    }
+  }
+
+  onMount(() => {
+    void run();
+    void loadTrusted();
+  });
 </script>
 
 <div class="title">
   <h1>Network</h1>
-  <p class="muted">Checks that other devices can find and reach this one.</p>
+  <p class="muted">Checks that other devices can find and reach this one, and which nodes it trusts.</p>
 </div>
 
 <div class="sections">
@@ -85,6 +100,9 @@
       </ul>
     </section>
   {/if}
+
+  <PairingSection onpaired={loadTrusted} />
+  <TrustSection nodes={trusted} onchange={loadTrusted} />
 </div>
 
 <style>

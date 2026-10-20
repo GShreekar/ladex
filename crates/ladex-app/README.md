@@ -50,7 +50,7 @@ The first time the app opens on a data folder it shows a short wizard before any
 ## Settings, network and command line
 
 - **Settings** (only on the machine running the node): the downloads folder, how files sent to this device are accepted (always ask, from paired devices, or from anyone in the mesh, with an optional size above which it still asks), the storage limit, the mesh passphrase (shown on request, to add another computer), launch at login and the theme. Changing the passphrase takes effect on a restart, which the page offers.
-- **Network** runs the same checks as `ladex doctor`: addresses, whether the page answers, whether multicast works, other nodes, storage and disk, with a report to copy into a bug report.
+- **Network** runs the same checks as `ladex doctor`: addresses, whether the page answers, whether multicast works, other nodes, storage and disk, with a report to copy into a bug report. It also pairs with another node by comparing six words (`ladex pair`), and lists the trusted nodes with a button to revoke one (`ladex trust`).
 - **Command line** lists the `ladex` commands that do what the app does, with the data folder the CLI will use and a copy button for each. Everything except the tray, notifications and the theme has one: `receive` stands in for the window as a device files are sent to, and `autostart` for Launch at login.
 - `ladex settings` does the same from a terminal; the daemon and the app read the same files.
 

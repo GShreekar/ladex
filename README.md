@@ -155,6 +155,8 @@ ladex receive                        # be a device others can send files to (--n
 ladex chat                           # read the room chat; ladex chat "hello" posts to it
 ladex guests                         # browser guests and their uploads; sign-out, approve and deny act on them
 ladex passphrase                     # show the mesh passphrase; passphrase set [--generate] changes it
+ladex pair 192.168.1.20:8080         # pair with another node by comparing six words (run `ladex pair` there)
+ladex trust                          # nodes this one trusts; trust revoke <node> drops one from the whole mesh
 ladex autostart on                   # start this node when you log in (off turns it off)
 ```
 
@@ -174,6 +176,7 @@ ladex autostart on                   # and from now on, start it at login
 - `seed --watch` shares the whole folder afresh when it changes and takes the earlier version down, so downloads of the earlier version stop.
 - `receive` keeps running as a device called after the node (or `--name`), so others can send it files with `send --to` or from the app. Files the incoming files rule allows (`ladex settings --auto-accept`) are saved at once; you are asked about the rest, and with no terminal to ask at they are declined unless you pass `--yes`.
 - `chat` posts as this node, under its name.
+- `pair` makes two nodes trust each other's key, even with different passphrases. One side runs `ladex pair` and waits; the other runs `ladex pair <address>` with the address the first one prints. Both are shown six words and asked whether they match, so it needs a person at each terminal. Paired devices are the ones `--auto-accept paired` trusts.
 - `passphrase` works with or without a running node: with one, a new passphrase takes effect when the node restarts; without one, it is saved in the data folder for the next `ladex` or app start.
 - `autostart` uses a systemd user service on Linux (`systemctl --user`; add `loginctl enable-linger` to start it at boot without logging in), a launch agent on macOS, and a Run entry on Windows, whose console window starts minimized. It runs `ladex --data-dir DIR` with the passphrase and storage limit saved in that folder.
 - The passphrase, storage limit and downloads folder chosen in the app are kept in the data folder, so `ladex` on the same folder uses them: it takes the saved passphrase unless you pass one, and the saved storage limit unless you pass `--storage-limit-gb`.

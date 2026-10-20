@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::identity::node_id_for;
 use crate::revocation::Revocation;
 use crate::types::NodeId;
-use crate::validate;
+use crate::{validate, NodeState};
 
 const FILE_NAME: &str = "trust.redb";
 const NODES: TableDefinition<&str, &[u8]> = TableDefinition::new("nodes");
@@ -35,6 +35,41 @@ pub struct TrustedNode {
     pub first_seen_ms: u64,
     pub last_seen_ms: u64,
     pub revoked: bool,
+}
+
+/// A node this one trusts or has revoked, as the person at this machine is shown it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrustedNodeView {
+    #[serde(flatten)]
+    pub node: TrustedNode,
+    pub connected: bool,
+    /// Who revoked it, when it is revoked.
+    pub revoked_by: Option<String>,
+}
+
+/// The nodes this one trusts or has revoked, and which of them are connected now.
+pub async fn views(state: &NodeState) -> anyhow::Result<Vec<TrustedNodeView>> {
+    let nodes = state.trust.list()?;
+    let connected = state.mesh_peers.read().await;
+    let view = |node: TrustedNode| {
+        let revoked_by = node.revoked.then(|| revoker_name(state, &node.node_id));
+        TrustedNodeView { connected: connected.contains_key(&node.node_id), revoked_by, node }
+    };
+    Ok(nodes.into_iter().map(view).collect())
+}
+
+fn revoker_name(state: &NodeState, node_id: &str) -> String {
+    let Ok(Some(revocation)) = state.trust.revocation(node_id) else {
+        return "this device".to_string();
+    };
+    if revocation.issuer == state.identity.public_key() {
+        return "this device".to_string();
+    }
+    let issuer = revocation.issuer_id();
+    match state.trust.get(&issuer) {
+        Ok(Some(node)) => node.name,
+        _ => issuer,
+    }
 }
 
 /// What this node thinks of a public key presented to it.

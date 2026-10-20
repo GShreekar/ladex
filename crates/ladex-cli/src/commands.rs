@@ -10,10 +10,11 @@ use ladex_core::control::{Device, Event, GuestInvite, Invite, Node, Reply, Reque
 use ladex_core::guest::sessions::GuestSummary;
 use ladex_core::guest::{Permission, WaitingUpload};
 use ladex_core::preferences::{self, AutoAccept, AutoAcceptFrom, Preferences};
+use ladex_core::trust::{TrustedNodeView, TrustedVia};
 use ladex_core::types::{FileView, TextMessage};
 
 use crate::output::{self, format_bytes, ProgressLine};
-use crate::{autostart, doctor, passphrase, receive};
+use crate::{autostart, doctor, pair, passphrase, receive};
 
 const WATCH_INTERVAL: Duration = Duration::from_secs(2);
 pub const EXIT_OK: i32 = 0;
@@ -82,6 +83,16 @@ pub enum Command {
         #[arg(long)]
         yes: bool,
     },
+    /// Pair with another node by comparing six words, so each trusts the other's key itself
+    Pair {
+        /// The other device's address, as `ladex pair` on it shows; without one, waits for it to dial this one.
+        address: Option<String>,
+    },
+    /// List the nodes this one trusts, or revoke one so the whole mesh drops it
+    Trust {
+        #[command(subcommand)]
+        action: Option<TrustAction>,
+    },
     /// Show the mesh passphrase, or set a new one; works with or without a running node
     Passphrase {
         #[command(subcommand)]
@@ -125,6 +136,12 @@ pub enum GuestsAction {
     Deny { upload: String },
 }
 
+#[derive(Subcommand)]
+pub enum TrustAction {
+    /// Revoke a node, named by its id or its name; every node in the mesh drops it
+    Revoke { node: String },
+}
+
 /// A running node, and how this command should show what the node tells it.
 pub struct Session {
     endpoint: Endpoint,
@@ -132,7 +149,7 @@ pub struct Session {
 }
 
 pub fn not_running(data_dir: &Path) -> anyhow::Error {
-    anyhow!("no LADEX node is running with {}; start one with `ladex`", data_dir.display())
+    anyhow!("no LADEX node is running with {}; start one with `ladex`, or open the LADEX app", data_dir.display())
 }
 
 impl Session {
@@ -224,6 +241,9 @@ async fn execute(command: Command, data_dir: &Path, is_json: bool) -> anyhow::Re
         Command::Guests { action: Some(GuestsAction::SignOut { guest }) } => Request::SignOutGuest { guest },
         Command::Guests { action: Some(GuestsAction::Approve { upload }) } => Request::AnswerUpload { upload, accepted: true },
         Command::Guests { action: Some(GuestsAction::Deny { upload }) } => Request::AnswerUpload { upload, accepted: false },
+        Command::Pair { address } => return pair::run(&session, address).await,
+        Command::Trust { action: None } => Request::Trust,
+        Command::Trust { action: Some(TrustAction::Revoke { node }) } => Request::RevokeNode { node },
         Command::Receive { name, output, yes } => {
             let into = std::path::absolute(output.unwrap_or_else(|| PathBuf::from(".")))?;
             return receive::run(&session, name, into, yes).await;
@@ -308,7 +328,26 @@ fn print_reply(reply: &Reply) {
         Reply::Passphrase { passphrase } => passphrase::print(passphrase.as_deref()),
         Reply::Received { path, .. } => println!("Saved {}", path.display()),
         Reply::Acknowledged { message } => println!("{message}"),
+        Reply::Pairing(view) => println!("This device's address for pairing: {}", view.address.as_deref().unwrap_or("none")),
+        Reply::Trust { nodes } => print_trust(nodes),
     }
+}
+
+fn print_trust(nodes: &[TrustedNodeView]) {
+    if nodes.is_empty() {
+        return println!("This node trusts no other node yet. Nodes are trusted when they join with the passphrase or pair.");
+    }
+    let how = |node: &TrustedNodeView| match node.node.trusted_via {
+        TrustedVia::Passphrase => "passphrase",
+        TrustedVia::Pairing => "paired",
+    };
+    let standing = |node: &TrustedNodeView| match (&node.revoked_by, node.connected) {
+        (Some(by), _) => format!("revoked by {by}"),
+        (None, true) => "connected".to_string(),
+        (None, false) => "not connected".to_string(),
+    };
+    let row = |node: &TrustedNodeView| vec![node.node.name.clone(), how(node).to_string(), standing(node), node.node.node_id.clone()];
+    output::print_table(&["NODE", "TRUSTED BY", "NOW", "ID"], &nodes.iter().map(row).collect::<Vec<_>>());
 }
 
 fn print_messages(messages: &[TextMessage]) {

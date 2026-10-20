@@ -11,10 +11,11 @@ use tokio::sync::mpsc;
 
 use crate::guest::sessions::GuestSummary;
 use crate::guest::{self, Permission, WaitingUpload};
-use crate::preferences;
 use crate::receive::{self, ReceiveRoot};
 use crate::store::CHUNK_SIZE;
+use crate::trust::TrustedNodeView;
 use crate::types::{FileView, NodeId, PeerInfo, SessionId, TextMessage};
+use crate::{pairing, preferences};
 use crate::{state, tls, NodeState};
 
 mod push;
@@ -104,6 +105,27 @@ pub enum Request {
         file: String,
         from: SessionId,
     },
+    /// Shows this node's address for pairing and the codes waiting for an answer.
+    Pairing,
+    /// Accepts pairings from other devices for the next few minutes.
+    OpenPairing,
+    /// Stops accepting pairings and declines every code still waiting.
+    ClosePairing,
+    /// Dials the node at `address` to pair with it.
+    DialPairing {
+        address: String,
+    },
+    /// Answers whether a waiting code matches the one on the other device.
+    AnswerPairing {
+        id: u64,
+        accepted: bool,
+    },
+    /// Lists the nodes this one trusts or has revoked.
+    Trust,
+    /// Revokes a node, named by its id or its name; the rest of the mesh drops it too.
+    RevokeNode {
+        node: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -160,6 +182,8 @@ pub enum Reply {
     Guests { guests: Vec<GuestSummary>, uploads: Vec<WaitingUpload> },
     Passphrase { passphrase: Option<String> },
     Received { name: String, path: PathBuf },
+    Pairing(Box<pairing::View>),
+    Trust { nodes: Vec<TrustedNodeView> },
     Acknowledged { message: String },
 }
 
@@ -341,6 +365,45 @@ async fn run(state: &NodeState, settings: &Settings, request: Request, events: &
             crate::push::decline_offer(state, &device, &file, &from).await;
             Ok(acknowledged("Declined"))
         }
+        Request::Pairing => Ok(Reply::Pairing(Box::new(pairing::view(state)))),
+        Request::OpenPairing => {
+            state.pairings.open();
+            Ok(Reply::Pairing(Box::new(pairing::view(state))))
+        }
+        Request::ClosePairing => {
+            state.pairings.close();
+            Ok(acknowledged("Stopped accepting pairings"))
+        }
+        Request::DialPairing { address } => {
+            let target = pairing::parse_address(&address, state.quic_port)
+                .with_context(|| format!("{address:?} is not an address; give the other device's, like 192.168.1.20:8080"))?;
+            pairing::dial(state, target);
+            Ok(acknowledged(&format!("Dialing {target}")))
+        }
+        Request::AnswerPairing { id, accepted } => match state.pairings.answer(id, accepted) {
+            true => Ok(acknowledged(if accepted { "Confirmed" } else { "Refused" })),
+            false => bail!("that pairing is no longer waiting"),
+        },
+        Request::Trust => Ok(Reply::Trust { nodes: crate::trust::views(state).await? }),
+        Request::RevokeNode { node } => revoke(state, &node).await,
+    }
+}
+
+async fn revoke(state: &NodeState, wanted: &str) -> anyhow::Result<Reply> {
+    let nodes = state.trust.list()?;
+    let mut named: Vec<_> = nodes.iter().filter(|node| node.node_id == wanted || node.name.eq_ignore_ascii_case(wanted)).collect();
+    let node = match named.len() {
+        0 => bail!("this node does not know {wanted:?} (see `ladex trust`)"),
+        1 => named.remove(0),
+        _ => {
+            let ids: Vec<&str> = named.iter().map(|node| node.node_id.as_str()).collect();
+            bail!("{} nodes are called {wanted:?}; name one by its id: {}", named.len(), ids.join(", "))
+        }
+    };
+    match crate::mesh::revoke_node(state, &node.node_id).await? {
+        crate::mesh::Revoked::Now => Ok(acknowledged(&format!("Revoked {}; the rest of the mesh drops it too", node.name))),
+        crate::mesh::Revoked::Already => Ok(acknowledged(&format!("{} was already revoked", node.name))),
+        crate::mesh::Revoked::UnknownNode => bail!("this node does not know {wanted:?} (see `ladex trust`)"),
     }
 }
 

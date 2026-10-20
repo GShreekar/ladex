@@ -14,6 +14,7 @@ import { Transfers } from '../state/transfers.svelte';
 import '../styles/base.css';
 import App from './App.svelte';
 import { GuestsApi } from './guests-api';
+import { PairingApi } from './pairing-api';
 import { PreferencesApi } from './preferences-api';
 import SetupWizard from './SetupWizard.svelte';
 import type { HostContext } from './host-context';
@@ -65,6 +66,7 @@ if (!(await showWizardIfNeeded())) {
     transfers: new Transfers(client, toasts),
     toasts,
     guestsApi: new GuestsApi(transport),
+    pairingApi: new PairingApi(transport),
     preferencesApi,
     desktop: isShownByTheApp() ? tauriSettings : null,
   };

@@ -144,19 +144,13 @@ pub async fn revoke_session(
 #[derive(serde::Serialize)]
 struct PairingResponse {
     can_pair: bool,
-    /// What to type on the other device to dial this one.
-    address: Option<String>,
     #[serde(flatten)]
-    status: Option<crate::pairing::Status>,
+    view: Option<crate::pairing::View>,
 }
 
 pub async fn pairing_status(peer: Option<PeerAddr>, state: NodeState) -> Result<impl Reply, Rejection> {
     let can_pair = can_manage(peer);
-    let response = PairingResponse {
-        can_pair,
-        address: state.local_ip.filter(|_| can_pair).map(|ip| std::net::SocketAddr::new(ip, state.quic_port).to_string()),
-        status: can_pair.then(|| state.pairings.status()),
-    };
+    let response = PairingResponse { can_pair, view: can_pair.then(|| crate::pairing::view(&state)) };
     Ok(warp::reply::json(&response))
 }
 
@@ -186,14 +180,10 @@ pub async fn dial_pairing(request: DialRequest, peer: Option<PeerAddr>, state: N
     if !can_manage(peer) {
         return Ok(pairing_forbidden());
     }
-    let Some(target) = parse_node_address(&request.address, state.quic_port) else {
+    let Some(target) = crate::pairing::parse_address(&request.address, state.quic_port) else {
         return Ok(json_error("Enter the other device's address, like 192.168.1.20:8080", StatusCode::BAD_REQUEST));
     };
-    tokio::spawn(async move {
-        let result = crate::mesh::quic::pair(&state, target).await;
-        let name = result.as_ref().map_or_else(|_| target.to_string(), Clone::clone);
-        state.pairings.record(crate::pairing::Outcome::of(&name, &result));
-    });
+    crate::pairing::dial(&state, target);
     Ok(Box::new(warp::reply::with_status(warp::reply(), StatusCode::ACCEPTED)))
 }
 
@@ -218,16 +208,7 @@ struct TrustResponse {
     can_manage: bool,
     /// False for an open node, which trusts nobody and so has no one to revoke.
     secured: bool,
-    nodes: Vec<TrustedNodeView>,
-}
-
-#[derive(serde::Serialize)]
-struct TrustedNodeView {
-    #[serde(flatten)]
-    node: crate::trust::TrustedNode,
-    connected: bool,
-    /// Who revoked it, when it is revoked.
-    revoked_by: Option<String>,
+    nodes: Vec<crate::trust::TrustedNodeView>,
 }
 
 /// The nodes this one trusts or has revoked, for the person at this machine.
@@ -237,33 +218,14 @@ pub async fn trusted_nodes(peer: Option<PeerAddr>, state: NodeState) -> Result<B
     if !can_manage {
         return Ok(Box::new(warp::reply::json(&response)));
     }
-    let nodes = match state.trust.list() {
-        Ok(nodes) => nodes,
+    match crate::trust::views(&state).await {
+        Ok(nodes) => response.nodes = nodes,
         Err(e) => {
             tracing::error!("Trust: could not list the trusted nodes: {e:#}");
             return Ok(json_error("Could not read the trust store", StatusCode::INTERNAL_SERVER_ERROR));
         }
-    };
-    let connected = state.mesh_peers.read().await;
-    for node in nodes {
-        let revoked_by = node.revoked.then(|| revoker_name(&state, &node.node_id));
-        response.nodes.push(TrustedNodeView { connected: connected.contains_key(&node.node_id), revoked_by, node });
     }
     Ok(Box::new(warp::reply::json(&response)))
-}
-
-fn revoker_name(state: &NodeState, node_id: &str) -> String {
-    let Ok(Some(revocation)) = state.trust.revocation(node_id) else {
-        return "this device".to_string();
-    };
-    if revocation.issuer == state.identity.public_key() {
-        return "this device".to_string();
-    }
-    let issuer = revocation.issuer_id();
-    match state.trust.get(&issuer) {
-        Ok(Some(node)) => node.name,
-        _ => issuer,
-    }
 }
 
 /// Revokes a node in this node's name; the rest of the mesh drops it too.
@@ -279,15 +241,6 @@ pub async fn revoke_node(node_id: String, peer: Option<PeerAddr>, state: NodeSta
             Ok(json_error("Could not record the revocation", StatusCode::INTERNAL_SERVER_ERROR))
         }
     }
-}
-
-// "ip:port", or just "ip" for a node on the same port as this one.
-fn parse_node_address(address: &str, default_port: u16) -> Option<std::net::SocketAddr> {
-    let address = address.trim();
-    address
-        .parse::<std::net::SocketAddr>()
-        .ok()
-        .or_else(|| address.parse::<std::net::IpAddr>().ok().map(|ip| std::net::SocketAddr::new(ip, default_port)))
 }
 
 fn pairing_forbidden() -> Box<dyn Reply> {
@@ -504,12 +457,5 @@ mod tests {
         let request = DialRequest { address: "not an address".into() };
         let reply = dial_pairing(request, peer("127.0.0.1:1", false), state).await.unwrap().into_response();
         assert_eq!(reply.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[test]
-    fn a_node_address_without_a_port_uses_this_nodes_port() {
-        assert_eq!(parse_node_address(" 192.168.1.20 ", 8080), Some("192.168.1.20:8080".parse().unwrap()));
-        assert_eq!(parse_node_address("192.168.1.20:9000", 8080), Some("192.168.1.20:9000".parse().unwrap()));
-        assert_eq!(parse_node_address("laptop", 8080), None);
     }
 }

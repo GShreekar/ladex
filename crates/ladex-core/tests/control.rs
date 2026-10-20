@@ -8,7 +8,8 @@ use ladex_core::guest::uploads::UploadState;
 use ladex_core::guest::Permission;
 use ladex_core::saved_passphrase;
 use ladex_core::store::CHUNK_SIZE;
-use ladex_core::testing::{eventually, spawn_mesh, NodeHandle};
+use ladex_core::testing::{eventually, spawn_mesh, spawn_node, NodeConfig, NodeHandle};
+use ladex_core::trust::TrustedVia;
 use ladex_core::types::FileView;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -427,4 +428,59 @@ async fn a_new_passphrase_is_saved_for_the_next_start_and_the_old_one_is_shown_u
     assert!(node.state.preferences.needs_restart());
     let shown = ask(&endpoint, Request::Passphrase).await.unwrap();
     assert_eq!(shown, Reply::Passphrase { passphrase: Some("old-mesh-secret".into()) });
+}
+
+async fn pairing_of(endpoint: &Endpoint) -> ladex_core::pairing::View {
+    match ask(endpoint, Request::Pairing).await.unwrap() {
+        Reply::Pairing(view) => *view,
+        other => panic!("expected pairing, got {other:?}"),
+    }
+}
+
+/// Answers the code waiting on a node as soon as it shows; returns the words it showed.
+async fn confirm_code(endpoint: &Endpoint) -> Vec<String> {
+    let mut code = None;
+    assert!(
+        eventually(async || {
+            code = pairing_of(endpoint).await.status.waiting.into_iter().next();
+            code.is_some()
+        })
+        .await,
+        "no code to compare ever showed"
+    );
+    let code = code.unwrap();
+    ask(endpoint, Request::AnswerPairing { id: code.id, accepted: true }).await.unwrap();
+    code.request.words
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_nodes_pair_from_the_command_line_and_one_can_then_revoke_the_other() {
+    let phone = spawn_node(NodeConfig::named("phone").passphrase("one")).await;
+    let laptop = spawn_node(NodeConfig::named("laptop").passphrase("two")).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (on_phone, on_laptop) = (control_of(&phone, &dir.path().join("a")).await, control_of(&laptop, &dir.path().join("b")).await);
+
+    ask(&on_laptop, Request::OpenPairing).await.unwrap();
+    ask(&on_phone, Request::DialPairing { address: laptop.addr.to_string() }).await.unwrap();
+    let (phone_words, laptop_words) = tokio::join!(confirm_code(&on_phone), confirm_code(&on_laptop));
+
+    assert_eq!(phone_words, laptop_words);
+    assert!(eventually(async || pairing_of(&on_phone).await.status.recent.first().is_some_and(|outcome| outcome.paired)).await);
+    let Reply::Trust { nodes } = ask(&on_phone, Request::Trust).await.unwrap() else { panic!("expected trust") };
+    assert_eq!((nodes[0].node.name.as_str(), nodes[0].node.trusted_via), ("laptop", TrustedVia::Pairing));
+
+    ask(&on_phone, Request::RevokeNode { node: "laptop".into() }).await.unwrap();
+    let Reply::Trust { nodes } = ask(&on_phone, Request::Trust).await.unwrap() else { panic!("expected trust") };
+    assert_eq!(nodes[0].revoked_by.as_deref(), Some("this device"));
+}
+
+#[tokio::test]
+async fn pairing_with_something_that_is_not_an_address_is_refused() {
+    let node = &spawn_mesh(1, None).await[0];
+    let dir = tempfile::tempdir().unwrap();
+    let endpoint = control_of(node, dir.path()).await;
+
+    let refused = ask(&endpoint, Request::DialPairing { address: "the laptop".into() }).await.unwrap_err();
+
+    assert!(refused.to_string().contains("is not an address"), "{refused}");
 }

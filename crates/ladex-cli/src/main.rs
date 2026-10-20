@@ -16,6 +16,7 @@ mod autostart;
 mod commands;
 mod doctor;
 mod output;
+mod pair;
 mod passphrase;
 mod receive;
 

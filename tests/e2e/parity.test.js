@@ -129,6 +129,26 @@ const check = (name, ok, detail = '') => { console.log(`${ok ? 'PASS' : 'FAIL'} 
     r = await run(n1, ['passphrase', 'set', '--no-keychain'], { input: 'another-long-mesh-secret\n' });
     check('passphrase set on a running node saves it for its next start', r.code === 0 && /once it restarts/.test(r.stdout), r.stdout + r.stderr);
 
+    // Pairing and trust, as on the app's Network page. Nobody is at a terminal here, so the codes are refused.
+    const listening = start(n1, ['pair']);
+    await until(() => /Waiting for the other device/.test(listening.out.stderr));
+    const dialing = await within(run(n2, ['pair', `127.0.0.1:${n1.port}`]), 30000);
+    const listened = await within(listening.done, 30000);
+    check('pair shows both sides the same six words', !!dialing && /these same words/.test(dialing.stderr) && /these same words/.test(listened?.stderr ?? ''), JSON.stringify(dialing) + JSON.stringify(listened));
+    const words = (text) => text.match(/these same words:\s+([a-z ]+)/)?.[1].trim();
+    check('and they are the same on both', !!dialing && words(dialing.stderr) === words(listened?.stderr ?? ''), JSON.stringify(dialing));
+    check('with nobody to compare them, pairing is refused and both commands fail', dialing?.code === 1 && listened?.code === 1 && /Not paired/.test(dialing.stderr), JSON.stringify(dialing) + JSON.stringify(listened));
+
+    r = await runJson(n1, ['trust']);
+    const other = r.json?.nodes?.[0];
+    check('trust lists the other node, trusted through the passphrase', r.json?.nodes.length === 1 && other.trusted_via === 'passphrase' && other.connected === true, r.stdout);
+    r = await run(n1, ['trust', 'revoke', other?.node_id ?? '']);
+    check('trust revoke revokes it', r.code === 0 && /Revoked/.test(r.stdout), r.stdout + r.stderr);
+    const isDropped = await until(async () => (await runJson(n1, ['devices'])).json?.nodes.length === 0);
+    check('and the revoked node is dropped from the mesh', !!isDropped);
+    r = await runJson(n1, ['trust']);
+    check('trust then shows it revoked by this device', r.json?.nodes[0]?.revoked_by === 'this device', r.stdout);
+
     for (const proc of procs) proc.kill('SIGKILL');
     console.log(failures === 0 ? '\nALL PASSED' : `\n${failures} FAILED`);
     if (!process.env.LADEX_KEEP) fs.rmSync(ROOT, { recursive: true, force: true }); else console.log('kept', ROOT);
