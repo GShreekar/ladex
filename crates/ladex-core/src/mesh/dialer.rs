@@ -1,11 +1,12 @@
 //! Who dials whom, and how often: of two nodes only the lower node id dials, and it keeps retrying with jittered backoff.
+//! Peers given by address (`--peer`) are the exception: this node keeps those connected itself.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use super::{is_revoked, quic, AuthFailure};
+use super::{is_revoked, quic, AlreadyConnected, AuthFailure};
 use crate::types::NodeId;
 use crate::NodeState;
 
@@ -20,6 +21,9 @@ const GIVE_UP: Duration = Duration::from_secs(600);
 /// Peers with a dial loop running, and where to reach them.
 pub type DialTargets = Arc<Mutex<HashMap<NodeId, DialTarget>>>;
 
+/// Peers this node was given by address, which it redials whenever they are lost, whichever node id is lower.
+pub type KeptPeers = Arc<Mutex<HashSet<NodeId>>>;
+
 #[derive(Debug, Clone, Copy)]
 pub struct DialTarget {
     addr: SocketAddr,
@@ -31,9 +35,13 @@ pub fn is_dialer(our_node_id: &str, peer_node_id: &str) -> bool {
     our_node_id < peer_node_id
 }
 
+fn is_kept(state: &NodeState, peer_node_id: &NodeId) -> bool {
+    state.kept_peers.lock().unwrap().contains(peer_node_id)
+}
+
 /// Dials the peer until connected, unless the other node is the dialer; a loop already running just learns the new address.
 pub fn dial(state: &NodeState, peer_node_id: &NodeId, addr: SocketAddr) {
-    if !is_dialer(&state.node_id, peer_node_id) {
+    if !is_dialer(&state.node_id, peer_node_id) && !is_kept(state, peer_node_id) {
         return;
     }
     let target = DialTarget { addr, wanted_at: Instant::now() };
@@ -66,13 +74,41 @@ async fn dial_until_connected(state: NodeState, peer_node_id: NodeId) {
 /// Where to dial the peer next; None, and the loop is over, once it is connected, revoked or no longer wanted.
 async fn next_address(state: &NodeState, peer_node_id: &NodeId) -> Option<SocketAddr> {
     let connected = state.mesh_peers.read().await.contains_key(peer_node_id);
+    let is_wanted_still = |target: &DialTarget| is_kept(state, peer_node_id) || target.wanted_at.elapsed() <= GIVE_UP;
     let mut targets = state.dial_targets.lock().unwrap();
     let target = targets.get(peer_node_id).copied()?;
-    if connected || is_revoked(state, peer_node_id) || target.wanted_at.elapsed() > GIVE_UP {
+    if connected || is_revoked(state, peer_node_id) || !is_wanted_still(&target) {
         targets.remove(peer_node_id);
         return None;
     }
     Some(target.addr)
+}
+
+/// Joins the node at `addr`, retrying until it answers, and from then on redials it whenever the connection is lost.
+pub async fn keep_connected(state: &NodeState, addr: SocketAddr) {
+    let mut failures = 0;
+    let mut auth_failed = false;
+    let peer_node_id = loop {
+        if failures > 0 {
+            tokio::time::sleep(retry_delay(failures, auth_failed, rand::random())).await;
+        }
+        match quic::join(state, addr).await {
+            Ok(peer_node_id) => break peer_node_id,
+            Err(e) => match e.downcast::<AlreadyConnected>() {
+                Ok(AlreadyConnected(peer_node_id)) => break peer_node_id,
+                Err(e) => {
+                    failures += 1;
+                    auth_failed = e.downcast_ref::<AuthFailure>().is_some();
+                    tracing::warn!("Mesh: connecting to {addr} failed (attempt {failures}): {e:#}");
+                }
+            },
+        }
+    };
+    state.kept_peers.lock().unwrap().insert(peer_node_id.clone());
+    // A connection lost before the peer was kept was not redialed.
+    if !state.mesh_peers.read().await.contains_key(&peer_node_id) {
+        dial(state, &peer_node_id, addr);
+    }
 }
 
 /// How long to wait after `failures` failed dials in a row; `jitter` in [0, 1) spreads the retries of different nodes apart.

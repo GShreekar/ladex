@@ -114,7 +114,7 @@ impl FileView {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TextMessage {
     pub id: String,
     pub content: String,

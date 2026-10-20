@@ -16,7 +16,7 @@ use crate::types::FileView;
 use crate::{hlc, state, validate, NodeState};
 
 // A device's uploads carry its id; what the node's own user shares carries none, and only this machine can take it down.
-const SHARED_BY_THIS_NODE: &str = "";
+pub(super) const SHARED_BY_THIS_NODE: &str = "";
 
 pub(super) fn new_id(kind: &str) -> String {
     format!("{kind}_{:016x}_{}", rand::random::<u64>(), hlc::wall_clock_ms())

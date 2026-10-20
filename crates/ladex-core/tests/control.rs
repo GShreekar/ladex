@@ -4,8 +4,12 @@ use std::path::{Path, PathBuf};
 
 use ladex_core::control::server::{self, Endpoint};
 use ladex_core::control::{Event, Reply, Request, Settings, VERSION};
+use ladex_core::guest::uploads::UploadState;
+use ladex_core::guest::Permission;
+use ladex_core::saved_passphrase;
 use ladex_core::store::CHUNK_SIZE;
-use ladex_core::testing::{eventually, spawn_mesh, NodeHandle};
+use ladex_core::testing::{eventually, spawn_mesh, spawn_node, NodeConfig, NodeHandle};
+use ladex_core::trust::TrustedVia;
 use ladex_core::types::FileView;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -292,4 +296,191 @@ async fn a_node_that_never_reports_its_version_is_refused_as_older() {
     let refused = ask(&endpoint, Request::List).await.unwrap_err();
 
     assert_eq!(refused.to_string(), format!("the running node is an older version, this command is {VERSION} — update one of them"));
+}
+
+#[tokio::test]
+async fn unsharing_by_name_takes_the_file_off_every_node() {
+    let nodes = spawn_mesh(2, None).await;
+    let dir = tempfile::tempdir().unwrap();
+    let endpoint = control_of(&nodes[0], &dir.path().join("data")).await;
+    let source = write(&dir.path().join("notes.txt"), b"notes");
+    let shared = shared_by(&endpoint, Request::Send { paths: vec![source], to: None }).await.remove(0);
+    assert!(eventually(async || nodes[1].live_files().await.contains(&shared.id)).await);
+
+    let reply = ask(&endpoint, Request::Unshare { file: "notes.txt".into() }).await.unwrap();
+
+    assert_eq!(reply, Reply::Acknowledged { message: "Stopped sharing notes.txt".into() });
+    assert!(eventually(async || !nodes[1].live_files().await.contains(&shared.id)).await);
+}
+
+#[tokio::test]
+async fn a_file_another_node_shared_cannot_be_unshared_here() {
+    let nodes = spawn_mesh(2, None).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (sharing, other) = (control_of(&nodes[0], &dir.path().join("a")).await, control_of(&nodes[1], &dir.path().join("b")).await);
+    let source = write(&dir.path().join("notes.txt"), b"notes");
+    let shared = shared_by(&sharing, Request::Send { paths: vec![source], to: None }).await.remove(0);
+    assert!(eventually(async || nodes[1].live_files().await.contains(&shared.id)).await);
+
+    let refused = ask(&other, Request::Unshare { file: shared.id.clone() }).await.unwrap_err();
+
+    assert!(refused.to_string().contains("only that node can stop sharing it"), "{refused}");
+    assert!(nodes[1].live_files().await.contains(&shared.id));
+}
+
+#[tokio::test]
+async fn a_chat_message_from_the_command_line_reaches_the_other_node_under_this_nodes_name() {
+    let nodes = spawn_mesh(2, None).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (posting, reading) = (control_of(&nodes[0], &dir.path().join("a")).await, control_of(&nodes[1], &dir.path().join("b")).await);
+
+    ask(&posting, Request::Chat { message: Some("lunch at one?".into()) }).await.unwrap();
+
+    assert!(eventually(async || nodes[1].chat().await.len() == 1).await);
+    let Reply::Messages { messages } = ask(&reading, Request::Chat { message: None }).await.unwrap() else { panic!("expected messages") };
+    assert_eq!(messages[0].content, "lunch at one?");
+    assert_eq!(messages[0].sender_name.as_deref(), Some(nodes[0].state.node_name.as_str()));
+}
+
+#[tokio::test]
+async fn an_empty_chat_message_is_refused() {
+    let node = &spawn_mesh(1, None).await[0];
+    let dir = tempfile::tempdir().unwrap();
+    let endpoint = control_of(node, dir.path()).await;
+
+    assert!(ask(&endpoint, Request::Chat { message: Some("   ".into()) }).await.is_err());
+    assert!(node.chat().await.is_empty());
+}
+
+/// A guest on `node` whose upload of a small file waits for approval; returns the guest's id and the upload's.
+async fn waiting_guest_upload(node: &NodeHandle) -> (String, String) {
+    let guests = &node.state.guests;
+    let (_, guest) = guests.sessions.create("192.168.1.40".parse().unwrap(), None, Permission::UploadWithApproval);
+    guests.uploads.begin("file_g", &guest.id, "photo.jpg".into(), "image/jpeg".into(), 5).unwrap();
+    let blob = node.state.store.create("file_g", 5).unwrap();
+    blob.write_chunk_hashing(0, b"photo".to_vec()).await.unwrap();
+    blob.seal().await.unwrap();
+    guests.uploads.transition("file_g", UploadState::Receiving, UploadState::AwaitingApproval).unwrap();
+    (guest.id, "file_g".into())
+}
+
+async fn guests_of(endpoint: &Endpoint) -> (Vec<String>, Vec<String>) {
+    match ask(endpoint, Request::Guests).await.unwrap() {
+        Reply::Guests { guests, uploads } => {
+            (guests.into_iter().map(|guest| guest.id).collect(), uploads.into_iter().map(|upload| upload.id).collect())
+        }
+        other => panic!("expected guests, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_waiting_guest_upload_is_listed_and_once_approved_is_shared() {
+    let node = &spawn_mesh(1, None).await[0];
+    let dir = tempfile::tempdir().unwrap();
+    let endpoint = control_of(node, dir.path()).await;
+    let (guest, upload) = waiting_guest_upload(node).await;
+    assert_eq!(guests_of(&endpoint).await, (vec![guest], vec![upload.clone()]));
+
+    let shared = shared_by(&endpoint, Request::AnswerUpload { upload: upload.clone(), accepted: true }).await;
+
+    assert_eq!(shared[0].name, "photo.jpg");
+    assert!(node.live_files().await.contains(&upload));
+    assert!(guests_of(&endpoint).await.1.is_empty());
+}
+
+#[tokio::test]
+async fn a_denied_guest_upload_is_thrown_away() {
+    let node = &spawn_mesh(1, None).await[0];
+    let dir = tempfile::tempdir().unwrap();
+    let endpoint = control_of(node, dir.path()).await;
+    let (_, upload) = waiting_guest_upload(node).await;
+
+    ask(&endpoint, Request::AnswerUpload { upload: upload.clone(), accepted: false }).await.unwrap();
+
+    assert!(node.state.store.get(&upload).is_none());
+    assert!(!node.live_files().await.contains(&upload));
+    assert!(ask(&endpoint, Request::AnswerUpload { upload, accepted: false }).await.is_err(), "denied twice");
+}
+
+#[tokio::test]
+async fn a_guest_signed_out_from_the_command_line_is_gone() {
+    let node = &spawn_mesh(1, None).await[0];
+    let dir = tempfile::tempdir().unwrap();
+    let endpoint = control_of(node, dir.path()).await;
+    let (guest, _) = waiting_guest_upload(node).await;
+
+    ask(&endpoint, Request::SignOutGuest { guest: guest.clone() }).await.unwrap();
+
+    assert_eq!(guests_of(&endpoint).await, (vec![], vec![]));
+    assert!(ask(&endpoint, Request::SignOutGuest { guest }).await.is_err(), "signed out twice");
+}
+
+#[tokio::test]
+async fn a_new_passphrase_is_saved_for_the_next_start_and_the_old_one_is_shown_until_then() {
+    let node = &spawn_mesh(1, Some("old-mesh-secret")).await[0];
+    let dir = tempfile::tempdir().unwrap();
+    let endpoint = control_of(node, dir.path()).await;
+
+    ask(&endpoint, Request::ChangePassphrase { passphrase: "new-mesh-secret".into() }).await.unwrap();
+
+    let saved = saved_passphrase::load(&node.state.started_with.data_dir, false).unwrap();
+    assert_eq!(saved.as_deref(), Some("new-mesh-secret"));
+    assert!(node.state.preferences.needs_restart());
+    let shown = ask(&endpoint, Request::Passphrase).await.unwrap();
+    assert_eq!(shown, Reply::Passphrase { passphrase: Some("old-mesh-secret".into()) });
+}
+
+async fn pairing_of(endpoint: &Endpoint) -> ladex_core::pairing::View {
+    match ask(endpoint, Request::Pairing).await.unwrap() {
+        Reply::Pairing(view) => *view,
+        other => panic!("expected pairing, got {other:?}"),
+    }
+}
+
+/// Answers the code waiting on a node as soon as it shows; returns the words it showed.
+async fn confirm_code(endpoint: &Endpoint) -> Vec<String> {
+    let mut code = None;
+    assert!(
+        eventually(async || {
+            code = pairing_of(endpoint).await.status.waiting.into_iter().next();
+            code.is_some()
+        })
+        .await,
+        "no code to compare ever showed"
+    );
+    let code = code.unwrap();
+    ask(endpoint, Request::AnswerPairing { id: code.id, accepted: true }).await.unwrap();
+    code.request.words
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_nodes_pair_from_the_command_line_and_one_can_then_revoke_the_other() {
+    let phone = spawn_node(NodeConfig::named("phone").passphrase("one")).await;
+    let laptop = spawn_node(NodeConfig::named("laptop").passphrase("two")).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (on_phone, on_laptop) = (control_of(&phone, &dir.path().join("a")).await, control_of(&laptop, &dir.path().join("b")).await);
+
+    ask(&on_laptop, Request::OpenPairing).await.unwrap();
+    ask(&on_phone, Request::DialPairing { address: laptop.addr.to_string() }).await.unwrap();
+    let (phone_words, laptop_words) = tokio::join!(confirm_code(&on_phone), confirm_code(&on_laptop));
+
+    assert_eq!(phone_words, laptop_words);
+    assert!(eventually(async || pairing_of(&on_phone).await.status.recent.first().is_some_and(|outcome| outcome.paired)).await);
+    let Reply::Trust { nodes } = ask(&on_phone, Request::Trust).await.unwrap() else { panic!("expected trust") };
+    assert_eq!((nodes[0].node.name.as_str(), nodes[0].node.trusted_via), ("laptop", TrustedVia::Pairing));
+
+    ask(&on_phone, Request::RevokeNode { node: "laptop".into() }).await.unwrap();
+    let Reply::Trust { nodes } = ask(&on_phone, Request::Trust).await.unwrap() else { panic!("expected trust") };
+    assert_eq!(nodes[0].revoked_by.as_deref(), Some("this device"));
+}
+
+#[tokio::test]
+async fn pairing_with_something_that_is_not_an_address_is_refused() {
+    let node = &spawn_mesh(1, None).await[0];
+    let dir = tempfile::tempdir().unwrap();
+    let endpoint = control_of(node, dir.path()).await;
+
+    let refused = ask(&endpoint, Request::DialPairing { address: "the laptop".into() }).await.unwrap_err();
+
+    assert!(refused.to_string().contains("is not an address"), "{refused}");
 }

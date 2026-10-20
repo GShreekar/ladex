@@ -2,21 +2,24 @@
 //! progress events and then a reply.
 
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use crate::guest::{self, Permission};
-use crate::preferences;
+use crate::guest::sessions::GuestSummary;
+use crate::guest::{self, Permission, WaitingUpload};
 use crate::receive::{self, ReceiveRoot};
 use crate::store::CHUNK_SIZE;
-use crate::types::{FileView, NodeId, PeerInfo, SessionId};
+use crate::trust::TrustedNodeView;
+use crate::types::{FileView, NodeId, PeerInfo, SessionId, TextMessage};
+use crate::{pairing, preferences};
 use crate::{state, tls, NodeState};
 
 mod push;
+mod receiving;
 pub mod server;
 mod share;
 
@@ -62,6 +65,67 @@ pub enum Request {
         #[serde(default)]
         update: Option<preferences::Update>,
     },
+    /// Stops sharing a file or folder this node shared, named by id or by name.
+    Unshare {
+        file: String,
+    },
+    /// Shows the room's chat, after posting `message` if there is one.
+    Chat {
+        message: Option<String>,
+    },
+    /// Lists the browser guests signed in and their uploads waiting for approval.
+    Guests,
+    SignOutGuest {
+        guest: String,
+    },
+    /// Accepts a guest's upload that waits for approval, or throws it away.
+    AnswerUpload {
+        upload: String,
+        accepted: bool,
+    },
+    /// Shows the passphrase the node runs with.
+    Passphrase,
+    /// Saves a new passphrase for the node's next start.
+    ChangePassphrase {
+        passphrase: String,
+    },
+    /// Joins the mesh as a device called `name` and reports each file offered to it, until the command leaves.
+    Receive {
+        name: String,
+    },
+    /// Accepts a file offered to the receiving device `device` and saves it into `into`.
+    AcceptOffer {
+        device: SessionId,
+        file: String,
+        into: PathBuf,
+    },
+    /// Turns down a file offered to the receiving device `device` by the device `from`.
+    DeclineOffer {
+        device: SessionId,
+        file: String,
+        from: SessionId,
+    },
+    /// Shows this node's address for pairing and the codes waiting for an answer.
+    Pairing,
+    /// Accepts pairings from other devices for the next few minutes.
+    OpenPairing,
+    /// Stops accepting pairings and declines every code still waiting.
+    ClosePairing,
+    /// Dials the node at `address` to pair with it.
+    DialPairing {
+        address: String,
+    },
+    /// Answers whether a waiting code matches the one on the other device.
+    AnswerPairing {
+        id: u64,
+        accepted: bool,
+    },
+    /// Lists the nodes this one trusts or has revoked.
+    Trust,
+    /// Revokes a node, named by its id or its name; the rest of the mesh drops it too.
+    RevokeNode {
+        node: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,6 +151,14 @@ pub enum Event {
     Declined {
         name: String,
     },
+    /// The receiving device joined the mesh under this id.
+    Joined {
+        device: SessionId,
+    },
+    /// A file was offered to the receiving device.
+    Incoming {
+        offer: Offer,
+    },
     Done {
         reply: Box<Reply>,
     },
@@ -106,6 +178,28 @@ pub enum Reply {
     Invite(Invite),
     Status(Box<Status>),
     Preferences(Box<preferences::View>),
+    Messages { messages: Vec<TextMessage> },
+    Guests { guests: Vec<GuestSummary>, uploads: Vec<WaitingUpload> },
+    Passphrase { passphrase: Option<String> },
+    Received { name: String, path: PathBuf },
+    Pairing(Box<pairing::View>),
+    Trust { nodes: Vec<TrustedNodeView> },
+    Acknowledged { message: String },
+}
+
+/// A file offered to a device the command line is receiving as.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Offer {
+    pub file_id: String,
+    pub name: String,
+    /// For a folder, the size of all its files.
+    pub size: u64,
+    pub from: SessionId,
+    pub from_name: String,
+    /// Sent to this device alone, rather than a shared file another device pointed it to.
+    pub is_direct: bool,
+    /// The node's rule for incoming files lets it be saved without asking.
+    pub is_accepted_without_asking: bool,
 }
 
 /// A browser or command-line device on the mesh.
@@ -212,6 +306,11 @@ impl Events {
         }
     }
 
+    // Resolves once the command has gone away.
+    async fn closed(&self) {
+        self.0.closed().await;
+    }
+
     // Progress is only worth showing now and then; one dropped because the command is busy reading is no loss.
     fn progress(&self, name: &str, done: u64, total: u64) -> anyhow::Result<()> {
         match self.0.try_send(Event::Progress { name: name.to_string(), done, total }) {
@@ -235,7 +334,7 @@ async fn run(state: &NodeState, settings: &Settings, request: Request, events: &
         Request::Send { paths, to: None } => Ok(Reply::Shared { files: share::share_paths(state, &paths, events).await? }),
         Request::Send { paths, to: Some(device) } => push::send_to_device(state, &paths, &device, events).await,
         Request::Seed { dir, replaces } => Ok(Reply::Shared { files: vec![share::seed(state, &dir, replaces.as_deref(), events).await?] }),
-        Request::Get { file, into } => save(state, &file, into, events).await,
+        Request::Get { file, into } => save(state, &file, &into, events).await,
         Request::List => Ok(Reply::Files { files: state::file_views(state) }),
         Request::Devices => Ok(Reply::Devices { devices: devices(state).await, nodes: nodes(state).await }),
         Request::Invite { permission } => Ok(Reply::Invite(invite(state, permission))),
@@ -246,7 +345,94 @@ async fn run(state: &NodeState, settings: &Settings, request: Request, events: &
             }
             Ok(Reply::Preferences(Box::new(preferences::view(state))))
         }
+        Request::Unshare { file } => unshare(state, &file).await,
+        Request::Chat { message } => chat(state, message.as_deref()).await,
+        Request::Guests => Ok(Reply::Guests { guests: state.guests.sessions.list(), uploads: guest::waiting_uploads(state) }),
+        Request::SignOutGuest { guest } => sign_out_guest(state, &guest),
+        Request::AnswerUpload { upload, accepted: true } => Ok(Reply::Shared { files: vec![guest::approve_upload(state, &upload).await?] }),
+        Request::AnswerUpload { upload, accepted: false } => match guest::deny_upload(state, &upload) {
+            true => Ok(acknowledged("The upload was thrown away")),
+            false => bail!("no upload {upload:?} is waiting (see `ladex guests`)"),
+        },
+        Request::Passphrase => Ok(Reply::Passphrase { passphrase: state.passphrase.clone() }),
+        Request::ChangePassphrase { passphrase } => {
+            preferences::change_passphrase(state, settings.use_keychain, &passphrase)?;
+            Ok(acknowledged("Saved; the node uses the new passphrase once it restarts"))
+        }
+        Request::Receive { name } => receiving::receive(state, &name, events).await,
+        Request::AcceptOffer { device, file, into } => receiving::accept(state, &device, &file, &into, events).await,
+        Request::DeclineOffer { device, file, from } => {
+            crate::push::decline_offer(state, &device, &file, &from).await;
+            Ok(acknowledged("Declined"))
+        }
+        Request::Pairing => Ok(Reply::Pairing(Box::new(pairing::view(state)))),
+        Request::OpenPairing => {
+            state.pairings.open();
+            Ok(Reply::Pairing(Box::new(pairing::view(state))))
+        }
+        Request::ClosePairing => {
+            state.pairings.close();
+            Ok(acknowledged("Stopped accepting pairings"))
+        }
+        Request::DialPairing { address } => {
+            let target = pairing::parse_address(&address, state.quic_port)
+                .with_context(|| format!("{address:?} is not an address; give the other device's, like 192.168.1.20:8080"))?;
+            pairing::dial(state, target);
+            Ok(acknowledged(&format!("Dialing {target}")))
+        }
+        Request::AnswerPairing { id, accepted } => match state.pairings.answer(id, accepted) {
+            true => Ok(acknowledged(if accepted { "Confirmed" } else { "Refused" })),
+            false => bail!("that pairing is no longer waiting"),
+        },
+        Request::Trust => Ok(Reply::Trust { nodes: crate::trust::views(state).await? }),
+        Request::RevokeNode { node } => revoke(state, &node).await,
     }
+}
+
+async fn revoke(state: &NodeState, wanted: &str) -> anyhow::Result<Reply> {
+    let nodes = state.trust.list()?;
+    let mut named: Vec<_> = nodes.iter().filter(|node| node.node_id == wanted || node.name.eq_ignore_ascii_case(wanted)).collect();
+    let node = match named.len() {
+        0 => bail!("this node does not know {wanted:?} (see `ladex trust`)"),
+        1 => named.remove(0),
+        _ => {
+            let ids: Vec<&str> = named.iter().map(|node| node.node_id.as_str()).collect();
+            bail!("{} nodes are called {wanted:?}; name one by its id: {}", named.len(), ids.join(", "))
+        }
+    };
+    match crate::mesh::revoke_node(state, &node.node_id).await? {
+        crate::mesh::Revoked::Now => Ok(acknowledged(&format!("Revoked {}; the rest of the mesh drops it too", node.name))),
+        crate::mesh::Revoked::Already => Ok(acknowledged(&format!("{} was already revoked", node.name))),
+        crate::mesh::Revoked::UnknownNode => bail!("this node does not know {wanted:?} (see `ladex trust`)"),
+    }
+}
+
+fn acknowledged(message: &str) -> Reply {
+    Reply::Acknowledged { message: message.to_string() }
+}
+
+async fn unshare(state: &NodeState, wanted: &str) -> anyhow::Result<Reply> {
+    let file = find_file(state, wanted)?;
+    if state::unshare(state, &file.id, share::SHARED_BY_THIS_NODE, true).await.is_empty() {
+        bail!("{} was shared by another node; only that node can stop sharing it", file.name);
+    }
+    Ok(acknowledged(&format!("Stopped sharing {}", file.name)))
+}
+
+// The command line speaks in chat as this node, under an id of its own so its messages are told apart from a tab's.
+async fn chat(state: &NodeState, message: Option<&str>) -> anyhow::Result<Reply> {
+    if let Some(text) = message {
+        let sender = format!("cli_{}", state.node_id);
+        state::post_message(state, sender, Some(state.node_name.clone()), text).await.context("the message is empty")?;
+    }
+    Ok(Reply::Messages { messages: state.messages.read().await.clone() })
+}
+
+fn sign_out_guest(state: &NodeState, wanted: &str) -> anyhow::Result<Reply> {
+    if !guest::revoke_guest(state, wanted) {
+        bail!("no guest {wanted:?} is signed in (see `ladex guests`)");
+    }
+    Ok(acknowledged("The guest was signed out"))
 }
 
 /// The shared file a user means by an id or a name; a name several files share is refused with their ids.
@@ -266,17 +452,29 @@ pub fn find_file(state: &NodeState, wanted: &str) -> anyhow::Result<FileView> {
     }
 }
 
-async fn save(state: &NodeState, wanted: &str, into: PathBuf, events: &Events) -> anyhow::Result<Reply> {
+async fn save(state: &NodeState, wanted: &str, into: &Path, events: &Events) -> anyhow::Result<Reply> {
     let file = find_file(state, wanted)?;
-    let root = ReceiveRoot::open(&into).with_context(|| format!("could not open {}", into.display()))?;
+    let root = ReceiveRoot::open(into).with_context(|| format!("could not open {}", into.display()))?;
     let total = if file.is_folder { file.folder_bytes } else { file.size };
     let saving = receive::save_shared(state, &root, &file.id);
-    tokio::pin!(saving);
+    let path = with_progress(saving, || fetched_bytes(state, &file), &file.name, total, events).await?;
+    Ok(Reply::Saved { path, file })
+}
+
+/// Waits for `work`, telling the command how far it has got now and then.
+async fn with_progress<T, E: std::error::Error + Send + Sync + 'static>(
+    work: impl std::future::Future<Output = Result<T, E>>,
+    done: impl Fn() -> u64,
+    name: &str,
+    total: u64,
+    events: &Events,
+) -> anyhow::Result<T> {
+    tokio::pin!(work);
     let mut tick = tokio::time::interval(PROGRESS_INTERVAL);
     loop {
         tokio::select! {
-            saved = &mut saving => return Ok(Reply::Saved { path: saved?, file: file.clone() }),
-            _ = tick.tick() => events.progress(&file.name, fetched_bytes(state, &file), total)?,
+            outcome = &mut work => return Ok(outcome?),
+            _ = tick.tick() => events.progress(name, done(), total)?,
         }
     }
 }

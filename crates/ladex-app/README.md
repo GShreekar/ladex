@@ -20,6 +20,22 @@ cargo run -p ladex-app
 
 `ui/dist` is shared: the app embeds it directly, and `ladex` stages a copy of it from `crates/ladex-cli/build.rs`, so one `npm run build` serves both.
 
+## Installers
+
+The release workflow builds them from one tag, after checking the tag matches the version in `Cargo.toml` and `ui/package.json`. Each installer carries the `ladex` CLI as well (Tauri's `externalBin`, added by `tauri.release.conf.json` so plain `cargo run` doesn't need it). To build one locally:
+
+```sh
+(cd ui && npm ci && npm run build)
+cargo build --release -p ladex
+mkdir -p crates/ladex-app/binaries
+cp target/release/ladex crates/ladex-app/binaries/ladex-$(rustc -vV | sed -n 's/host: //p')
+(cd crates/ladex-app && npx @tauri-apps/cli@2.11 build --config tauri.release.conf.json)
+```
+
+- **Windows (NSIS):** installs for all users. `windows/installer-hooks.nsh` adds inbound firewall rules for `ladex-app.exe` and `ladex.exe` and puts the install folder on the machine PATH (through `windows/cli-path.ps1`). Uninstalling removes both. There is no MSI because MSI refuses prerelease versions such as `3.0.0-rc.1`.
+- **macOS (.dmg):** ad-hoc signed, with the Local Network usage string and the `_ladex._tcp` Bonjour type from `Info.plist`. On launch from Applications, `src/cli_link.rs` links `/usr/local/bin/ladex` to the bundled CLI. It asks for an administrator password once if it needs to, and never replaces a `ladex` that it did not install.
+- **Linux:** a `.deb` that installs `ladex-app` and `ladex` into `/usr/bin`, and an AppImage. `install.sh` stays the route for the CLI alone.
+
 ## Tray, login item and notifications
 
 - **Tray (menu bar on macOS).** Closing the window hides it; the node keeps sharing. The tray menu shows how many devices are connected and has Open LADEX, Open Downloads Folder, Launch at Login and Quit LADEX. Without a tray (some Linux desktops) closing the window quits, as before.
@@ -34,8 +50,8 @@ The first time the app opens on a data folder it shows a short wizard before any
 ## Settings, network and command line
 
 - **Settings** (only on the machine running the node): the downloads folder, how files sent to this device are accepted (always ask, from paired devices, or from anyone in the mesh, with an optional size above which it still asks), the storage limit, the mesh passphrase (shown on request, to add another computer), launch at login and the theme. Changing the passphrase takes effect on a restart, which the page offers.
-- **Network** runs the same checks as `ladex doctor`: addresses, whether the page answers, whether multicast works, other nodes, storage and disk, with a report to copy into a bug report.
-- **Command line** lists the `ladex` commands that do what the app does, with the data folder the CLI will use and a copy button for each.
+- **Network** runs the same checks as `ladex doctor`: addresses, whether the page answers, whether multicast works, other nodes, storage and disk, with a report to copy into a bug report. It also pairs with another node by comparing six words (`ladex pair`), and lists the trusted nodes with a button to revoke one (`ladex trust`).
+- **Command line** lists the `ladex` commands that do what the app does, with the data folder the CLI will use and a copy button for each. Everything except the tray, notifications and the theme has one: `receive` stands in for the window as a device files are sent to, and `autostart` for Launch at login.
 - `ladex settings` does the same from a terminal; the daemon and the app read the same files.
 
 ## Environment

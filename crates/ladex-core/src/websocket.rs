@@ -274,26 +274,9 @@ async fn handle_client_message(
         }
 
         ClientMessage::TextMessage { session_id: sender_id, content } => {
-            let content = validate::clean_message(&content).ok_or("message is empty")?;
-            let now_ms = chrono::Utc::now().timestamp_millis() as u64;
             // Kept with the message, so it is still credited after the sender leaves.
             let sender_name = state.local_peers.read().await.get(&sender_id).and_then(|peer| peer.nickname.clone());
-            let message = TextMessage {
-                id: format!("msg_{}_{}", sender_id, now_ms),
-                content,
-                sender_id,
-                sender_name,
-                timestamp: chrono::Utc::now(),
-                created_at: now_ms,
-            };
-            {
-                let mut messages = state.messages.write().await;
-                messages.push(message.clone());
-                messages.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
-                state::prune_messages(&mut messages);
-            }
-            broadcast(state, ServerMessage::TextMessage { message: message.clone() }).await;
-            state::push_message_to_mesh(&state.mesh_peers, message).await;
+            state::post_message(state, sender_id, sender_name, &content).await.ok_or("message is empty")?;
         }
 
         // The sharing device may unshare a file, and so may the node's own machine; a folder takes its files with it.
@@ -331,11 +314,7 @@ async fn handle_client_message(
         }
 
         ClientMessage::DeclineFileOffer { session_id: from, target_session_id, file_id } => {
-            // A file sent to this device alone is declined at its node; an offer of a catalog file just tells the other tab.
-            if !crate::push::decline(state, &from, &file_id).await {
-                let declined = ServerMessage::FileOfferDeclined { file_id, from_session_id: from.clone() };
-                mesh::route_to_device(state, &from, &target_session_id, declined).await;
-            }
+            crate::push::decline_offer(state, &from, &file_id, &target_session_id).await;
         }
 
         ClientMessage::AcceptFileOffer { session_id: _, file_id } => {

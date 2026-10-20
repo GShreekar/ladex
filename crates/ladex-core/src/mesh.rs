@@ -38,6 +38,18 @@ impl std::fmt::Display for AuthFailure {
 
 impl std::error::Error for AuthFailure {}
 
+/// The node dialed keeps the connection it already has with this one, so the two are connected.
+#[derive(Debug)]
+pub struct AlreadyConnected(pub NodeId);
+
+impl std::fmt::Display for AlreadyConnected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "already connected to {}", self.0)
+    }
+}
+
+impl std::error::Error for AlreadyConnected {}
+
 #[derive(Debug, Clone)]
 pub struct MeshPeerHandle {
     pub node_id: NodeId,

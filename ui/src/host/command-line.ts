@@ -30,6 +30,8 @@ export function settingsCommands(view: PreferencesView): CommandHint[] {
   const downloads = preferences.downloads_dir ? ['--downloads-dir', quote(preferences.downloads_dir, view.platform)] : [];
   return [
     { label: 'Show these settings', command: ladex(view, 'settings') },
+    { label: 'Show the mesh passphrase', command: ladex(view, 'passphrase') },
+    { label: 'Change the mesh passphrase', command: ladex(view, 'passphrase', 'set', '--generate') },
     { label: 'Set the storage limit', command: ladex(view, 'settings', '--storage-limit-gb', String(preferences.storage_limit_gib)) },
     { label: 'Set the incoming files rule', command: ladex(view, 'settings', '--auto-accept', rule.from, ...sizeLimit) },
     ...(downloads.length ? [{ label: 'Set the downloads folder', command: ladex(view, 'settings', ...downloads) }] : []),
@@ -43,6 +45,10 @@ export function nodeCommands(view: PreferencesView): CommandHint[] {
     { label: 'List what is shared', command: ladex(view, 'ls') },
     { label: 'List connected devices', command: ladex(view, 'devices') },
     { label: 'Download a shared file', command: ladex(view, 'get', '<name>') },
+    { label: 'Stop sharing a file', command: ladex(view, 'unshare', '<name>') },
+    { label: 'Receive files sent to this device', command: ladex(view, 'receive') },
+    { label: 'Read and post in the room chat', command: ladex(view, 'chat', '"<message>"') },
+    { label: 'See and sign out guests, answer their uploads', command: ladex(view, 'guests') },
     { label: 'Check the network', command: ladex(view, 'doctor') },
   ];
 }
@@ -52,6 +58,11 @@ export function daemonCommand(view: PreferencesView): CommandHint {
   const dataDir = view.is_default_data_dir ? [] : ['--data-dir', quote(view.data_dir, view.platform)];
   const limit = ['--storage-limit-gb', String(view.preferences.storage_limit_gib)];
   return { label: 'Run this node without the app', command: ['ladex', ...dataDir, ...limit].join(' ') };
+}
+
+/** Starts that node when the person logs in, as Launch at login does for the app. */
+export function autostartCommand(view: PreferencesView): CommandHint {
+  return { label: 'Start this node when you log in', command: ladex(view, 'autostart', 'on') };
 }
 
 /** How the data folder is named for another command line: on Windows the variable is set differently. */

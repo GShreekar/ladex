@@ -25,7 +25,9 @@ pub fn migrate(root: &Path, layout: &Layout, index: &Index, now_ms: u64) -> io::
     let mut moved = 0;
     for entry in std::fs::read_dir(root)? {
         let meta_path = entry?.path();
-        if meta_path.extension().and_then(|e| e.to_str()) != Some("json") {
+        // Other JSON files live here too, such as the preferences; an old file's record sits beside its data.
+        let is_record = meta_path.extension().and_then(|e| e.to_str()) == Some("json") && meta_path.with_extension("data").is_file();
+        if !is_record {
             continue;
         }
         match import(root, &meta_path, layout, index, now_ms) {

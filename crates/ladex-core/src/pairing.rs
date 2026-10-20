@@ -1,14 +1,16 @@
 //! Pairing with another node: a time-limited window for incoming pairings, and codes waiting for each person's answer.
 
 use std::collections::{HashMap, VecDeque};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use crate::handshake::Pairing;
 use crate::types::NodeId;
+use crate::NodeState;
 
 pub const WINDOW: Duration = Duration::from_secs(300);
 // Shorter than the handshake's wait for the other device, so this side always answers first.
@@ -18,29 +20,30 @@ const MAX_WAITING: usize = 3;
 const MAX_RECENT: usize = 8;
 
 /// A code waiting for the person at this node to compare it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Request {
     pub node_id: NodeId,
     pub name: String,
-    pub words: Vec<&'static str>,
+    pub words: Vec<String>,
     /// Whether this node dialed the other, rather than the other way round.
     pub dialed: bool,
 }
 
 impl Request {
     pub fn for_pairing(pairing: &Pairing<'_>, dialed: bool) -> Self {
-        Request { node_id: pairing.peer_node_id(), name: pairing.peer_name(), words: pairing.code().to_vec(), dialed }
+        let words = pairing.code().iter().map(|word| word.to_string()).collect();
+        Request { node_id: pairing.peer_node_id(), name: pairing.peer_name(), words, dialed }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WaitingCode {
     pub id: u64,
     #[serde(flatten)]
     pub request: Request,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Outcome {
     pub name: String,
     pub paired: bool,
@@ -56,13 +59,41 @@ impl Outcome {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Status {
     pub open: bool,
     pub seconds_left: u64,
     pub waiting: Vec<WaitingCode>,
     /// Newest first.
     pub recent: Vec<Outcome>,
+}
+
+/// Pairing as the person at this node sees it: the address another device dials, and the window's state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct View {
+    pub address: Option<String>,
+    #[serde(flatten)]
+    pub status: Status,
+}
+
+pub fn view(state: &NodeState) -> View {
+    View { address: state.local_ip.map(|ip| SocketAddr::new(ip, state.quic_port).to_string()), status: state.pairings.status() }
+}
+
+/// "ip:port", or just "ip" for a node on the same port as this one.
+pub fn parse_address(address: &str, default_port: u16) -> Option<SocketAddr> {
+    let address = address.trim();
+    address.parse::<SocketAddr>().ok().or_else(|| address.parse::<IpAddr>().ok().map(|ip| SocketAddr::new(ip, default_port)))
+}
+
+/// Dials another node to pair with it; the outcome shows up in the status once both people have answered.
+pub fn dial(state: &NodeState, target: SocketAddr) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        let result = crate::mesh::quic::pair(&state, target).await;
+        let name = result.as_ref().map_or_else(|_| target.to_string(), Clone::clone);
+        state.pairings.record(Outcome::of(&name, &result));
+    });
 }
 
 #[derive(Default)]
@@ -168,8 +199,15 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    #[test]
+    fn a_node_address_without_a_port_uses_this_nodes_port() {
+        assert_eq!(parse_address(" 192.168.1.20 ", 8080), Some("192.168.1.20:8080".parse().unwrap()));
+        assert_eq!(parse_address("192.168.1.20:9000", 8080), Some("192.168.1.20:9000".parse().unwrap()));
+        assert_eq!(parse_address("laptop", 8080), None);
+    }
+
     fn request(name: &str) -> Request {
-        Request { node_id: format!("id_{name}"), name: name.to_string(), words: vec!["apple"; 6], dialed: false }
+        Request { node_id: format!("id_{name}"), name: name.to_string(), words: vec!["apple".to_string(); 6], dialed: false }
     }
 
     async fn ask_in_background(pairings: &Arc<Pairings>, name: &str) -> (u64, tokio::task::JoinHandle<bool>) {

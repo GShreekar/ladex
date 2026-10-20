@@ -7,16 +7,18 @@ use anyhow::{anyhow, bail, Context};
 use clap::Subcommand;
 use ladex_core::control::server::{self, Endpoint};
 use ladex_core::control::{Device, Event, GuestInvite, Invite, Node, Reply, Request};
-use ladex_core::guest::Permission;
+use ladex_core::guest::sessions::GuestSummary;
+use ladex_core::guest::{Permission, WaitingUpload};
 use ladex_core::preferences::{self, AutoAccept, AutoAcceptFrom, Preferences};
-use ladex_core::types::FileView;
+use ladex_core::trust::{TrustedNodeView, TrustedVia};
+use ladex_core::types::{FileView, TextMessage};
 
-use crate::doctor;
 use crate::output::{self, format_bytes, ProgressLine};
+use crate::{autostart, doctor, pair, passphrase, receive};
 
 const WATCH_INTERVAL: Duration = Duration::from_secs(2);
-const EXIT_OK: i32 = 0;
-const EXIT_FAILED: i32 = 1;
+pub const EXIT_OK: i32 = 0;
+pub const EXIT_FAILED: i32 = 1;
 
 #[derive(Subcommand)]
 pub enum Command {
@@ -57,6 +59,53 @@ pub enum Command {
     },
     /// Check that this node can be reached and has what it needs
     Doctor,
+    /// Stop sharing a file or folder this node shared, named by its id or its name
+    Unshare { file: String },
+    /// Show the room's chat, or post a message to it
+    Chat {
+        /// The message to post.
+        message: Option<String>,
+    },
+    /// List the browser guests and their uploads waiting for approval, or act on them
+    Guests {
+        #[command(subcommand)]
+        action: Option<GuestsAction>,
+    },
+    /// Receive files sent to this device: stays running as a device others can send to
+    Receive {
+        /// The device name others see. Default: this node's name
+        #[arg(long)]
+        name: Option<String>,
+        /// The directory to save into. Default: the current directory
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Accept every file without asking, whatever the incoming files rule says.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Pair with another node by comparing six words, so each trusts the other's key itself
+    Pair {
+        /// The other device's address, as `ladex pair` on it shows; without one, waits for it to dial this one.
+        address: Option<String>,
+    },
+    /// List the nodes this one trusts, or revoke one so the whole mesh drops it
+    Trust {
+        #[command(subcommand)]
+        action: Option<TrustAction>,
+    },
+    /// Show the mesh passphrase, or set a new one; works with or without a running node
+    Passphrase {
+        #[command(subcommand)]
+        action: Option<passphrase::Action>,
+        /// Keep the passphrase in a file in the data directory instead of the OS keychain.
+        #[arg(long, global = true)]
+        no_keychain: bool,
+    },
+    /// Start a node when you log in, or stop doing so: what the app's Launch at login does
+    Autostart {
+        /// on or off; without it, shows whether it is on.
+        state: Option<autostart::Switch>,
+    },
     /// Show this node's settings, or change them: what the app's Settings page does
     Settings {
         /// Where files saved from the app's window go; an empty value goes back to the system's downloads folder.
@@ -77,6 +126,22 @@ pub enum Command {
     },
 }
 
+#[derive(Subcommand)]
+pub enum GuestsAction {
+    /// Sign a guest out, throwing away its uploads nobody accepted yet
+    SignOut { guest: String },
+    /// Accept a guest's upload that waits for approval, so it is shared with everyone
+    Approve { upload: String },
+    /// Throw away a guest's upload that waits for approval
+    Deny { upload: String },
+}
+
+#[derive(Subcommand)]
+pub enum TrustAction {
+    /// Revoke a node, named by its id or its name; every node in the mesh drops it
+    Revoke { node: String },
+}
+
 /// A running node, and how this command should show what the node tells it.
 pub struct Session {
     endpoint: Endpoint,
@@ -84,7 +149,7 @@ pub struct Session {
 }
 
 pub fn not_running(data_dir: &Path) -> anyhow::Error {
-    anyhow!("no LADEX node is running with {}; start one with `ladex`", data_dir.display())
+    anyhow!("no LADEX node is running with {}; start one with `ladex`, or open the LADEX app", data_dir.display())
 }
 
 impl Session {
@@ -93,11 +158,20 @@ impl Session {
         Ok(Self { endpoint, is_json })
     }
 
+    pub fn is_json(&self) -> bool {
+        self.is_json
+    }
+
     pub async fn call(&self, request: &Request) -> anyhow::Result<Reply> {
         let mut progress = ProgressLine::new(!self.is_json);
         let reply = server::call(&self.endpoint, request, |event| self.show(event, &mut progress)).await;
         progress.clear();
         reply
+    }
+
+    /// Sends a request whose events the caller handles itself.
+    pub async fn stream(&self, request: &Request, on_event: impl FnMut(&Event)) -> anyhow::Result<Reply> {
+        server::call(&self.endpoint, request, on_event).await
     }
 
     fn show(&self, event: &Event, progress: &mut ProgressLine) {
@@ -114,17 +188,26 @@ impl Session {
             }
             Event::Delivered { name } => eprintln!("{name} was delivered"),
             Event::Declined { name } => eprintln!("{name} was declined"),
-            Event::Welcome { .. } | Event::Progress { .. } | Event::Done { .. } | Event::Failed { .. } => {}
+            Event::Welcome { .. }
+            | Event::Progress { .. }
+            | Event::Joined { .. }
+            | Event::Incoming { .. }
+            | Event::Done { .. }
+            | Event::Failed { .. } => {}
         }
     }
 }
 
 /// Runs a command and returns the process's exit code.
 pub async fn run(command: Command, data_dir: &Path, is_json: bool) -> i32 {
-    if matches!(command, Command::Doctor) {
-        return doctor::run(data_dir, is_json).await;
-    }
-    match execute(command, data_dir, is_json).await {
+    // These work whether or not a node is running.
+    let outcome = match command {
+        Command::Doctor => return doctor::run(data_dir, is_json).await,
+        Command::Passphrase { action, no_keychain } => passphrase::run(action, data_dir, !no_keychain, is_json).await,
+        Command::Autostart { state } => autostart::run(state, data_dir, is_json),
+        command => execute(command, data_dir, is_json).await,
+    };
+    match outcome {
         Ok(code) => code,
         Err(e) => {
             let message = if is_connection_refused(&e) { format!("{:#}", not_running(data_dir)) } else { format!("{e:#}") };
@@ -152,7 +235,22 @@ async fn execute(command: Command, data_dir: &Path, is_json: bool) -> anyhow::Re
         Command::Ls { all } => return list(&session, all).await,
         Command::Devices => Request::Devices,
         Command::Invite { permission } => Request::Invite { permission },
-        Command::Doctor => unreachable!("doctor does not need a running node and is handled before this"),
+        Command::Unshare { file } => Request::Unshare { file },
+        Command::Chat { message } => Request::Chat { message },
+        Command::Guests { action: None } => Request::Guests,
+        Command::Guests { action: Some(GuestsAction::SignOut { guest }) } => Request::SignOutGuest { guest },
+        Command::Guests { action: Some(GuestsAction::Approve { upload }) } => Request::AnswerUpload { upload, accepted: true },
+        Command::Guests { action: Some(GuestsAction::Deny { upload }) } => Request::AnswerUpload { upload, accepted: false },
+        Command::Pair { address } => return pair::run(&session, address).await,
+        Command::Trust { action: None } => Request::Trust,
+        Command::Trust { action: Some(TrustAction::Revoke { node }) } => Request::RevokeNode { node },
+        Command::Receive { name, output, yes } => {
+            let into = std::path::absolute(output.unwrap_or_else(|| PathBuf::from(".")))?;
+            return receive::run(&session, name, into, yes).await;
+        }
+        Command::Doctor | Command::Passphrase { .. } | Command::Autostart { .. } => {
+            unreachable!("these do not need a running node and are handled before this")
+        }
         Command::Settings { downloads_dir, storage_limit_gb, auto_accept, ask_above_mb, no_size_limit } => {
             let asks_for_change =
                 downloads_dir.is_some() || storage_limit_gb.is_some() || auto_accept.is_some() || ask_above_mb.is_some() || no_size_limit;
@@ -203,7 +301,7 @@ fn existing(paths: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
     paths.iter().map(|path| path.canonicalize().with_context(|| format!("could not find {}", path.display()))).collect()
 }
 
-fn report(reply: &Reply, is_json: bool) -> i32 {
+pub fn report(reply: &Reply, is_json: bool) -> i32 {
     if is_json {
         println!("{}", serde_json::to_string(reply).expect("a reply is plain data"));
     } else {
@@ -225,7 +323,61 @@ fn print_reply(reply: &Reply) {
         Reply::Invite(invite) => print_invite(invite),
         Reply::Status(status) => println!("{} ({}) is running", status.node_name, status.node_id),
         Reply::Preferences(view) => print_preferences(view),
+        Reply::Messages { messages } => print_messages(messages),
+        Reply::Guests { guests, uploads } => print_guests(guests, uploads),
+        Reply::Passphrase { passphrase } => passphrase::print(passphrase.as_deref()),
+        Reply::Received { path, .. } => println!("Saved {}", path.display()),
+        Reply::Acknowledged { message } => println!("{message}"),
+        Reply::Pairing(view) => println!("This device's address for pairing: {}", view.address.as_deref().unwrap_or("none")),
+        Reply::Trust { nodes } => print_trust(nodes),
     }
+}
+
+fn print_trust(nodes: &[TrustedNodeView]) {
+    if nodes.is_empty() {
+        return println!("This node trusts no other node yet. Nodes are trusted when they join with the passphrase or pair.");
+    }
+    let how = |node: &TrustedNodeView| match node.node.trusted_via {
+        TrustedVia::Passphrase => "passphrase",
+        TrustedVia::Pairing => "paired",
+    };
+    let standing = |node: &TrustedNodeView| match (&node.revoked_by, node.connected) {
+        (Some(by), _) => format!("revoked by {by}"),
+        (None, true) => "connected".to_string(),
+        (None, false) => "not connected".to_string(),
+    };
+    let row = |node: &TrustedNodeView| vec![node.node.name.clone(), how(node).to_string(), standing(node), node.node.node_id.clone()];
+    output::print_table(&["NODE", "TRUSTED BY", "NOW", "ID"], &nodes.iter().map(row).collect::<Vec<_>>());
+}
+
+fn print_messages(messages: &[TextMessage]) {
+    if messages.is_empty() {
+        return println!("No messages yet. Post one with: ladex chat \"hello\"");
+    }
+    for message in messages {
+        let time = message.timestamp.with_timezone(&chrono::Local).format("%H:%M");
+        let sender = message.sender_name.as_deref().unwrap_or("someone");
+        println!("{time}  {sender}: {}", message.content);
+    }
+}
+
+fn print_guests(guests: &[GuestSummary], uploads: &[WaitingUpload]) {
+    if guests.is_empty() {
+        println!("No guests are signed in. Invite one with: ladex invite");
+    } else {
+        let row =
+            |guest: &GuestSummary| vec![guest.label.clone(), guest.ip.clone(), describe(guest.permission).to_string(), guest.id.clone()];
+        output::print_table(&["GUEST", "ADDRESS", "MAY", "ID"], &guests.iter().map(row).collect::<Vec<_>>());
+    }
+    if uploads.is_empty() {
+        return;
+    }
+    println!("\nWaiting for approval (ladex guests approve <id>, or deny <id>):");
+    let row = |upload: &WaitingUpload| {
+        let guest = upload.guest.clone().unwrap_or_else(|| "a guest who left".to_string());
+        vec![upload.name.clone(), format_bytes(upload.size), guest, upload.id.clone()]
+    };
+    output::print_table(&["NAME", "SIZE", "FROM", "ID"], &uploads.iter().map(row).collect::<Vec<_>>());
 }
 
 fn print_preferences(view: &preferences::View) {

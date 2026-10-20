@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use hyper::Method;
-use ladex_core::node::{LocalLink, LocalResponse, Node, NodeConfig, NodeHandle, SocketReader, SocketWriter, UiAssets, WebUi};
+use ladex_core::node::{LocalLink, LocalResponse, Node, NodeConfig, NodeHandle, SocketReader, SocketWriter, UiAssets};
 use serde_json::{json, Value};
 
 const SESSION: &str = "peer_app_window";
@@ -19,7 +19,7 @@ impl UiAssets for StubUi {
 }
 
 async fn started(data_dir: &std::path::Path, passphrase: Option<&str>) -> NodeHandle {
-    let mut config = NodeConfig::new(data_dir.to_path_buf(), WebUi { assets: Arc::new(StubUi), is_legacy: false });
+    let mut config = NodeConfig::new(data_dir.to_path_buf(), Arc::new(StubUi));
     config.http_port = 0;
     config.discovery_port = None;
     config.use_tls = false;

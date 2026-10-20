@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use ladex_core::control::server::{self, Endpoint};
 use ladex_core::control::{Reply, Request};
-use ladex_core::node::{Bridge, Node, NodeConfig, NodeHandle, SocketEvent, UiAssets, WebUi};
+use ladex_core::node::{Bridge, Node, NodeConfig, NodeHandle, SocketEvent, UiAssets};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 use tokio::sync::mpsc;
@@ -50,7 +50,7 @@ fn content() -> Vec<u8> {
 
 async fn start_peer(driver: Driver, join: Option<SocketAddr>) -> Peer {
     let dir = tempfile::tempdir().unwrap();
-    let mut config = NodeConfig::new(dir.path().to_path_buf(), WebUi { assets: Arc::new(StubUi), is_legacy: false });
+    let mut config = NodeConfig::new(dir.path().to_path_buf(), Arc::new(StubUi));
     config.passphrase = Some(PASSPHRASE.to_string());
     config.http_port = 0;
     config.discovery_port = None;

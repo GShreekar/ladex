@@ -14,7 +14,7 @@ cd ladex
 cargo build
 ```
 
-The workspace has three crates: `crates/ladex-core` (everything the node does, started through `ladex_core::node::Node::start`), `crates/ladex-cli` (the `ladex` binary: flags, output and the embedded web UI around that call) and `crates/ladex-app` (the Tauri desktop app: a window whose UI reaches the node in the same process through `ladex_core::node::Bridge`). The app needs the platform webview, so it is left out of plain `cargo build` and `cargo test`; see `crates/ladex-app/README.md`. The web UI is in `ui/` (Svelte + TypeScript; `cargo build` builds it through `crates/ladex-cli/build.rs`, so you need Node.js 20 or newer, or set `LADEX_SKIP_UI_BUILD=1` to build without it). The previous UI in `static/` is served only with `--legacy-ui` and is deleted in the next release.
+The workspace has three crates: `crates/ladex-core` (everything the node does, started through `ladex_core::node::Node::start`), `crates/ladex-cli` (the `ladex` binary: flags, output and the embedded web UI around that call) and `crates/ladex-app` (the Tauri desktop app: a window whose UI reaches the node in the same process through `ladex_core::node::Bridge`). The app needs the platform webview, so it is left out of plain `cargo build` and `cargo test`; see `crates/ladex-app/README.md`. The web UI is in `ui/` (Svelte + TypeScript; `cargo build` builds it through `crates/ladex-cli/build.rs`, so you need Node.js 20 or newer, or set `LADEX_SKIP_UI_BUILD=1` to build without it).
 
 ## Before you open a pull request
 
@@ -24,8 +24,8 @@ CI runs all of these, so running them first saves a round trip:
 cargo fmt --all -- --check
 cargo clippy --workspace --exclude ladex-app --all-targets -- -D warnings
 cargo test --workspace --exclude ladex-app
-for t in tests/js/*.test.js; do node "$t"; done
-cargo build && for t in data folder client restart push cli; do node tests/e2e/$t.test.js; done
+(cd ui && npm ci && npm run check && npm test)
+cargo build && for t in data folder restart push cli parity; do node tests/e2e/$t.test.js; done
 ```
 
 `tests/e2e/swarm.test.js` (a source killed mid-transfer, `kill -9` on a receiver, ten receivers) moves a few hundred MiB and takes a couple of minutes, so it is not in that list; run it with `cargo build --release` and `LADEX_BIN=target/release/ladex`. The check that ten nodes get a file within about twice the time one does is `crates/ladex-core/tests/swarm.rs`, where `LinkedMesh::limit_bandwidth` gives each node a network card of fixed speed.

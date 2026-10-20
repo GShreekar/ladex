@@ -26,25 +26,16 @@ const MAX_CATALOG_STREAMS: usize = 64;
 const CATALOG_DEBOUNCE: Duration = Duration::from_millis(250);
 const KEEP_ALIVE: Duration = Duration::from_secs(15);
 
-const LEGACY_JOIN_PAGE: &str = include_str!("join.html");
-const LEGACY_JOIN_SCRIPT: &str = include_str!("join.js");
-
 /// The page served at /join. `{{fingerprint}}` in it is replaced by the node's certificate fingerprint.
 #[derive(Clone)]
 pub struct JoinPage {
     html: Arc<str>,
-    script: Option<Arc<str>>,
 }
 
 impl JoinPage {
     /// A page whose script and styles are files the node serves elsewhere.
     pub fn new(html: String) -> Self {
-        Self { html: html.into(), script: None }
-    }
-
-    /// The small self-contained page that shipped before the web UI, kept for `--legacy-ui`.
-    pub fn legacy() -> Self {
-        Self { html: LEGACY_JOIN_PAGE.into(), script: Some(LEGACY_JOIN_SCRIPT.into()) }
+        Self { html: html.into() }
     }
 }
 
@@ -67,19 +58,14 @@ pub struct GuestApi {
 }
 
 impl GuestApi {
-    pub fn new(state: NodeState, files: FilesApi) -> Self {
-        Self { state, files, join_page: JoinPage::legacy(), catalog_streams: Arc::new(Semaphore::new(MAX_CATALOG_STREAMS)) }
-    }
-
-    pub fn with_join_page(mut self, join_page: JoinPage) -> Self {
-        self.join_page = join_page;
-        self
+    pub fn new(state: NodeState, files: FilesApi, join_page: JoinPage) -> Self {
+        Self { state, files, join_page, catalog_streams: Arc::new(Semaphore::new(MAX_CATALOG_STREAMS)) }
     }
 }
 
 impl Api for GuestApi {
     fn claims(&self, path: &str) -> bool {
-        matches!(path, "/join" | "/join.js" | "/uploads" | "/api/catalog" | "/api/devices" | "/api/me")
+        matches!(path, "/join" | "/uploads" | "/api/catalog" | "/api/devices" | "/api/me")
             || path.starts_with("/blobs/")
             || path.starts_with("/uploads/")
             || path.starts_with("/api/guests/")
@@ -154,7 +140,6 @@ impl GuestApi {
         let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
         match (parts.method.clone(), segments.as_slice()) {
             (Method::GET | Method::HEAD, ["join"]) => Ok(self.join_page()),
-            (Method::GET, ["join.js"]) => self.join_script(),
             (Method::POST, ["join"]) => self.join(parts, body, peer).await,
             (Method::GET, ["api", "me"]) => self.me(parts),
             (Method::DELETE, ["api", "me"]) => self.leave(parts, peer),
@@ -185,13 +170,6 @@ impl GuestApi {
             false => tls::format_fingerprint(&self.state.tls_fingerprint),
         };
         page(self.join_page.html.replace("{{fingerprint}}", &fingerprint), "text/html; charset=utf-8")
-    }
-
-    fn join_script(&self) -> Outcome {
-        match &self.join_page.script {
-            Some(script) => Ok(page(script.to_string(), "text/javascript; charset=utf-8")),
-            None => Err(refuse(StatusCode::NOT_FOUND, "not found")),
-        }
     }
 
     async fn join(&self, parts: &Parts, body: &mut Option<Incoming>, peer: PeerAddr) -> Outcome {

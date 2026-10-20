@@ -119,10 +119,17 @@ async fn serve_command(state: NodeState, settings: Settings, mut stream: TcpStre
     // The work runs in a task of its own: an offer to a device stands even after the command that made it has gone.
     let (events, mut outbox) = mpsc::channel(EVENT_QUEUE);
     tokio::spawn(async move { super::answer(&state, &settings, request, Events::new(events)).await });
-    while let Some(event) = outbox.recv().await {
-        write_event(&mut writing, &event).await?;
+    // A command sends nothing after its request, so the socket turning readable means it has gone.
+    let mut gone = [0u8; 1];
+    loop {
+        tokio::select! {
+            event = outbox.recv() => match event {
+                Some(event) => write_event(&mut writing, &event).await?,
+                None => return Ok(()),
+            },
+            _ = reading.read(&mut gone) => return Ok(()),
+        }
     }
-    Ok(())
 }
 
 /// Sends one request to a running node, passing on each progress event; returns its reply.

@@ -40,6 +40,8 @@ function join(base, token, session) {
             send: (m) => ws.send(JSON.stringify(m)),
             files: () => [...received].reverse().find((m) => m.type === 'file_list_update')?.files ?? [],
             wait: async (pred, ms = 5000) => { const end = Date.now() + ms; while (Date.now() < end) { const h = received.find(pred); if (h) return h; await sleep(25); } return null; },
+            // Waits for the latest file list, rather than any earlier one, to satisfy `pred`.
+            waitForFiles: async (pred, ms = 5000) => { const end = Date.now() + ms; while (Date.now() < end) { if (pred(c.files())) return true; await sleep(25); } return false; },
         };
         ws.onopen = () => { c.send({ type: 'join', session_id: session }); resolve(c); };
         ws.onerror = () => reject(new Error('ws error'));
@@ -140,7 +142,9 @@ const check = (name, ok, detail = '') => { console.log(`${ok ? 'PASS' : 'FAIL'} 
     check('node 2 hears of the new file once it reconnects', !!(await c2.wait((m) => m.type === 'file_list_update' && m.files.some((f) => f.id === 'file_b'), 20000)));
     await sleep(800);
     await stopNode(1);
-    await sleep(1500);
+    // A killed node says no goodbye, so node 2 only notices at the QUIC idle timeout (10 s, plus a keep-alive).
+    const isUnavailable = (files) => files.some((f) => f.id === 'file_b' && !f.available);
+    check('node 2 shows the file as unavailable once its only holder is gone', await c2.waitForFiles(isUnavailable, 20000));
     d = await download(n2.base, t2, 'file_b');
     check('a file whose only holder is offline is reported as unavailable (503)', d.status === 503, `${d.status}`);
 

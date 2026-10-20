@@ -24,7 +24,7 @@ pub mod web;
 pub use bridge::{Bridge, Reply, SocketEvent};
 pub use local::{LinkError, LocalLink, LocalResponse, LocalUpload, SavedFile, SocketReader, SocketWriter};
 pub use lock::DataDirLock;
-pub use web::{UiAssets, WebUi};
+pub use web::UiAssets;
 
 pub const DEFAULT_HTTP_PORT: u16 = 8080;
 pub const DEFAULT_DISCOVERY_PORT: u16 = 7878;
@@ -42,7 +42,8 @@ const ISOLATION_DIAGNOSTIC_DELAY: Duration = Duration::from_secs(10);
 /// How a node is set up; `NodeConfig::new` gives the defaults the `ladex` command uses.
 pub struct NodeConfig {
     pub data_dir: PathBuf,
-    pub web_ui: WebUi,
+    /// The built web UI the node serves to browsers.
+    pub ui_assets: Arc<dyn UiAssets>,
     /// Required for browser logins and proven (never sent) in the mesh handshake; None = open node.
     pub passphrase: Option<String>,
     /// The TCP port of the node's web page and guest API; 0 picks a free one.
@@ -62,10 +63,10 @@ pub struct NodeConfig {
 }
 
 impl NodeConfig {
-    pub fn new(data_dir: PathBuf, web_ui: WebUi) -> Self {
+    pub fn new(data_dir: PathBuf, ui_assets: Arc<dyn UiAssets>) -> Self {
         Self {
             data_dir,
-            web_ui,
+            ui_assets,
             passphrase: None,
             http_port: DEFAULT_HTTP_PORT,
             quic_port: None,
@@ -288,7 +289,7 @@ impl Node {
 
         let mut background_tasks = vec![tokio::spawn(mesh::quic::accept_loop(state.clone(), mesh_endpoint.clone()))];
         background_tasks.extend(start_control_socket(&state, &config, &mut notices).await);
-        background_tasks.extend(dial_manual_peers(&state, &config.manual_peers));
+        background_tasks.extend(keep_manual_peers_connected(&state, &config.manual_peers));
         if let Some(saved) = &saved {
             persist::redial(&state, saved.peers.clone());
         }
@@ -305,7 +306,7 @@ impl Node {
         let (stop_web, stop_signal) = watch::channel(false);
         let listeners = Listeners { public: public_listener, local: local_listener };
         let WebServers { public: web_server, local: local_web_server, open_pipe } =
-            serve_web(&state, &config.web_ui, listeners, tls_config, stop_signal);
+            serve_web(&state, &config.ui_assets, listeners, tls_config, stop_signal);
 
         let info = NodeInfo {
             node_id,
@@ -437,6 +438,7 @@ fn new_state(config: &NodeConfig, parts: StateParts) -> NodeState {
         pairings: Arc::new(pairing::Pairings::new()),
         mesh_peers: Arc::new(RwLock::new(HashMap::new())),
         dial_targets: Default::default(),
+        kept_peers: Default::default(),
         mesh_endpoint: Some(parts.mesh_endpoint),
         quic_port: parts.quic_port,
         passphrase: config.passphrase.clone(),
@@ -502,16 +504,14 @@ async fn start_control_socket(state: &NodeState, config: &NodeConfig, notices: &
     }
 }
 
-fn dial_manual_peers(state: &NodeState, peers: &[SocketAddr]) -> Vec<JoinHandle<()>> {
+fn keep_manual_peers_connected(state: &NodeState, peers: &[SocketAddr]) -> Vec<JoinHandle<()>> {
     peers
         .iter()
         .map(|&addr| {
             let state = state.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(MANUAL_PEER_DELAY).await;
-                if let Err(e) = mesh::quic::join(&state, addr).await {
-                    tracing::warn!("Manual peer connect to {addr} failed: {e}");
-                }
+                mesh::dialer::keep_connected(&state, addr).await;
             })
         })
         .collect()
@@ -595,15 +595,14 @@ struct WebServers {
 /// Serves the node's own page and the guest and file APIs on the public listener, and on the loopback one if it is open.
 fn serve_web(
     state: &NodeState,
-    web_ui: &WebUi,
+    ui_assets: &Arc<dyn UiAssets>,
     listeners: Listeners,
     tls_config: Option<Arc<rustls::ServerConfig>>,
     stop: watch::Receiver<bool>,
 ) -> WebServers {
-    let service = web::service(state.clone(), web_ui);
+    let service = web::service(state.clone(), ui_assets);
     let files = files_api::FilesApi::new(state.clone());
-    let guest_api = guest::api::GuestApi::new(state.clone(), files.clone());
-    let guest_api = if web_ui.is_legacy { guest_api } else { guest_api.with_join_page(join_page(web_ui)) };
+    let guest_api = guest::api::GuestApi::new(state.clone(), files.clone(), join_page(ui_assets.as_ref()));
     let api = server::Chain(files, guest_api);
 
     let local = listeners.local.map(|listener| {
@@ -643,8 +642,8 @@ async fn wait_for_stop(mut stop: watch::Receiver<bool>) {
     let _ = stop.wait_for(|is_stopped| *is_stopped).await;
 }
 
-fn join_page(web_ui: &WebUi) -> guest::api::JoinPage {
-    let page = web_ui.assets.file("join.html").and_then(|bytes| std::str::from_utf8(bytes).ok()).unwrap_or_default();
+fn join_page(ui_assets: &dyn UiAssets) -> guest::api::JoinPage {
+    let page = ui_assets.file("join.html").and_then(|bytes| std::str::from_utf8(bytes).ok()).unwrap_or_default();
     guest::api::JoinPage::new(page.to_string())
 }
 

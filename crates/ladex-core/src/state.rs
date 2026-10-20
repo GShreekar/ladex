@@ -321,6 +321,23 @@ pub async fn apply_chat_sync(state: &NodeState, incoming: Vec<TextMessage>) {
     }
 }
 
+/// Posts a chat message from a device here to everyone in the mesh; None if it has no text left once cleaned.
+pub async fn post_message(state: &NodeState, sender_id: SessionId, sender_name: Option<String>, content: &str) -> Option<TextMessage> {
+    let content = validate::clean_message(content)?;
+    let now = chrono::Utc::now();
+    let created_at = now.timestamp_millis() as u64;
+    let message = TextMessage { id: format!("msg_{sender_id}_{created_at}"), content, sender_id, sender_name, timestamp: now, created_at };
+    {
+        let mut messages = state.messages.write().await;
+        messages.push(message.clone());
+        messages.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+        prune_messages(&mut messages);
+    }
+    websocket::broadcast(state, ServerMessage::TextMessage { message: message.clone() }).await;
+    push_message_to_mesh(&state.mesh_peers, message.clone()).await;
+    Some(message)
+}
+
 /// Apply a single incoming chat message and fan it out to local tabs.
 pub async fn apply_chat_message(state: &NodeState, message: TextMessage) {
     let Some(message) = validate::incoming_message(message) else { return };
