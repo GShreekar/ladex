@@ -186,8 +186,15 @@ jobs:
           path: ./artifacts
           merge-multiple: true
 
+      # Installers arrive in per-format folders (dmg/, nsis/, deb/, appimage/), the CLI archives at the top.
+      - name: Collect the files to publish
+        run: |
+          mkdir release
+          find artifacts -type f -exec mv -t release {} +
+          ls -l release
+
       - name: Write checksums
-        working-directory: artifacts
+        working-directory: release
         run: |
           sha256sum * > SHA256SUMS.txt
           cat SHA256SUMS.txt
@@ -195,7 +202,7 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: ./artifacts/*
+          files: ./release/*
           body_path: .github/release-notes.md
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}
