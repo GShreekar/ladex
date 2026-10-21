@@ -153,7 +153,9 @@ pub fn run() {
             setup::ladex_setup_finish,
         ])
         .setup(|app| {
-            app.manage(AppPaths::resolve(app.handle())?);
+            let paths = AppPaths::resolve(app.handle())?;
+            tracing::info!("LADEX {} starting, data folder {}", env!("CARGO_PKG_VERSION"), paths.data_dir.display());
+            app.manage(paths);
             #[cfg(desktop)]
             set_up_desktop(app.handle());
             Ok(start(app.handle())?)
