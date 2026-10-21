@@ -184,7 +184,8 @@ jobs:
         with:
           api-level: 34
           arch: x86_64
-          target: google_apis
+          # The plain image: Google services update packages in the background, which can restart the WebView mid-test.
+          target: default
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: true
           script: |
