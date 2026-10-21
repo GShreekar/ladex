@@ -117,6 +117,7 @@ def main() -> int:
         # What was on screen when a step was not found is what tells why.
         screenshot(out, "stuck")
         (out / "stuck-screen.xml").write_text(adb("shell", "cat", "/sdcard/screen.xml"))
+        (out / "logcat-when-stuck.log").write_text(adb("logcat", "-d"))
         raise
     has_joined = wait_for_the_join(ladex, host_data_dir)
     screenshot(out, "6-after-join")
