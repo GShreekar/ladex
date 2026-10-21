@@ -203,8 +203,10 @@
 </main>
 
 <style>
+  /* The column is capped at the screen, so a long path truncates instead of pushing the card off a phone screen. */
   main {
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
     place-items: center;
     min-height: var(--viewport-height);
     padding: 24px 16px calc(24px + var(--safe-bottom));
@@ -246,6 +248,7 @@
 
   .row {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 8px;
   }
@@ -350,5 +353,16 @@
     justify-content: flex-end;
     gap: 8px;
     margin-top: 8px;
+  }
+
+  /* Narrow phones: less padding, and the two mesh choices stacked. */
+  @media (max-width: 400px) {
+    .wizard {
+      padding: 20px;
+    }
+
+    .choices {
+      grid-template-columns: 1fr;
+    }
   }
 </style>
