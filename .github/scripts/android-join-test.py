@@ -43,21 +43,21 @@ def bounds_of(node: ElementTree.Element) -> tuple[int, int, int, int]:
     return left, top, right, bottom
 
 
-def is_reachable(node: ElementTree.Element, screen_height: int) -> bool:
+def is_reachable(node: ElementTree.Element, screen_height: int, is_in_bottom_bar: bool) -> bool:
     if node.get("bounds") == OFF_SCREEN:
         return False
     _, top, _, bottom = bounds_of(node)
-    return (top + bottom) // 2 < screen_height * REACHABLE_SHARE_OF_SCREEN
+    return is_in_bottom_bar or (top + bottom) // 2 < screen_height * REACHABLE_SHARE_OF_SCREEN
 
 
 # Below the fold, or under the bottom navigation, an element cannot be tapped; a person would scroll down to it.
-def find(text: str | None = None, element_id: str | None = None) -> ElementTree.Element:
+def find(text: str | None = None, element_id: str | None = None, is_in_bottom_bar: bool = False) -> ElementTree.Element:
     deadline = time.monotonic() + SCREEN_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
         nodes = screen_nodes()
         screen_height = max(bounds_of(node)[3] for node in nodes)
         found = [node for node in nodes if matches(node, text, element_id)]
-        reachable = [node for node in found if is_reachable(node, screen_height)]
+        reachable = [node for node in found if is_reachable(node, screen_height, is_in_bottom_bar)]
         if reachable:
             return reachable[0]
         if found:
@@ -66,8 +66,8 @@ def find(text: str | None = None, element_id: str | None = None) -> ElementTree.
     raise TimeoutError(f"nothing on screen matched text={text!r} id={element_id!r}")
 
 
-def tap(text: str | None = None, element_id: str | None = None) -> None:
-    left, top, right, bottom = bounds_of(find(text, element_id))
+def tap(text: str | None = None, element_id: str | None = None, is_in_bottom_bar: bool = False) -> None:
+    left, top, right, bottom = bounds_of(find(text, element_id, is_in_bottom_bar))
     adb("shell", "input", "tap", str((left + right) // 2), str((top + bottom) // 2))
 
 
@@ -110,7 +110,7 @@ def finish_the_wizard(out: Path, passphrase: str) -> None:
 
 def add_host_by_address(out: Path, host_port: str) -> None:
     # The window reloads onto the running app once the wizard has started the node.
-    tap(text="Network")
+    tap(text="Network", is_in_bottom_bar=True)
     type_into("peer-address", f"{HOST_FROM_EMULATOR}:{host_port}")
     press_enter()
     time.sleep(POLL_SECONDS)
