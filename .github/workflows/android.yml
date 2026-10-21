@@ -108,10 +108,15 @@ jobs:
       - name: Check every APK is signed with the release key
         id: verify
         run: |
+          set -o pipefail
           apksigner="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)/apksigner"
-          fingerprints=$(for apk in apk/*.apk; do
-            "$apksigner" verify --print-certs "$apk" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p'
-          done | sort -u)
+          for apk in apk/*.apk; do
+            echo "== $apk"
+            # Fails, and so stops the job, for an APK that is unsigned or does not verify.
+            "$apksigner" verify --verbose --print-certs "$apk" | tee -a "$RUNNER_TEMP/apksigner.txt"
+          done
+          # Newer apksigner names the signer by SDK range ("Signer (minSdkVersion=24, ...)"), older ones "Signer #1".
+          fingerprints=$(sed -n 's/^Signer.* certificate SHA-256 digest: //p' "$RUNNER_TEMP/apksigner.txt" | sort -u)
           if [[ $(echo "$fingerprints" | grep -c .) -ne 1 ]]; then
             echo "::error::The APKs are not all signed with one key: '$fingerprints'"
             exit 1
