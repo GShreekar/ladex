@@ -130,13 +130,24 @@ jobs:
           path: apk/*.apk
           if-no-files-found: error
 
+      # The emulator test joins the phone to a node run by this same commit's CLI.
+      - name: Build the CLI the emulator test runs as the other node
+        run: cargo build -p ladex
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ladex-cli-for-tests
+          path: target/debug/ladex
+          retention-days: 1
+
       - name: Forget the release key
         if: always()
         run: rm -f "$RUNNER_TEMP/ladex-release.jks" crates/ladex-app/gen/android/keystore.properties
 
-  # The x86_64 APK runs on the emulator, so a build that crashes on start never reaches a phone or a release.
+  # The x86_64 APK runs on the emulator: it must start, finish the wizard and join a node by address (the 8b gate,
+  # short of a real phone), so a broken build never reaches a phone or a release.
   smoke-test:
-    name: Starts on an emulator
+    name: Starts and joins on an emulator
     needs: apk
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -147,6 +158,20 @@ jobs:
         with:
           name: ladex-android-apk
           path: apk
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ladex-cli-for-tests
+          path: cli
+
+      # Discovery is off: the phone must reach it by the address it is given, as on a network that blocks multicast.
+      - name: Start the node the phone joins
+        run: |
+          chmod +x cli/ladex
+          echo "HOST_DATA_DIR=$RUNNER_TEMP/host-node" >> "$GITHUB_ENV"
+          nohup cli/ladex --data-dir "$RUNNER_TEMP/host-node" --port 18080 --no-tls --no-discovery ci-join-test-passphrase > host-node.log 2>&1 &
+          sleep 3
+          cli/ladex --data-dir "$RUNNER_TEMP/host-node" devices
 
       - name: Let the emulator use KVM
         run: |
@@ -162,7 +187,13 @@ jobs:
           target: google_apis
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: true
-          script: .github/scripts/android-smoke-test.sh apk/ladex-v*-android-x86_64.apk smoke
+          script: |
+            .github/scripts/android-smoke-test.sh apk/ladex-v*-android-x86_64.apk smoke
+            python3 .github/scripts/android-join-test.py cli/ladex "$HOST_DATA_DIR" 18080 ci-join-test-passphrase smoke
+
+      - name: Keep the other node's log
+        if: always()
+        run: cp host-node.log smoke/ 2>/dev/null || true
 
       - uses: actions/upload-artifact@v4
         if: always()
