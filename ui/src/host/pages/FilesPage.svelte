@@ -80,11 +80,11 @@
   <div class="banner" role="status">
     <Icon name="info" size={22} />
     <div>
-      <strong>This is the only computer running LADEX on this network so far.</strong>
+      <strong>This is the only device running LADEX on this network so far.</strong>
       <p class="small">
-        Phones and other browsers can still join as guests with a QR code. If LADEX is running on another computer too,
+        Other devices can still join as guests in a browser with a QR code. If LADEX is running on another device too,
         check that both are on the same Wi-Fi, that client isolation is off on the router (common on guest networks and
-        phone hotspots), and that a firewall isn't blocking LADEX.
+        phone hotspots), and that a firewall isn't blocking LADEX. You can also add it by its address on the Network page.
       </p>
       {#if room.capabilities.canManageGuests}
         <div class="banner-actions">
