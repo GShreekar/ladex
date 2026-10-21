@@ -115,8 +115,8 @@ jobs:
             # Fails, and so stops the job, for an APK that is unsigned or does not verify.
             "$apksigner" verify --verbose --print-certs "$apk" | tee -a "$RUNNER_TEMP/apksigner.txt"
           done
-          # Newer apksigner names the signer by SDK range ("Signer (minSdkVersion=24, ...)"), older ones "Signer #1".
-          fingerprints=$(sed -n 's/^Signer.* certificate SHA-256 digest: //p' "$RUNNER_TEMP/apksigner.txt" | sort -u)
+          # The signer is named per scheme ("V2 Signer:") or by number ("Signer #1"), depending on the apksigner version.
+          fingerprints=$(sed -n 's/^.*Signer.* certificate SHA-256 digest: //p' "$RUNNER_TEMP/apksigner.txt" | sort -u)
           if [[ $(echo "$fingerprints" | grep -c .) -ne 1 ]]; then
             echo "::error::The APKs are not all signed with one key: '$fingerprints'"
             exit 1
