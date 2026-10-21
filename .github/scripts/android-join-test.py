@@ -26,10 +26,11 @@ def screen_nodes() -> list[ElementTree.Element]:
     return list(ElementTree.fromstring(adb("shell", "cat", "/sdcard/screen.xml")).iter("node"))
 
 
+# A button's accessible name can carry its subtitle too ("Join an existing mesh Another device is..."), so text matches a start.
 def matches(node: ElementTree.Element, text: str | None, element_id: str | None) -> bool:
     if element_id is not None:
         return node.get("resource-id", "").endswith(element_id)
-    return text in (node.get("text"), node.get("content-desc"))
+    return any((label or "").startswith(text) for label in (node.get("text"), node.get("content-desc")))
 
 
 def find(text: str | None = None, element_id: str | None = None) -> ElementTree.Element:
@@ -109,8 +110,14 @@ def main() -> int:
     ladex, host_data_dir, host_port, passphrase, out_folder = sys.argv[1:]
     out = Path(out_folder)
     out.mkdir(parents=True, exist_ok=True)
-    finish_the_wizard(out, passphrase)
-    add_host_by_address(out, host_port)
+    try:
+        finish_the_wizard(out, passphrase)
+        add_host_by_address(out, host_port)
+    except TimeoutError:
+        # What was on screen when a step was not found is what tells why.
+        screenshot(out, "stuck")
+        (out / "stuck-screen.xml").write_text(adb("shell", "cat", "/sdcard/screen.xml"))
+        raise
     has_joined = wait_for_the_join(ladex, host_data_dir)
     screenshot(out, "6-after-join")
     if not has_joined:
