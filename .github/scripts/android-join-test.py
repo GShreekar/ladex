@@ -16,6 +16,8 @@ JOIN_TIMEOUT_SECONDS = 90
 POLL_SECONDS = 2
 KEY_ENTER = "66"
 OFF_SCREEN = "[0,0][0,0]"
+# The app's bottom navigation covers the lowest part of the screen, so something there cannot be tapped yet.
+REACHABLE_SHARE_OF_SCREEN = 0.85
 # From the lower middle of a 320x640 screen up to the upper middle, over 300 ms.
 SCROLL_DOWN_SWIPE = ("160", "450", "160", "200", "300")
 
@@ -36,14 +38,28 @@ def matches(node: ElementTree.Element, text: str | None, element_id: str | None)
     return any((label or "").startswith(text) for label in (node.get("text"), node.get("content-desc")))
 
 
-# Below the fold, an element is listed with empty bounds; a person would scroll down to it.
+def bounds_of(node: ElementTree.Element) -> tuple[int, int, int, int]:
+    left, top, right, bottom = map(int, re.findall(r"\d+", node.get("bounds", "")))
+    return left, top, right, bottom
+
+
+def is_reachable(node: ElementTree.Element, screen_height: int) -> bool:
+    if node.get("bounds") == OFF_SCREEN:
+        return False
+    _, top, _, bottom = bounds_of(node)
+    return (top + bottom) // 2 < screen_height * REACHABLE_SHARE_OF_SCREEN
+
+
+# Below the fold, or under the bottom navigation, an element cannot be tapped; a person would scroll down to it.
 def find(text: str | None = None, element_id: str | None = None) -> ElementTree.Element:
     deadline = time.monotonic() + SCREEN_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
-        found = [node for node in screen_nodes() if matches(node, text, element_id)]
-        on_screen = [node for node in found if node.get("bounds") != OFF_SCREEN]
-        if on_screen:
-            return on_screen[0]
+        nodes = screen_nodes()
+        screen_height = max(bounds_of(node)[3] for node in nodes)
+        found = [node for node in nodes if matches(node, text, element_id)]
+        reachable = [node for node in found if is_reachable(node, screen_height)]
+        if reachable:
+            return reachable[0]
         if found:
             adb("shell", "input", "swipe", *SCROLL_DOWN_SWIPE)
         time.sleep(POLL_SECONDS)
@@ -51,7 +67,7 @@ def find(text: str | None = None, element_id: str | None = None) -> ElementTree.
 
 
 def tap(text: str | None = None, element_id: str | None = None) -> None:
-    left, top, right, bottom = map(int, re.findall(r"\d+", find(text, element_id).get("bounds", "")))
+    left, top, right, bottom = bounds_of(find(text, element_id))
     adb("shell", "input", "tap", str((left + right) // 2), str((top + bottom) // 2))
 
 
@@ -128,6 +144,7 @@ def main() -> int:
         raise
     has_joined = wait_for_the_join(ladex, host_data_dir)
     screenshot(out, "6-after-join")
+    (out / "logcat-after-join.log").write_text(adb("logcat", "-d", "-s", "LADEX"))
     if not has_joined:
         print("::error::The phone finished the wizard but never joined the node it was given by address")
         return 1
