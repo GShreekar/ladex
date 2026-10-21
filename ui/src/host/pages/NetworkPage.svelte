@@ -86,6 +86,8 @@
     </div>
   </section>
 
+  <AddressSection />
+
   {#if hasChecked}
     <section class="card">
       <ul>
@@ -102,7 +104,6 @@
     </section>
   {/if}
 
-  <AddressSection />
   <PairingSection onpaired={loadTrusted} />
   <TrustSection nodes={trusted} onchange={loadTrusted} />
 </div>
@@ -121,6 +122,7 @@
 
   .summary {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 14px;
     padding: 18px 20px;
@@ -128,6 +130,7 @@
 
   .summary > div:first-of-type {
     flex: 1;
+    min-width: 180px;
   }
 
   .summary.ok {

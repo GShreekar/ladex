@@ -15,6 +15,9 @@ SCREEN_TIMEOUT_SECONDS = 60
 JOIN_TIMEOUT_SECONDS = 90
 POLL_SECONDS = 2
 KEY_ENTER = "66"
+OFF_SCREEN = "[0,0][0,0]"
+# From the lower middle of a 320x640 screen up to the upper middle, over 300 ms.
+SCROLL_DOWN_SWIPE = ("160", "450", "160", "200", "300")
 
 
 def adb(*arguments: str) -> str:
@@ -33,12 +36,16 @@ def matches(node: ElementTree.Element, text: str | None, element_id: str | None)
     return any((label or "").startswith(text) for label in (node.get("text"), node.get("content-desc")))
 
 
+# Below the fold, an element is listed with empty bounds; a person would scroll down to it.
 def find(text: str | None = None, element_id: str | None = None) -> ElementTree.Element:
     deadline = time.monotonic() + SCREEN_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
-        for node in screen_nodes():
-            if matches(node, text, element_id) and node.get("bounds") != "[0,0][0,0]":
-                return node
+        found = [node for node in screen_nodes() if matches(node, text, element_id)]
+        on_screen = [node for node in found if node.get("bounds") != OFF_SCREEN]
+        if on_screen:
+            return on_screen[0]
+        if found:
+            adb("shell", "input", "swipe", *SCROLL_DOWN_SWIPE)
         time.sleep(POLL_SECONDS)
     raise TimeoutError(f"nothing on screen matched text={text!r} id={element_id!r}")
 
