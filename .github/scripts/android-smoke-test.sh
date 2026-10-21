@@ -23,6 +23,7 @@ sleep "$settle_seconds"
 
 adb logcat -d -s LADEX > "$out/ladex.log"
 adb logcat -d '*:E' > "$out/errors.log"
+adb logcat -d > "$out/logcat-at-start.log"
 adb exec-out screencap -p > "$out/first-screen.png"
 
 if ! grep -q "LADEX .* starting" "$out/ladex.log"; then
