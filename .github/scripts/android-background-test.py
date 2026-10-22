@@ -3,6 +3,7 @@
 notification, the node outliving a window Android closed, and the notification's Stop button."""
 
 import json
+import re
 import subprocess
 import sys
 import time
@@ -15,7 +16,6 @@ from android_ui import (
     bounds_of,
     find,
     keep_what_was_on_screen,
-    press_home,
     screen_nodes,
     screenshot,
     scroll_to_the_top,
@@ -23,6 +23,9 @@ from android_ui import (
 )
 
 PACKAGE = "io.github.gshreekar.ladex"
+KEY_APP_SWITCH = "187"
+# Recents animates in before its cards can be swiped.
+RECENTS_SECONDS = 3
 WAIT_SECONDS = 60
 GOODBYE_SECONDS = 15
 # Longer than the app waits off Wi-Fi before pausing, so a lost connection would show as a paused notification.
@@ -93,21 +96,32 @@ def turn_on_sharing_in_the_background(out: Path) -> None:
     screenshot(out, "8-sharing")
 
 
+# A display-size override is listed after the physical size, and taps go by it.
+def screen_size() -> tuple[int, int]:
+    width, height = re.findall(r"(\d+)x(\d+)", adb("shell", "wm", "size"))[-1]
+    return int(width), int(height)
+
+
+# Swiping the app's card up in Recents destroys its activity, which is how a person closes an app.
+def swipe_away_from_recents(out: Path) -> None:
+    adb("shell", "input", "keyevent", KEY_APP_SWITCH)
+    time.sleep(RECENTS_SECONDS)
+    screenshot(out, "9-recents")
+    width, height = screen_size()
+    middle = str(width // 2)
+    adb("shell", "input", "swipe", middle, str(height // 2), middle, str(height // 20), "200")
+
+
 def close_the_window_while_sharing(ladex: str, host_data_dir: str, out: Path) -> None:
-    # With this developer option Android destroys an activity once it leaves the screen, as it may on a real phone.
-    adb("shell", "settings", "put", "global", "always_finish_activities", "1")
-    try:
-        press_home()
-        wait_until(lambda: "keeps sharing in the background" in ladex_log(), "the node to outlive its window")
-        time.sleep(SETTLE_SECONDS)
-        expect(is_running(), "LADEX stopped after Android closed its window")
-        expect(is_sharing_in_the_foreground(), "the sharing service stopped after Android closed the window")
-        expect(host_node_count(ladex, host_data_dir) > 0, "the other node lost the phone after Android closed the window")
-        adb("shell", "am", "start", "-n", f"{PACKAGE}/.MainActivity")
-        find(text="Network", is_in_bottom_bar=True)
-        screenshot(out, "9-reopened")
-    finally:
-        adb("shell", "settings", "put", "global", "always_finish_activities", "0")
+    swipe_away_from_recents(out)
+    wait_until(lambda: "keeps sharing in the background" in ladex_log(), "the node to outlive its window")
+    time.sleep(SETTLE_SECONDS)
+    expect(is_running(), "LADEX stopped after Android closed its window")
+    expect(is_sharing_in_the_foreground(), "the sharing service stopped after Android closed the window")
+    expect(host_node_count(ladex, host_data_dir) > 0, "the other node lost the phone after Android closed the window")
+    adb("shell", "am", "start", "-n", f"{PACKAGE}/.MainActivity")
+    find(text="Network", is_in_bottom_bar=True)
+    screenshot(out, "10-reopened")
 
 
 # A notification can show collapsed, with its buttons hidden; its own Expand button opens it.
@@ -127,7 +141,7 @@ def stop_from_the_notification(ladex: str, host_data_dir: str, out: Path) -> Non
     adb("shell", "cmd", "statusbar", "expand-notifications")
     time.sleep(POLL_SECONDS)
     expand_the_notification()
-    screenshot(out, "10-notification")
+    screenshot(out, "11-notification")
     # The notification shade has no bottom navigation to keep clear of.
     tap(text="Stop", is_in_bottom_bar=True)
     wait_until(lambda: not is_running(), "LADEX to quit")
