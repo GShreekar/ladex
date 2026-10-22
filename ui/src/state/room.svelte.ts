@@ -1,4 +1,5 @@
 import type {
+  Capabilities,
   ChatMessage,
   ClientEvent,
   ConnectionState,
@@ -24,6 +25,8 @@ export class Room {
   messages = $state<ChatMessage[]>([]);
   offers = $state<IncomingOffer[]>([]);
   hasNoPeersWarning = $state(false);
+  // Copied from the client, which learns them from the node only after the page has drawn its navigation.
+  capabilities = $state() as Capabilities;
 
   private stopListening: () => void;
 
@@ -33,15 +36,12 @@ export class Room {
     private readonly notifier?: Pick<Notifier, 'downloadSaved'>,
     private readonly autoAccept?: Pick<AutoAccept, 'shouldAccept'>,
   ) {
+    this.capabilities = client.capabilities;
     this.stopListening = client.subscribe((event) => this.apply(event));
   }
 
   get otherDevices(): Device[] {
     return this.devices.filter((device) => !device.isSelf);
-  }
-
-  get capabilities(): LadexClient['capabilities'] {
-    return this.client.capabilities;
   }
 
   async start(): Promise<void> {
@@ -108,9 +108,11 @@ export class Room {
     switch (event.type) {
       case 'connection':
         this.connection = event.state;
+        this.capabilities = this.client.capabilities;
         break;
       case 'self':
         this.self = event.self;
+        this.capabilities = this.client.capabilities;
         break;
       case 'devices':
         this.devices = event.devices;

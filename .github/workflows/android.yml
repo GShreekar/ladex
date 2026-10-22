@@ -1,0 +1,203 @@
+name: Android app
+
+on:
+  # Each push to a Phase 8 branch leaves signed APKs to try on a phone.
+  push:
+    branches: ['phase8/**']
+  workflow_dispatch:
+  # The release workflow builds the APKs it publishes with this.
+  workflow_call:
+    outputs:
+      certificate_sha256:
+        description: The SHA-256 of the certificate the APKs are signed with, for the release notes.
+        value: ${{ jobs.apk.outputs.certificate_sha256 }}
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  apk:
+    name: Signed APKs
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      certificate_sha256: ${{ steps.verify.outputs.certificate_sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            ui/package-lock.json
+            crates/ladex-app/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android-apk
+
+      - name: Build the web UI the app embeds
+        working-directory: ui
+        run: |
+          npm ci
+          npm run build
+
+      # The runner image carries the SDK and NDK; Tauri finds the NDK through NDK_HOME.
+      - name: Point Tauri at the NDK
+        run: echo "NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+
+      - name: Unpack the release key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [[ -z "$KEYSTORE_BASE64" ]]; then
+            echo "::error::The ANDROID_KEYSTORE_BASE64 secret is missing, so the APKs cannot be signed."
+            exit 1
+          fi
+          keystore="$RUNNER_TEMP/ladex-release.jks"
+          echo "$KEYSTORE_BASE64" | base64 --decode > "$keystore"
+          {
+            echo "storeFile=$keystore"
+            echo "storePassword=$KEYSTORE_PASSWORD"
+            echo "keyAlias=$KEY_ALIAS"
+            echo "keyPassword=$KEY_PASSWORD"
+          } > crates/ladex-app/gen/android/keystore.properties
+
+      - name: Work out the version
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "ladex-app") | .version')
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "VERSION_CODE=$(.github/scripts/android-version-code.sh "$version")" >> "$GITHUB_ENV"
+
+      # Gradle calls back into this same Tauri CLI to build the Rust library for each ABI.
+      - name: Build the APKs
+        working-directory: crates/ladex-app
+        run: |
+          npm ci
+          npm run tauri -- android build --ci --apk --split-per-abi \
+            --target aarch64 armv7 x86_64 \
+            --config "{\"bundle\":{\"android\":{\"versionCode\":$VERSION_CODE}}}"
+
+      # Named for what they run on, so people pick the right one from the release page.
+      - name: Name the APKs
+        run: |
+          mkdir apk
+          outputs=crates/ladex-app/gen/android/app/build/outputs/apk
+          cp "$outputs/arm64/release/app-arm64-release.apk" "apk/ladex-v$VERSION-android-arm64.apk"
+          cp "$outputs/arm/release/app-arm-release.apk" "apk/ladex-v$VERSION-android-armv7.apk"
+          cp "$outputs/x86_64/release/app-x86_64-release.apk" "apk/ladex-v$VERSION-android-x86_64.apk"
+          ls -l apk
+
+      - name: Check every APK is signed with the release key
+        id: verify
+        run: |
+          set -o pipefail
+          apksigner="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)/apksigner"
+          for apk in apk/*.apk; do
+            echo "== $apk"
+            # Fails, and so stops the job, for an APK that is unsigned or does not verify.
+            "$apksigner" verify --verbose --print-certs "$apk" | tee -a "$RUNNER_TEMP/apksigner.txt"
+          done
+          # The signer is named per scheme ("V2 Signer:") or by number ("Signer #1"), depending on the apksigner version.
+          fingerprints=$(sed -n 's/^.*Signer.* certificate SHA-256 digest: //p' "$RUNNER_TEMP/apksigner.txt" | sort -u)
+          if [[ $(echo "$fingerprints" | grep -c .) -ne 1 ]]; then
+            echo "::error::The APKs are not all signed with one key: '$fingerprints'"
+            exit 1
+          fi
+          echo "Signed with certificate SHA-256 $fingerprints"
+          echo "certificate_sha256=$fingerprints" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ladex-android-apk
+          path: apk/*.apk
+          if-no-files-found: error
+
+      # The emulator test joins the phone to a node run by this same commit's CLI.
+      - name: Build the CLI the emulator test runs as the other node
+        run: cargo build -p ladex
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ladex-cli-for-tests
+          path: target/debug/ladex
+          retention-days: 1
+
+      - name: Forget the release key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/ladex-release.jks" crates/ladex-app/gen/android/keystore.properties
+
+  # The x86_64 APK runs on the emulator: it must start, finish the wizard and join a node by address (the 8b gate,
+  # short of a real phone), so a broken build never reaches a phone or a release.
+  smoke-test:
+    name: Starts and joins on an emulator
+    needs: apk
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ladex-android-apk
+          path: apk
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ladex-cli-for-tests
+          path: cli
+
+      # Discovery is off: the phone must reach it by the address it is given, as on a network that blocks multicast.
+      - name: Start the node the phone joins
+        run: |
+          chmod +x cli/ladex
+          echo "HOST_DATA_DIR=$RUNNER_TEMP/host-node" >> "$GITHUB_ENV"
+          nohup cli/ladex --data-dir "$RUNNER_TEMP/host-node" --port 18080 --no-tls --no-discovery ci-join-test-passphrase > host-node.log 2>&1 &
+          sleep 3
+          cli/ladex --data-dir "$RUNNER_TEMP/host-node" devices
+
+      - name: Let the emulator use KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Install, open and watch the app
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          # The plain image: Google services update packages in the background, which can restart the WebView mid-test.
+          target: default
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          script: |
+            .github/scripts/android-smoke-test.sh apk/ladex-v*-android-x86_64.apk smoke
+            python3 .github/scripts/android-join-test.py cli/ladex "$HOST_DATA_DIR" 18080 ci-join-test-passphrase smoke
+
+      - name: Keep the other node's log
+        if: always()
+        run: cp host-node.log smoke/ 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: android-smoke-test
+          path: smoke/

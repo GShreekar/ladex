@@ -40,7 +40,7 @@
           <span class="muted">{message.senderName}</span>
           <span class="faint">{formatAgo(message.sentAt, clock.now)}</span>
         </div>
-        <button class="bubble" title="Click to copy" onclick={() => copy(message.text)}>{message.text}</button>
+        <button class="bubble" title="Copy this message" onclick={() => copy(message.text)}>{message.text}</button>
       </li>
     {:else}
       <li class="empty faint small">No messages yet. Say hello, or paste a link.</li>

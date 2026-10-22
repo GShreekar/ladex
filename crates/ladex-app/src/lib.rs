@@ -6,6 +6,7 @@ mod desktop;
 mod ipc;
 #[cfg(desktop)]
 mod launch;
+mod logging;
 mod notify;
 mod paths;
 mod running;
@@ -121,7 +122,7 @@ fn set_up_desktop(app: &AppHandle) {
 /// Builds and runs the app until it quits; Android calls this when the app is opened.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tracing_subscriber::fmt::init();
+    logging::init();
 
     let app = with_desktop_plugins(tauri::Builder::default())
         .plugin(tauri_plugin_notification::init())
@@ -152,7 +153,9 @@ pub fn run() {
             setup::ladex_setup_finish,
         ])
         .setup(|app| {
-            app.manage(AppPaths::resolve(app.handle())?);
+            let paths = AppPaths::resolve(app.handle())?;
+            tracing::info!("LADEX {} starting, data folder {}", env!("CARGO_PKG_VERSION"), paths.data_dir.display());
+            app.manage(paths);
             #[cfg(desktop)]
             set_up_desktop(app.handle());
             Ok(start(app.handle())?)

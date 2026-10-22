@@ -44,8 +44,9 @@
 
 <style>
   main {
-    min-height: 100vh;
+    min-height: var(--viewport-height);
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
     place-items: center;
     padding: 16px;
   }

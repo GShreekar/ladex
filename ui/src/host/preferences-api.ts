@@ -13,6 +13,8 @@ export interface Preferences {
   downloads_dir: string | null;
   storage_limit_gib: number;
   auto_accept: AutoAcceptRule;
+  // Other nodes kept connected by address, as "ip:port".
+  peer_addresses: string[];
 }
 
 export interface PreferencesView {
@@ -24,6 +26,8 @@ export interface PreferencesView {
   store_used_bytes: number;
   disk_free_bytes: number | null;
   platform: 'windows' | 'unix';
+  // What another device types to add this one by address.
+  this_address: string | null;
 }
 
 export interface PreferencesUpdate {
@@ -31,6 +35,8 @@ export interface PreferencesUpdate {
   downloads_dir?: string;
   storage_limit_gib?: number;
   auto_accept?: AutoAcceptRule;
+  // The whole list, as typed; an IP alone uses the default port.
+  peer_addresses?: string[];
 }
 
 export type Verdict = 'ok' | 'warning' | 'problem';

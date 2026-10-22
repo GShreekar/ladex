@@ -173,10 +173,16 @@ jobs:
             target/${{ matrix.target }}/release/bundle/appimage/*.AppImage
           if-no-files-found: error
 
+  android:
+    name: Android app
+    needs: version
+    uses: ./.github/workflows/android.yml
+    secrets: inherit
+
   release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
-    needs: [build, app]
+    needs: [build, app, android]
     steps:
       - uses: actions/checkout@v4
 
@@ -199,11 +205,30 @@ jobs:
           sha256sum * > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
+      # People can check an APK came from this project before installing it.
+      - name: Write the release notes
+        env:
+          CERTIFICATE_SHA256: ${{ needs.android.outputs.certificate_sha256 }}
+        run: |
+          cp .github/release-notes.md release-notes.md
+          {
+            echo
+            echo "### Android signing certificate"
+            echo
+            echo "Every APK is signed with the certificate whose SHA-256 is:"
+            echo
+            echo '```'
+            echo "$CERTIFICATE_SHA256" | sed 's/../&:/g; s/:$//' | tr '[:lower:]' '[:upper:]'
+            echo '```'
+            echo
+            echo 'Check a download with `apksigner verify --print-certs <file>.apk`, or in an app such as AppVerifier.'
+          } >> release-notes.md
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           files: ./release/*
-          body_path: .github/release-notes.md
+          body_path: release-notes.md
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}
         env:

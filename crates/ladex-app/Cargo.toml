@@ -13,7 +13,7 @@ name = "ladex_app_lib"
 crate-type = ["cdylib", "rlib"]
 
 [build-dependencies]
-tauri-build = "2"
+tauri-build = { version = "2", features = [] }
 
 [dependencies]
 ladex-core.workspace = true
@@ -31,3 +31,7 @@ tracing-subscriber.workspace = true
 tauri-plugin-autostart = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-single-instance = "2"
+
+# Android drops a process's stdout, so logs go to logcat (`adb logcat -s LADEX`).
+[target.'cfg(target_os = "android")'.dependencies]
+tracing-logcat = "0.1"

@@ -4,7 +4,7 @@ import type { PreferencesView } from './preferences-api';
 
 function view(overrides: Partial<PreferencesView> = {}): PreferencesView {
   return {
-    preferences: { is_setup_done: true, downloads_dir: null, storage_limit_gib: 20, auto_accept: { from: 'nobody', ask_above_mib: null } },
+    preferences: { is_setup_done: true, downloads_dir: null, storage_limit_gib: 20, auto_accept: { from: 'nobody', ask_above_mib: null }, peer_addresses: [] },
     data_dir: '/home/sam/.ladex/files',
     is_default_data_dir: true,
     has_passphrase: true,
@@ -12,6 +12,7 @@ function view(overrides: Partial<PreferencesView> = {}): PreferencesView {
     store_used_bytes: 0,
     disk_free_bytes: null,
     platform: 'unix',
+    this_address: '192.168.1.5:8080',
     ...overrides,
   };
 }
@@ -63,6 +64,10 @@ describe('commands', () => {
     expect(settingsCommands(view()).some((hint) => hint.command.includes('--downloads-dir'))).toBe(false);
     const chosen = view({ preferences: { ...view().preferences, downloads_dir: '/home/sam/Received Files' } });
     expect(settingsCommands(chosen).map((hint) => hint.command)).toContain("ladex settings --downloads-dir '/home/sam/Received Files'");
+  });
+
+  it('offer_adding_a_device_by_address', () => {
+    expect(settingsCommands(view()).map((hint) => hint.command)).toContain('ladex settings --add-peer <address>');
   });
 
   it('run_the_node_without_the_app_with_its_storage_limit', () => {

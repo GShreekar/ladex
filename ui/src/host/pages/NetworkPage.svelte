@@ -5,6 +5,7 @@
   import type { IconName } from '../../components/icons';
   import { useHost } from '../host-context';
   import { formatReport, worstVerdict } from '../doctor-report';
+  import AddressSection from '../network/AddressSection.svelte';
   import PairingSection from '../network/PairingSection.svelte';
   import TrustSection from '../network/TrustSection.svelte';
   import type { TrustedNode } from '../pairing-api';
@@ -85,6 +86,8 @@
     </div>
   </section>
 
+  <AddressSection />
+
   {#if hasChecked}
     <section class="card">
       <ul>
@@ -119,6 +122,7 @@
 
   .summary {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 14px;
     padding: 18px 20px;
@@ -126,6 +130,7 @@
 
   .summary > div:first-of-type {
     flex: 1;
+    min-width: 180px;
   }
 
   .summary.ok {

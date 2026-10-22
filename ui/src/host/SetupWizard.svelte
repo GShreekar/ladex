@@ -110,7 +110,13 @@
       <p>LADEX shares files between devices on the same Wi-Fi or network, directly and without the internet. Setting up takes a minute.</p>
       <label class="field">
         <span class="label">What should other people see this device as?</span>
-        <input class="input" maxlength="40" placeholder="For example, Sam’s laptop" bind:value={answers.deviceName} />
+        <input
+          id="device-name"
+          class="input"
+          maxlength="40"
+          placeholder={isMobile ? 'For example, Sam’s phone' : 'For example, Sam’s laptop'}
+          bind:value={answers.deviceName}
+        />
         <span class="small faint">You can change it later in Settings.</span>
       </label>
     {:else if step === 'mesh'}
@@ -138,12 +144,12 @@
           </div>
           {#if copyState === 'failed'}<span class="small faint">Could not copy. Select it and copy it by hand.</span>{/if}
         </div>
-        <p class="small muted">You type it on each computer you add to the mesh; you can see it again later in Settings. Phones don’t need it: they join by scanning a QR code. Anyone who has it can join, so share it only with people you trust.</p>
+        <p class="small muted">You type it on each device you add to the mesh with the LADEX app; you can see it again later in Settings. Anyone visiting in a browser doesn’t need it: they join by scanning a QR code. Anyone who has it can join, so share it only with people you trust.</p>
       {:else}
         <label class="field">
           <span class="label">Passphrase of the mesh</span>
-          <input class="input code-input" bind:value={answers.joinedPassphrase} autocomplete="off" spellcheck="false" placeholder="Shown on the device that started it" />
-          <span class="small faint">On a computer already in the mesh, open Settings and choose Show passphrase.</span>
+          <input id="mesh-passphrase" class="input code-input" bind:value={answers.joinedPassphrase} autocomplete="off" spellcheck="false" placeholder="Shown on the device that started it" />
+          <span class="small faint">On a device already in the mesh, open Settings and choose Show passphrase.</span>
         </label>
       {/if}
     {:else if step === 'files'}
@@ -197,11 +203,13 @@
 </main>
 
 <style>
+  /* The column is capped at the screen, so a long path truncates instead of pushing the card off a phone screen. */
   main {
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
     place-items: center;
-    min-height: 100vh;
-    padding: 24px 16px;
+    min-height: var(--viewport-height);
+    padding: 24px 16px calc(24px + var(--safe-bottom));
   }
 
   .wizard {
@@ -240,6 +248,7 @@
 
   .row {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 8px;
   }
@@ -344,5 +353,16 @@
     justify-content: flex-end;
     gap: 8px;
     margin-top: 8px;
+  }
+
+  /* Narrow phones: less padding, and the two mesh choices stacked. */
+  @media (max-width: 400px) {
+    .wizard {
+      padding: 20px;
+    }
+
+    .choices {
+      grid-template-columns: 1fr;
+    }
   }
 </style>

@@ -103,14 +103,14 @@
   .shell {
     display: grid;
     grid-template-columns: 240px 1fr;
-    min-height: 100vh;
+    min-height: var(--viewport-height);
   }
 
   aside {
     position: sticky;
-    top: 0;
+    top: var(--safe-top);
     align-self: start;
-    height: 100vh;
+    height: var(--viewport-height);
     display: flex;
     flex-direction: column;
     background: var(--surface);
@@ -234,7 +234,7 @@
 
   header {
     position: sticky;
-    top: 0;
+    top: var(--safe-top);
     z-index: 10;
     display: flex;
     align-items: center;
@@ -308,6 +308,76 @@
 
     main {
       padding: 16px;
+    }
+  }
+
+  /* Phones: the navigation moves to a bar along the bottom, within reach of a thumb. */
+  @media (max-width: 600px) {
+    :global(:root) {
+      --bottom-bar-height: 64px;
+    }
+
+    .shell {
+      padding-bottom: calc(var(--bottom-bar-height) + var(--safe-bottom));
+    }
+
+    aside {
+      position: fixed;
+      inset: auto 0 0;
+      z-index: 20;
+      padding: 0 var(--safe-right) var(--safe-bottom) var(--safe-left);
+      border-top: 1px solid var(--border);
+      border-bottom: 0;
+    }
+
+    .brand {
+      display: none;
+    }
+
+    nav {
+      flex: 1;
+      gap: 0;
+      padding: 0;
+      overflow: visible;
+    }
+
+    .nav-item {
+      position: relative;
+      flex: 1;
+      flex-direction: column;
+      justify-content: center;
+      gap: 2px;
+      min-width: 0;
+      height: var(--bottom-bar-height);
+      padding: 6px 2px;
+      font-size: 11px;
+      line-height: 14px;
+      text-align: center;
+    }
+
+    .nav-item span:not(.count) {
+      display: block;
+      max-width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .nav-item:hover {
+      background: transparent;
+    }
+
+    .count {
+      position: absolute;
+      top: 6px;
+      left: calc(50% + 6px);
+      margin-left: 0;
+      padding: 0 6px;
+      font-size: 10px;
+    }
+
+    header {
+      gap: 8px;
     }
   }
 </style>

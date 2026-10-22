@@ -2659,7 +2659,7 @@ dependencies = [
 
 [[package]]
 name = "ladex"
-version = "3.0.0"
+version = "3.1.0-alpha.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2676,7 +2676,7 @@ dependencies = [
 
 [[package]]
 name = "ladex-app"
-version = "3.0.0"
+version = "3.1.0-alpha.1"
 dependencies = [
  "anyhow",
  "include_dir",
@@ -2690,12 +2690,13 @@ dependencies = [
  "tauri-plugin-opener",
  "tauri-plugin-single-instance",
  "tracing",
+ "tracing-logcat",
  "tracing-subscriber",
 ]
 
 [[package]]
 name = "ladex-core"
-version = "3.0.0"
+version = "3.1.0-alpha.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -4230,9 +4231,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.15"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "ring",
  "rustls-pki-types",
@@ -5695,6 +5696,17 @@ dependencies = [
  "log",
  "once_cell",
  "tracing-core",
+]
+
+[[package]]
+name = "tracing-logcat"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "678d561ce3d4b33dfcfb1c6bd13c422aad89be5bf0e66e20d518a5a254345b54"
+dependencies = [
+ "rustix 0.38.44",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

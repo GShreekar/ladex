@@ -38,7 +38,7 @@
 
   .dialog {
     width: min(480px, 100%);
-    max-height: calc(100vh - 32px);
+    max-height: calc(var(--viewport-height) - 32px - var(--safe-bottom));
     overflow: auto;
     padding: 24px;
     box-shadow: var(--shadow-overlay);
