@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import type { Check } from '../host/preferences-api';
 
 /** What the app's Rust side does for the person outside the window. */
 export interface DesktopShell {
@@ -14,6 +15,8 @@ export interface DesktopSettings {
   setLaunchesAtLogin(shouldLaunch: boolean): Promise<boolean>;
   // Stops the node and starts it again from what is saved, then reloads the window.
   restartNode(): Promise<void>;
+  // The phone's own network checks (Wi-Fi, the multicast lock); only the Android app has them.
+  deviceChecks(): Promise<Check[]>;
 }
 
 export interface SetupState {
@@ -63,6 +66,7 @@ export const tauriSettings: DesktopSettings = {
   launchesAtLogin: () => invoke<boolean>('ladex_launch_at_login'),
   setLaunchesAtLogin: (shouldLaunch) => invoke<boolean>('ladex_set_launch_at_login', { shouldLaunch }),
   restartNode: () => invoke<void>('ladex_restart_node'),
+  deviceChecks: () => invoke<Check[]>('ladex_device_checks'),
 };
 
 export const tauriSetup: DesktopSetup = {

@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["crates/ladex-core", "crates/ladex-cli", "crates/ladex-app"]
-# The app needs the platform webview, so plain `cargo build` and `cargo test` leave it out.
+members = ["crates/ladex-core", "crates/ladex-cli", "crates/ladex-app", "crates/tauri-plugin-ladex-android"]
+# The app and its Android plugin need the platform webview, so plain `cargo build` and `cargo test` leave them out.
 default-members = ["crates/ladex-core", "crates/ladex-cli"]
 
 [workspace.package]

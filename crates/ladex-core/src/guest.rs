@@ -82,7 +82,7 @@ impl Guests {
 /// The address a guest opens, with the invitation token and the certificate fingerprint in the fragment.
 /// A browser never sends the fragment to the server or in a Referer, so it stays between the QR code and the page.
 pub fn invite_link(state: &NodeState, invite: &invites::IssuedInvite) -> Option<String> {
-    let ip = state.local_ip?;
+    let ip = state.local_ip()?;
     let is_encrypted = !state.tls_fingerprint.is_empty();
     let scheme = if is_encrypted { "https" } else { "http" };
     let mut fragment = format!("t={}", invite.token);
@@ -255,7 +255,7 @@ mod tests {
 
     fn node_at(ip: &str, fingerprint: &[u8]) -> NodeState {
         let mut state = NodeState::for_tests(None);
-        state.local_ip = Some(ip.parse().unwrap());
+        state.set_local_ip(Some(ip.parse().unwrap()));
         state.http_port = 8443;
         state.tls_fingerprint = fingerprint.to_vec();
         state
@@ -279,8 +279,8 @@ mod tests {
 
     #[test]
     fn there_is_no_link_without_an_address() {
-        let mut state = node_at("192.168.1.5", &[]);
-        state.local_ip = None;
+        let state = node_at("192.168.1.5", &[]);
+        state.set_local_ip(None);
         assert!(invite_link(&state, &state.guests.invites.issue(Permission::ReadOnly)).is_none());
     }
 

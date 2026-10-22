@@ -420,6 +420,9 @@ where
     if !state.mesh_peers.read().await.contains_key(from) {
         return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "not a connected peer"));
     }
+    if state.is_seeding_paused.load(Ordering::Relaxed) {
+        return refuse(&mut writer, ErrorCode::Busy).await;
+    }
     let Ok(_slot) = tokio::time::timeout(SLOT_WAIT, state.transfers.uploads.acquire(from)).await else {
         return refuse(&mut writer, ErrorCode::Busy).await;
     };
@@ -1079,6 +1082,18 @@ mod tests {
         for _ in 0..UPLOAD_SLOTS {
             taken.push(a.transfers.uploads().acquire(&"node_c".to_string()).await);
         }
+
+        let replies = ask(&a, "node_b", GetChunks::for_indices("file_x", &[0])).await;
+
+        assert_eq!(replies, [Reply::Error(ErrorCode::Busy)]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_node_whose_seeding_is_paused_answers_busy() {
+        let [a, b] = nodes(["node_a", "node_b"]);
+        link(&a, &b, None).await;
+        share(&a, &[], "file_x", &data_pattern(100, 15)).await;
+        a.is_seeding_paused.store(true, Ordering::Relaxed);
 
         let replies = ask(&a, "node_b", GetChunks::for_indices("file_x", &[0])).await;
 

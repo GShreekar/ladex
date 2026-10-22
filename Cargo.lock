@@ -2682,13 +2682,16 @@ dependencies = [
  "include_dir",
  "ladex-core",
  "serde",
+ "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-autostart",
  "tauri-plugin-dialog",
+ "tauri-plugin-ladex-android",
  "tauri-plugin-notification",
  "tauri-plugin-opener",
  "tauri-plugin-single-instance",
+ "tokio",
  "tracing",
  "tracing-logcat",
  "tracing-subscriber",
@@ -5136,6 +5139,18 @@ dependencies = [
  "thiserror 2.0.14",
  "toml 1.1.6+spec-1.1.0",
  "url",
+]
+
+[[package]]
+name = "tauri-plugin-ladex-android"
+version = "3.1.0-alpha.1"
+dependencies = [
+ "jni",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-plugin",
+ "tracing",
 ]
 
 [[package]]

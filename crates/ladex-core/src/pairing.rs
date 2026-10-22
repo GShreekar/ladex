@@ -77,7 +77,7 @@ pub struct View {
 }
 
 pub fn view(state: &NodeState) -> View {
-    View { address: state.local_ip.map(|ip| SocketAddr::new(ip, state.quic_port).to_string()), status: state.pairings.status() }
+    View { address: state.local_ip().map(|ip| SocketAddr::new(ip, state.quic_port).to_string()), status: state.pairings.status() }
 }
 
 /// "ip:port", or just "ip" for a node on the same port as this one.

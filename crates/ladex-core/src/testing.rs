@@ -76,7 +76,7 @@ pub async fn spawn_node(config: NodeConfig) -> NodeHandle {
     state.quic_port = addr.port();
     state.mesh_endpoint = Some(endpoint.clone());
     state.node_name = config.name.clone();
-    state.local_ip = Some(addr.ip());
+    state.set_local_ip(Some(addr.ip()));
     // Every test node dials from 127.0.0.1, so that one address must not look like a guesser.
     state.mesh_limiter = Arc::new(ratelimit::AttemptLimiter::new(ratelimit::Policy {
         free_attempts: 1000,

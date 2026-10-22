@@ -4,6 +4,7 @@
   import { theme, type ThemePreference } from '../../state/theme.svelte';
   import { useHost } from '../host-context';
   import type { PreferencesView } from '../preferences-api';
+  import BackgroundSection from '../settings/BackgroundSection.svelte';
   import CommandLineSection from '../settings/CommandLineSection.svelte';
   import PassphraseSection from '../settings/PassphraseSection.svelte';
   import ReceivingSection from '../settings/ReceivingSection.svelte';
@@ -60,6 +61,7 @@
     <StorageSection {view} onchange={(next) => (view = next)} />
     <PassphraseSection {view} onchange={(next) => (view = next)} />
     {#if desktop && !isMobile}<StartupSection />{/if}
+    {#if isMobile}<BackgroundSection {view} onchange={(next) => (view = next)} />{/if}
   {/if}
 
   <section class="card">

@@ -32,8 +32,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # The app and its Android plugin are built and tested in their own jobs.
       - name: Test
-        run: cargo test --workspace --exclude ladex-app
+        run: cargo test --workspace --exclude ladex-app --exclude tauri-plugin-ladex-android
 
   ui:
     name: Web UI
@@ -90,6 +91,9 @@ jobs:
       - name: Clippy
         run: cargo clippy -p ladex-app --all-targets -- -D warnings
 
+      - name: Test
+        run: cargo test -p ladex-app
+
   android:
     name: Android app
     runs-on: ubuntu-latest
@@ -131,7 +135,7 @@ jobs:
 
       # Fails if a desktop-only dependency or API creeps back into the Android build.
       - name: Clippy
-        run: cargo clippy -p ladex-app --target aarch64-linux-android -- -D warnings
+        run: cargo clippy -p ladex-app -p tauri-plugin-ladex-android --target aarch64-linux-android -- -D warnings
 
       - name: Link the library Android loads
         run: cargo build -p ladex-app --lib --target aarch64-linux-android
@@ -171,4 +175,4 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Clippy
-        run: cargo clippy --workspace --exclude ladex-app --all-targets -- -D warnings
+        run: cargo clippy --workspace --exclude ladex-app --exclude tauri-plugin-ladex-android --all-targets -- -D warnings

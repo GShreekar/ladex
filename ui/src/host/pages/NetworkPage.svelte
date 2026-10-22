@@ -4,14 +4,14 @@
   import Icon from '../../components/Icon.svelte';
   import type { IconName } from '../../components/icons';
   import { useHost } from '../host-context';
-  import { formatReport, worstVerdict } from '../doctor-report';
+  import { formatReport, withDeviceChecks, worstVerdict } from '../doctor-report';
   import AddressSection from '../network/AddressSection.svelte';
   import PairingSection from '../network/PairingSection.svelte';
   import TrustSection from '../network/TrustSection.svelte';
   import type { TrustedNode } from '../pairing-api';
   import type { Check, Verdict } from '../preferences-api';
 
-  const { pairingApi, preferencesApi, toasts } = useHost();
+  const { pairingApi, preferencesApi, desktop, isMobile, toasts } = useHost();
 
   const icons: Record<Verdict, IconName> = { ok: 'check-circle', warning: 'alert', problem: 'alert' };
   const summaries: Record<Verdict, string> = {
@@ -30,7 +30,11 @@
   async function run(): Promise<void> {
     isChecking = true;
     try {
-      checks = await preferencesApi.diagnose();
+      const [nodeChecks, deviceChecks] = await Promise.all([
+        preferencesApi.diagnose(),
+        isMobile && desktop ? desktop.deviceChecks() : Promise.resolve([]),
+      ]);
+      checks = withDeviceChecks(nodeChecks, deviceChecks);
       hasChecked = true;
     } catch (error) {
       toasts.show('error', error instanceof TransferError ? error.message : 'Could not check the network.');

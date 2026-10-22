@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -204,6 +204,26 @@ impl NodeHandle {
 
     pub fn state(&self) -> &NodeState {
         &self.state
+    }
+
+    /// Stops or restarts serving chunks to other nodes and announcing this one, as when a phone leaves its Wi-Fi and comes back.
+    pub fn pause_seeding(&self, is_paused: bool) {
+        if self.state.is_seeding_paused.swap(is_paused, Ordering::Relaxed) == is_paused {
+            return;
+        }
+        tracing::info!("Seeding {}", if is_paused { "paused" } else { "resumed" });
+        if !is_paused {
+            self.refresh_address();
+        }
+    }
+
+    /// Takes up the address this device has on the local network now, which changes when it moves to another network.
+    pub fn refresh_address(&self) {
+        let ip = tls::local_ipv4_addresses().first().copied().or_else(guess_local_ip);
+        if ip != self.state.local_ip() {
+            tracing::info!("Network address is now {}", ip.map_or_else(|| "none".to_string(), |ip| ip.to_string()));
+            self.state.set_local_ip(ip);
+        }
     }
 
     /// An in-process way into this node's web server, for a window that lives in the same process.
@@ -458,6 +478,7 @@ fn new_state(config: &NodeConfig, parts: StateParts) -> NodeState {
             stall_timeout: config.stall_timeout,
             ..Default::default()
         })),
+        is_seeding_paused: Arc::new(AtomicBool::new(false)),
         pushes: Arc::new(push::Pushes::default()),
         sessions: Arc::new(sessions::SessionStore::new()),
         catalog_changes: Arc::new(tokio::sync::watch::channel(0).0),
@@ -467,7 +488,7 @@ fn new_state(config: &NodeConfig, parts: StateParts) -> NodeState {
         connection_counter: Arc::new(AtomicU64::new(1)),
         clock_alert_at: Arc::new(Mutex::new(None)),
         http_port: parts.http_port,
-        local_ip: parts.primary_ip,
+        local_ip: Arc::new(std::sync::RwLock::new(parts.primary_ip)),
         node_name: types::hostname(),
         preferences: Arc::new(crate::preferences::PreferencesStore::open(&config.data_dir)),
         started_with: Arc::new(control::Settings {
@@ -537,6 +558,7 @@ fn keep_manual_peers_connected(state: &NodeState, peers: &[SocketAddr]) -> Vec<J
 
 fn start_discovery(state: &NodeState, port: u16) -> JoinHandle<()> {
     let announce_packet = discovery::build_announce(state);
+    let is_seeding_paused = state.is_seeding_paused.clone();
     let state = state.clone();
     tokio::spawn(async move {
         let service = match discovery::DiscoveryService::bind(port).await {
@@ -548,7 +570,7 @@ fn start_discovery(state: &NodeState, port: u16) -> JoinHandle<()> {
             }
         };
         let announce = async {
-            if let Err(e) = service.announce_loop(announce_packet).await {
+            if let Err(e) = service.announce_loop(announce_packet, &is_seeding_paused).await {
                 tracing::error!("Discovery announce loop error: {e}");
             }
         };

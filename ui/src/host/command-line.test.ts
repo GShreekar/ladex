@@ -4,7 +4,7 @@ import type { PreferencesView } from './preferences-api';
 
 function view(overrides: Partial<PreferencesView> = {}): PreferencesView {
   return {
-    preferences: { is_setup_done: true, downloads_dir: null, storage_limit_gib: 20, auto_accept: { from: 'nobody', ask_above_mib: null }, peer_addresses: [] },
+    preferences: { is_setup_done: true, downloads_dir: null, storage_limit_gib: 20, auto_accept: { from: 'nobody', ask_above_mib: null }, peer_addresses: [], keep_sharing_in_background: false },
     data_dir: '/home/sam/.ladex/files',
     is_default_data_dir: true,
     has_passphrase: true,

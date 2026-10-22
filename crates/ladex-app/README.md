@@ -54,6 +54,25 @@ The first time the app opens on a data folder it shows a short wizard before any
 - **Command line** lists the `ladex` commands that do what the app does, with the data folder the CLI will use and a copy button for each. Everything except the tray, notifications and the theme has one: `receive` stands in for the window as a device files are sent to, and `autostart` for Launch at login.
 - `ladex settings` does the same from a terminal; the daemon and the app read the same files.
 
+## Android
+
+The same app runs on Android (Phase 8): the APKs are built and signed by the `Android app` workflow, and an emulator job
+drives each one through the wizard, a join by address and the background sharing below. Its Kotlin side is the in-repo
+plugin `crates/tauri-plugin-ladex-android`; `src/android.rs` keeps it in step with the node and `src/sharing.rs` holds the rules.
+
+- **Discovery.** Android drops multicast unless an app holds a `MulticastLock`, so the app holds one while its node runs.
+- **Wi-Fi.** Off Wi-Fi (and not sharing its own hotspot or tethering) for 10 seconds, the node pauses seeding: it serves
+  other nodes no chunks and stops announcing itself. Back on a network it resumes where it was: it takes up its address
+  there (kept fresh every 2 seconds while sharing) and joins the discovery group again, so a download carries on.
+- **Background.** While a transfer runs, or always when **Keep sharing in background** is on in Settings, a `dataSync`
+  foreground service keeps the node alive under an ongoing notification ("Sharing with 3 devices") with a Stop button.
+  During a transfer it also holds a wake lock and a Wi-Fi lock, so downloads finish with the screen off. The notification
+  permission is asked for the first time the service starts, and the notification is posted again once it is granted. If Android closes the window meanwhile, the node keeps
+  sharing, and opening the app gives it a new window. Stop tells the other devices goodbye and quits.
+- **Network page.** Two more checks: whether the phone is on Wi-Fi (or sharing its hotspot), and whether the multicast lock is held.
+
+Logs go to logcat: `adb logcat -s LADEX`.
+
 ## Environment
 
 | Variable | Meaning |
