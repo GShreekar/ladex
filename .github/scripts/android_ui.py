@@ -13,8 +13,11 @@ KEY_HOME = "3"
 OFF_SCREEN = "[0,0][0,0]"
 # The app's bottom navigation covers the lowest part of the screen, so something there cannot be tapped yet.
 REACHABLE_SHARE_OF_SCREEN = 0.85
-# From the lower middle of a 320x640 screen up to the upper middle, over 300 ms.
+# From the lower middle of a 320x640 screen up to the upper middle, over 300 ms; scrolling up is the reverse.
 SCROLL_DOWN_SWIPE = ("160", "450", "160", "200", "300")
+SCROLL_UP_SWIPE = ("160", "200", "160", "450", "300")
+# Enough swipes to bring any of the app's pages back to its top.
+SWIPES_TO_THE_TOP = 6
 
 
 def adb(*arguments: str) -> str:
@@ -59,6 +62,12 @@ def find(text: str | None = None, element_id: str | None = None, is_in_bottom_ba
             adb("shell", "input", "swipe", *SCROLL_DOWN_SWIPE)
         time.sleep(POLL_SECONDS)
     raise TimeoutError(f"nothing on screen matched text={text!r} id={element_id!r}")
+
+
+# `find` only scrolls down, so a page another step left scrolled down is brought back to its top first.
+def scroll_to_the_top() -> None:
+    for _ in range(SWIPES_TO_THE_TOP):
+        adb("shell", "input", "swipe", *SCROLL_UP_SWIPE)
 
 
 def tap(text: str | None = None, element_id: str | None = None, is_in_bottom_bar: bool = False) -> None:

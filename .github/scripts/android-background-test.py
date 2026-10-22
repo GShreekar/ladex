@@ -9,7 +9,18 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-from android_ui import POLL_SECONDS, adb, bounds_of, find, keep_what_was_on_screen, press_home, screen_nodes, screenshot, tap
+from android_ui import (
+    POLL_SECONDS,
+    adb,
+    bounds_of,
+    find,
+    keep_what_was_on_screen,
+    press_home,
+    screen_nodes,
+    screenshot,
+    scroll_to_the_top,
+    tap,
+)
 
 PACKAGE = "io.github.gshreekar.ladex"
 WAIT_SECONDS = 60
@@ -62,6 +73,8 @@ def ladex_log() -> str:
 
 def check_the_network_page(out: Path) -> None:
     tap(text="Network", is_in_bottom_bar=True)
+    # The join test left this page scrolled down to the address field.
+    scroll_to_the_top()
     tap(text="Check again")
     # The details of the phone's own checks, the Wi-Fi and the multicast lock.
     find(text="connected")
@@ -71,6 +84,7 @@ def check_the_network_page(out: Path) -> None:
 
 def turn_on_sharing_in_the_background(out: Path) -> None:
     tap(text="Settings", is_in_bottom_bar=True)
+    scroll_to_the_top()
     tap(text="Keep sharing in background")
     # Asked for at the moment the notification is first needed.
     tap(element_id="permission_allow_button")
