@@ -94,5 +94,6 @@ def screenshot(out: Path, name: str) -> None:
 
 def keep_what_was_on_screen(out: Path) -> None:
     screenshot(out, "stuck")
+    adb("shell", "uiautomator", "dump", "/sdcard/screen.xml")
     (out / "stuck-screen.xml").write_text(adb("shell", "cat", "/sdcard/screen.xml"))
     (out / "logcat-when-stuck.log").write_text(adb("logcat", "-d"))

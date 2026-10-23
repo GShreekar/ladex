@@ -3,7 +3,6 @@
 notification, the node outliving a window Android closed, and the notification's Stop button."""
 
 import json
-import re
 import subprocess
 import sys
 import time
@@ -24,7 +23,7 @@ from android_ui import (
 
 PACKAGE = "io.github.gshreekar.ladex"
 KEY_APP_SWITCH = "187"
-# Recents animates in before its cards can be swiped.
+# Recents animates in before its buttons can be tapped.
 RECENTS_SECONDS = 3
 WAIT_SECONDS = 60
 GOODBYE_SECONDS = 15
@@ -96,24 +95,18 @@ def turn_on_sharing_in_the_background(out: Path) -> None:
     screenshot(out, "8-sharing")
 
 
-# A display-size override is listed after the physical size, and taps go by it.
-def screen_size() -> tuple[int, int]:
-    width, height = re.findall(r"(\d+)x(\d+)", adb("shell", "wm", "size"))[-1]
-    return int(width), int(height)
-
-
-# Swiping the app's card up in Recents destroys its activity, which is how a person closes an app.
-def swipe_away_from_recents(out: Path) -> None:
+# Clear all in Recents removes the app's task, as swiping its card away does, which is how a person closes an app.
+# Its card is not always centred, so the button is found by its id rather than swiping at a guessed spot.
+def close_from_recents(out: Path) -> None:
     adb("shell", "input", "keyevent", KEY_APP_SWITCH)
     time.sleep(RECENTS_SECONDS)
     screenshot(out, "9-recents")
-    width, height = screen_size()
-    middle = str(width // 2)
-    adb("shell", "input", "swipe", middle, str(height // 2), middle, str(height // 20), "200")
+    # Recents has no bottom navigation to keep clear of.
+    tap(element_id="clear_all", is_in_bottom_bar=True)
 
 
 def close_the_window_while_sharing(ladex: str, host_data_dir: str, out: Path) -> None:
-    swipe_away_from_recents(out)
+    close_from_recents(out)
     wait_until(lambda: "keeps sharing in the background" in ladex_log(), "the node to outlive its window")
     time.sleep(SETTLE_SECONDS)
     expect(is_running(), "LADEX stopped after Android closed its window")
