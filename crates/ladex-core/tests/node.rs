@@ -245,3 +245,17 @@ async fn an_endpoint_left_by_a_node_that_died_is_replaced_on_start() {
     assert_ne!(published, stale);
     node.shutdown().await;
 }
+
+#[tokio::test]
+async fn resuming_seeding_takes_up_the_address_the_device_has_now() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = started(dir.path()).await;
+    let address_now = node.state().local_ip();
+    node.state().set_local_ip(Some("10.99.99.99".parse().unwrap()));
+
+    node.pause_seeding(true);
+    node.pause_seeding(false);
+
+    assert_eq!(node.state().local_ip(), address_now);
+    node.shutdown().await;
+}

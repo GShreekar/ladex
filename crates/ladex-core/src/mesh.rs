@@ -185,7 +185,7 @@ impl Intro {
     fn ours(state: &NodeState) -> String {
         let intro = Intro {
             quic_port: state.quic_port,
-            ip: state.local_ip.map(|ip| ip.to_string()).unwrap_or_default(),
+            ip: state.local_ip().map(|ip| ip.to_string()).unwrap_or_default(),
             now_ms: crate::hlc::wall_clock_ms(),
         };
         serde_json::to_string(&intro).expect("an intro always serializes")

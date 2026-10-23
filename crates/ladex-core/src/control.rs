@@ -537,10 +537,10 @@ fn invite(state: &NodeState, permission: Permission) -> Invite {
     });
     let scheme = if is_encrypted(state) { "https" } else { "http" };
     Invite {
-        url: state.local_ip.map(|ip| format!("{scheme}://{ip}:{}", state.http_port)),
+        url: state.local_ip().map(|ip| format!("{scheme}://{ip}:{}", state.http_port)),
         certificate_fingerprint: is_encrypted(state).then(|| tls::format_fingerprint(&state.tls_fingerprint)),
         needs_passphrase: state.passphrase.is_some(),
-        peer_address: state.local_ip.map(|ip| format!("{ip}:{}", state.quic_port)),
+        peer_address: state.local_ip().map(|ip| format!("{ip}:{}", state.quic_port)),
         guest,
     }
 }
@@ -550,7 +550,7 @@ pub(crate) async fn status(state: &NodeState, settings: &Settings) -> Status {
         version: VERSION.to_string(),
         node_id: state.node_id.clone(),
         node_name: state.node_name.clone(),
-        local_ip: state.local_ip,
+        local_ip: state.local_ip(),
         http_port: state.http_port,
         local_http_port: settings.local_http_port,
         quic_port: state.quic_port,

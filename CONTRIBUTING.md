@@ -14,7 +14,7 @@ cd ladex
 cargo build
 ```
 
-The workspace has three crates: `crates/ladex-core` (everything the node does, started through `ladex_core::node::Node::start`), `crates/ladex-cli` (the `ladex` binary: flags, output and the embedded web UI around that call) and `crates/ladex-app` (the Tauri desktop app: a window whose UI reaches the node in the same process through `ladex_core::node::Bridge`). The app needs the platform webview, so it is left out of plain `cargo build` and `cargo test`; see `crates/ladex-app/README.md`. The web UI is in `ui/` (Svelte + TypeScript; `cargo build` builds it through `crates/ladex-cli/build.rs`, so you need Node.js 20 or newer, or set `LADEX_SKIP_UI_BUILD=1` to build without it).
+The workspace has four crates: `crates/ladex-core` (everything the node does, started through `ladex_core::node::Node::start`), `crates/ladex-cli` (the `ladex` binary: flags, output and the embedded web UI around that call), `crates/ladex-app` (the Tauri app for desktop and Android: a window whose UI reaches the node in the same process through `ladex_core::node::Bridge`) and `crates/tauri-plugin-ladex-android` (the app's Kotlin side on Android: multicast lock, Wi-Fi state and the sharing notification). The app and the plugin need the platform webview, so they are left out of plain `cargo build` and `cargo test`; see `crates/ladex-app/README.md`. The web UI is in `ui/` (Svelte + TypeScript; `cargo build` builds it through `crates/ladex-cli/build.rs`, so you need Node.js 20 or newer, or set `LADEX_SKIP_UI_BUILD=1` to build without it).
 
 ## Before you open a pull request
 
@@ -22,8 +22,8 @@ CI runs all of these, so running them first saves a round trip:
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --exclude ladex-app --all-targets -- -D warnings
-cargo test --workspace --exclude ladex-app
+cargo clippy --workspace --exclude ladex-app --exclude tauri-plugin-ladex-android --all-targets -- -D warnings
+cargo test --workspace --exclude ladex-app --exclude tauri-plugin-ladex-android
 (cd ui && npm ci && npm run check && npm test)
 cargo build && for t in data folder restart push cli parity; do node tests/e2e/$t.test.js; done
 ```

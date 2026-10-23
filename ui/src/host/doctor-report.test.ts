@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { formatReport, hasProblem, worstVerdict } from './doctor-report';
+import { formatReport, hasProblem, withDeviceChecks, worstVerdict } from './doctor-report';
 import type { Check } from './preferences-api';
 
 const ok: Check = { name: 'Node', verdict: 'ok', detail: 'laptop' };
@@ -31,5 +31,22 @@ describe('formatReport', () => {
       '[ok     ] Node: laptop',
       '[PROBLEM] Disk: full',
     ]);
+  });
+});
+
+describe('withDeviceChecks', () => {
+  const address: Check = { name: 'Network address', verdict: 'ok', detail: '192.168.1.20' };
+  const wifi: Check = { name: 'Wi-Fi', verdict: 'ok', detail: 'connected' };
+
+  it('puts_the_phone_checks_right_after_the_network_address', () => {
+    expect(withDeviceChecks([ok, address, problem], [wifi])).toEqual([ok, address, wifi, problem]);
+  });
+
+  it('puts_them_first_when_there_is_no_network_address', () => {
+    expect(withDeviceChecks([ok, problem], [wifi])).toEqual([wifi, ok, problem]);
+  });
+
+  it('leaves_the_checks_as_they_are_without_phone_checks', () => {
+    expect(withDeviceChecks([ok, address], [])).toEqual([ok, address]);
   });
 });

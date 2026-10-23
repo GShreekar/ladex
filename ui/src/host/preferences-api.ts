@@ -15,6 +15,8 @@ export interface Preferences {
   auto_accept: AutoAcceptRule;
   // Other nodes kept connected by address, as "ip:port".
   peer_addresses: string[];
+  // On a phone: keeps sharing with the app closed, under a notification.
+  keep_sharing_in_background: boolean;
 }
 
 export interface PreferencesView {
@@ -37,6 +39,7 @@ export interface PreferencesUpdate {
   auto_accept?: AutoAcceptRule;
   // The whole list, as typed; an IP alone uses the default port.
   peer_addresses?: string[];
+  keep_sharing_in_background?: boolean;
 }
 
 export type Verdict = 'ok' | 'warning' | 'problem';

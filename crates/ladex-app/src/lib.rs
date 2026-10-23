@@ -1,5 +1,7 @@
 //! The LADEX app: a window whose UI talks to the node running inside this process, on desktop and Android.
 
+#[cfg(target_os = "android")]
+mod android;
 #[cfg(target_os = "macos")]
 mod cli_link;
 mod desktop;
@@ -11,6 +13,8 @@ mod notify;
 mod paths;
 mod running;
 mod setup;
+#[cfg(any(target_os = "android", test))]
+mod sharing;
 #[cfg(desktop)]
 mod tray;
 
@@ -39,7 +43,7 @@ fn starts_hidden(_app: &AppHandle) -> bool {
     false
 }
 
-fn open_window(app: &AppHandle, url: WebviewUrl) -> tauri::Result<()> {
+pub fn open_window(app: &AppHandle, url: WebviewUrl) -> tauri::Result<()> {
     // Dropped files are handled by the page, which the shell's own drag-and-drop would otherwise hide them from.
     WebviewWindowBuilder::new(app, WINDOW_LABEL, url)
         .title("LADEX")
@@ -96,7 +100,7 @@ fn start(app: &AppHandle) -> tauri::Result<()> {
 }
 
 #[cfg(desktop)]
-fn with_desktop_plugins(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
+fn with_platform_plugins(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
     builder
         // Opening the app again brings the running one forward instead of starting a second window.
         .plugin(tauri_plugin_single_instance::init(|app, _arguments, _working_dir| tray::show_main_window(app)))
@@ -105,7 +109,9 @@ fn with_desktop_plugins(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<t
 }
 
 #[cfg(mobile)]
-fn with_desktop_plugins(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
+fn with_platform_plugins(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
+    #[cfg(target_os = "android")]
+    let builder = builder.plugin(tauri_plugin_ladex_android::init());
     builder
 }
 
@@ -124,7 +130,7 @@ fn set_up_desktop(app: &AppHandle) {
 pub fn run() {
     logging::init();
 
-    let app = with_desktop_plugins(tauri::Builder::default())
+    let app = with_platform_plugins(tauri::Builder::default())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
@@ -148,6 +154,8 @@ pub fn run() {
             #[cfg(desktop)]
             desktop::ladex_set_launch_at_login,
             desktop::ladex_restart_node,
+            #[cfg(target_os = "android")]
+            android::ladex_device_checks,
             setup::ladex_setup_state,
             setup::ladex_suggest_passphrase,
             setup::ladex_setup_finish,
@@ -158,7 +166,10 @@ pub fn run() {
             app.manage(paths);
             #[cfg(desktop)]
             set_up_desktop(app.handle());
-            Ok(start(app.handle())?)
+            start(app.handle())?;
+            #[cfg(target_os = "android")]
+            android::start(app.handle());
+            Ok(())
         })
         .build(tauri::generate_context!())
         .expect("could not build the LADEX app");
@@ -170,9 +181,21 @@ pub fn run() {
         }
         #[cfg(target_os = "macos")]
         RunEvent::Reopen { .. } => tray::show_main_window(app),
-        RunEvent::ExitRequested { api, .. } => shut_down_node(app, &api),
+        RunEvent::ExitRequested { code, api, .. } => on_exit_requested(app, code, &api),
         _ => {}
     });
+}
+
+// Closing the window (no code) on Android keeps the node while it shares outside the app; anything else stops it.
+#[cfg_attr(not(target_os = "android"), allow(unused_variables))]
+fn on_exit_requested(app: &AppHandle, code: Option<i32>, api: &tauri::ExitRequestApi) {
+    #[cfg(target_os = "android")]
+    if code.is_none() && android::keep_running_without_window(app) {
+        tracing::info!("Android closed the window; LADEX keeps sharing in the background");
+        api.prevent_exit();
+        return;
+    }
+    shut_down_node(app, api);
 }
 
 // The node keeps sharing while the window is closed; quitting is done from the tray.

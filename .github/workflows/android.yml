@@ -145,9 +145,10 @@ jobs:
         run: rm -f "$RUNNER_TEMP/ladex-release.jks" crates/ladex-app/gen/android/keystore.properties
 
   # The x86_64 APK runs on the emulator: it must start, finish the wizard and join a node by address (the 8b gate,
-  # short of a real phone), so a broken build never reaches a phone or a release.
+  # short of a real phone), then report its network, share in the background, outlive a window Android closes and
+  # quit from its notification (8c), so a broken build never reaches a phone or a release.
   smoke-test:
-    name: Starts and joins on an emulator
+    name: Starts, joins and shares in the background on an emulator
     needs: apk
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -191,6 +192,7 @@ jobs:
           script: |
             .github/scripts/android-smoke-test.sh apk/ladex-v*-android-x86_64.apk smoke
             python3 .github/scripts/android-join-test.py cli/ladex "$HOST_DATA_DIR" 18080 ci-join-test-passphrase smoke
+            python3 .github/scripts/android-background-test.py cli/ladex "$HOST_DATA_DIR" smoke
 
       - name: Keep the other node's log
         if: always()

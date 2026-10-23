@@ -39,6 +39,23 @@ impl AppNode {
     pub fn take_handle(&self) -> Option<NodeHandle> {
         self.running.read().unwrap().handle.lock().unwrap().take()
     }
+
+    /// The running node's shared state; None once it has been stopped.
+    #[cfg(target_os = "android")]
+    pub fn state(&self) -> Option<ladex_core::NodeState> {
+        self.running.read().unwrap().handle.lock().unwrap().as_ref().map(|node| node.state().clone())
+    }
+
+    /// Pauses or resumes seeding; while it is not paused, the node also takes up any new address the device has.
+    #[cfg(target_os = "android")]
+    pub fn keep_seeding_in_step(&self, is_paused: bool) {
+        if let Some(node) = self.running.read().unwrap().handle.lock().unwrap().as_ref() {
+            node.pause_seeding(is_paused);
+            if !is_paused {
+                node.refresh_address();
+            }
+        }
+    }
 }
 
 pub enum StartFailure {

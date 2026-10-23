@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -110,15 +111,32 @@ impl DiscoveryService {
         Ok(Self { socket: Arc::new(socket), discovery_port })
     }
 
-    /// Broadcasts `packet` every `ANNOUNCE_INTERVAL`, forever.
-    pub async fn announce_loop(&self, packet: AnnouncePacket) -> anyhow::Result<()> {
+    /// Broadcasts `packet` every `ANNOUNCE_INTERVAL`, forever, except while seeding is paused.
+    pub async fn announce_loop(&self, packet: AnnouncePacket, is_seeding_paused: &AtomicBool) -> anyhow::Result<()> {
         let payload = serde_json::to_vec(&packet)?;
         let target = SocketAddrV4::new(MULTICAST_ADDR, self.discovery_port);
+        let mut was_paused = false;
         loop {
-            if let Err(e) = self.socket.send_to(&payload, target).await {
-                tracing::warn!("Discovery announce failed: {e}");
+            let is_paused = is_seeding_paused.load(Ordering::Relaxed);
+            if was_paused && !is_paused {
+                self.rejoin_group();
+            }
+            was_paused = is_paused;
+            if !is_paused {
+                if let Err(e) = self.socket.send_to(&payload, target).await {
+                    tracing::warn!("Discovery announce failed: {e}");
+                }
             }
             tokio::time::sleep(ANNOUNCE_INTERVAL).await;
+        }
+    }
+
+    // The group was joined on the network the device was on then; back on a network, it is joined there.
+    fn rejoin_group(&self) {
+        let _ = self.socket.leave_multicast_v4(MULTICAST_ADDR, Ipv4Addr::UNSPECIFIED);
+        match self.socket.join_multicast_v4(MULTICAST_ADDR, Ipv4Addr::UNSPECIFIED) {
+            Ok(()) => tracing::info!("Discovery: listening again on the network this device is back on"),
+            Err(e) => tracing::warn!("Discovery: could not listen again after a pause: {e}"),
         }
     }
 

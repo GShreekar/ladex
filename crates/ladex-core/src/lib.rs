@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 #[cfg(any(test, feature = "test-support"))]
 use std::time::Duration;
@@ -110,6 +110,9 @@ pub struct NodeState {
     pub store: Arc<store::Store>,
     pub transfers: Arc<transfer::Transfers>,
 
+    /// Set while the device is away from its local network: other nodes get no chunks and discovery stays quiet.
+    pub is_seeding_paused: Arc<AtomicBool>,
+
     /// Files being sent to one device, outside the catalog (see push.rs).
     pub pushes: Arc<push::Pushes>,
 
@@ -132,8 +135,8 @@ pub struct NodeState {
     /// This node's public listening port, told to peers so they can redial it.
     pub http_port: u16,
 
-    /// This node's best-guess LAN IPv4, told to peers so they can redial it.
-    pub local_ip: Option<IpAddr>,
+    /// This node's best-guess LAN IPv4, told to peers so they can redial it; see `local_ip()`.
+    pub local_ip: Arc<std::sync::RwLock<Option<IpAddr>>>,
 
     /// This machine's hostname, shown to peers.
     pub node_name: String,
@@ -148,6 +151,15 @@ pub struct NodeState {
 impl NodeState {
     pub fn next_connection_id(&self) -> u64 {
         self.connection_counter.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// This node's address on the local network now; it changes when the device moves to another network.
+    pub fn local_ip(&self) -> Option<IpAddr> {
+        *self.local_ip.read().unwrap()
+    }
+
+    pub fn set_local_ip(&self, ip: Option<IpAddr>) {
+        *self.local_ip.write().unwrap() = ip;
     }
 
     /// A node with no network, for unit tests.
@@ -208,6 +220,7 @@ impl NodeState {
                 stream_stall_timeout: Duration::from_secs(10),
                 upload_slots: transfer::UPLOAD_SLOTS,
             })),
+            is_seeding_paused: Arc::new(AtomicBool::new(false)),
             pushes: Arc::new(push::Pushes::default()),
             catalog: Arc::new(catalog::shared::SharedCatalog::open(&data_dir, state::MAX_CATALOG_ENTRIES).unwrap()),
             catalog_changes: Arc::new(tokio::sync::watch::channel(0).0),
@@ -216,7 +229,7 @@ impl NodeState {
             connection_counter: Arc::new(AtomicU64::new(1)),
             clock_alert_at: Arc::new(Mutex::new(None)),
             http_port: 0,
-            local_ip: None,
+            local_ip: Default::default(),
             node_name: "test".to_string(),
             preferences: Arc::new(preferences::PreferencesStore::open(&data_dir)),
             started_with: Arc::new(control::Settings {

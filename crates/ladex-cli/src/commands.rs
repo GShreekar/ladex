@@ -313,6 +313,8 @@ fn settings_update(current: Preferences, change: SettingsChange) -> anyhow::Resu
         storage_limit_gib: change.storage_limit_gb,
         auto_accept: rule,
         peer_addresses,
+        // A phone-only choice; there is no command line on a phone.
+        keep_sharing_in_background: None,
     })
 }
 

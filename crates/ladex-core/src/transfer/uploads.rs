@@ -56,6 +56,7 @@ impl Queue {
 #[derive(Clone)]
 pub struct UploadSlots {
     queue: Arc<Mutex<Queue>>,
+    capacity: usize,
 }
 
 /// One running upload; dropping it frees the slot for the next peer in line.
@@ -66,7 +67,7 @@ pub struct Slot {
 impl UploadSlots {
     pub fn new(capacity: usize) -> Self {
         let queue = Queue { free: capacity, waiting: HashMap::new(), turn: VecDeque::new() };
-        Self { queue: Arc::new(Mutex::new(queue)) }
+        Self { queue: Arc::new(Mutex::new(queue)), capacity }
     }
 
     /// Waits for a slot; peers with several requests waiting take turns with the others.
@@ -86,6 +87,11 @@ impl UploadSlots {
 
     pub fn free(&self) -> usize {
         self.queue.lock().unwrap().free
+    }
+
+    /// How many uploads are running right now.
+    pub fn in_use(&self) -> usize {
+        self.capacity - self.free()
     }
 }
 
@@ -121,6 +127,16 @@ mod tests {
         let _second = slots.acquire(&node("b")).await;
 
         assert!(!is_granted(&slots, &node("c")).await);
+    }
+
+    #[tokio::test]
+    async fn a_running_upload_is_counted_until_it_ends() {
+        let slots = UploadSlots::new(2);
+        let running = slots.acquire(&node("a")).await;
+        assert_eq!(slots.in_use(), 1);
+
+        drop(running);
+        assert_eq!(slots.in_use(), 0);
     }
 
     #[tokio::test(start_paused = true)]

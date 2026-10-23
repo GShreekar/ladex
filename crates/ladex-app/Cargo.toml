@@ -35,3 +35,8 @@ tauri-plugin-single-instance = "2"
 # Android drops a process's stdout, so logs go to logcat (`adb logcat -s LADEX`).
 [target.'cfg(target_os = "android")'.dependencies]
 tracing-logcat = "0.1"
+tauri-plugin-ladex-android = { path = "../tauri-plugin-ladex-android" }
+tokio.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

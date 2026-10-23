@@ -78,6 +78,8 @@ pub struct Preferences {
     pub auto_accept: AutoAccept,
     /// Other nodes this one keeps connected by address, for networks where discovery cannot find them.
     pub peer_addresses: Vec<SocketAddr>,
+    /// On a phone: keep sharing after the app is closed, under a notification. Otherwise it shares while open, or transferring.
+    pub keep_sharing_in_background: bool,
 }
 
 impl Default for Preferences {
@@ -88,6 +90,7 @@ impl Default for Preferences {
             storage_limit_gib: DEFAULT_STORAGE_LIMIT_GIB,
             auto_accept: AutoAccept::default(),
             peer_addresses: Vec::new(),
+            keep_sharing_in_background: false,
         }
     }
 }
@@ -109,6 +112,7 @@ pub struct Update {
     pub auto_accept: Option<AutoAccept>,
     /// The whole list, as typed: `192.168.1.20:8080`, or just the IP for the default port.
     pub peer_addresses: Option<Vec<String>>,
+    pub keep_sharing_in_background: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -183,6 +187,9 @@ impl PreferencesStore {
         }
         if let Some(addresses) = &update.peer_addresses {
             next.peer_addresses = checked_peer_addresses(addresses)?;
+        }
+        if let Some(keep_sharing) = update.keep_sharing_in_background {
+            next.keep_sharing_in_background = keep_sharing;
         }
         self.save(&next)?;
         *self.current.write().unwrap() = next.clone();
@@ -300,7 +307,7 @@ pub fn view(state: &NodeState) -> View {
         store_used_bytes: state.store.used_bytes(),
         disk_free_bytes: fs4::available_space(&data_dir).ok(),
         platform: if cfg!(windows) { "windows" } else { "unix" }.to_string(),
-        this_address: state.local_ip.map(|ip| SocketAddr::new(ip, state.quic_port).to_string()),
+        this_address: state.local_ip().map(|ip| SocketAddr::new(ip, state.quic_port).to_string()),
         data_dir,
     }
 }
@@ -378,6 +385,15 @@ mod tests {
         let (dir, _store) = store();
         std::fs::write(dir.path().join(FILE_NAME), br#"{"is_setup_done":true,"storage_limit_gib":5}"#).unwrap();
         assert!(load(dir.path()).peer_addresses.is_empty());
+    }
+
+    #[test]
+    fn sharing_in_the_background_is_off_until_chosen_and_remembered_once_it_is() {
+        let (dir, store) = store();
+        assert!(!store.get().keep_sharing_in_background);
+
+        store.update(&Update { keep_sharing_in_background: Some(true), ..Default::default() }, 0).unwrap();
+        assert!(PreferencesStore::open(dir.path()).get().keep_sharing_in_background);
     }
 
     #[test]

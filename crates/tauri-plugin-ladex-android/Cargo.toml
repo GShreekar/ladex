@@ -1,0 +1,21 @@
+[package]
+name = "tauri-plugin-ladex-android"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "LADEX on Android: the multicast lock, the network the phone is on, and the notification that keeps it sharing"
+# Tauri finds the plugin's Kotlin project through this name.
+links = "tauri-plugin-ladex-android"
+
+[build-dependencies]
+tauri-plugin = { version = "2", features = ["build"] }
+
+# Everything the plugin does is Android's; elsewhere the crate is empty.
+[target.'cfg(target_os = "android")'.dependencies]
+tauri = "2"
+jni = "0.21"
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
