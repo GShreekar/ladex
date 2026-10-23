@@ -9,7 +9,7 @@ export interface Toast {
   id: number;
   level: NoticeLevel;
   text: string;
-  action?: ToastAction;
+  actions: ToastAction[];
 }
 
 const DEFAULT_DURATION_MS = 4000;
@@ -19,10 +19,12 @@ export class Toasts {
   items = $state<Toast[]>([]);
   private nextId = 1;
 
-  show(level: NoticeLevel, text: string, action?: ToastAction): void {
-    const toast: Toast = { id: this.nextId++, level, text, action };
+  show(level: NoticeLevel, text: string, ...actions: ToastAction[]): void {
+    const toast: Toast = { id: this.nextId++, level, text, actions };
     this.items.push(toast);
-    const duration = level === 'error' || level === 'warning' ? ERROR_DURATION_MS : DEFAULT_DURATION_MS;
+    // A toast with something to do, like an error, stays long enough to be acted on.
+    const isLingering = level === 'error' || level === 'warning' || actions.length > 0;
+    const duration = isLingering ? ERROR_DURATION_MS : DEFAULT_DURATION_MS;
     setTimeout(() => this.dismiss(toast.id), duration);
   }
 

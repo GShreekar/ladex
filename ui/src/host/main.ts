@@ -6,6 +6,7 @@ import type { NodeTransport } from '../client/transport';
 import type { LadexClient } from '../client/types';
 import { contextFor } from '../state/context';
 import { isMobileApp, tauriDesktop, tauriSettings, tauriSetup } from '../desktop/desktop';
+import { tauriPhone } from '../desktop/phone';
 import { AutoAccept } from '../state/auto-accept';
 import { Notifier } from '../state/notifier';
 import { Room } from '../state/room.svelte';
@@ -48,7 +49,8 @@ async function showWizardIfNeeded(isMobile: boolean): Promise<boolean> {
   if (!isShownByTheApp()) return false;
   const state = await tauriSetup.state();
   if (!state.isNeeded) return false;
-  mount(SetupWizard, { target, props: { setup: tauriSetup, pickFolder: tauriSettings.pickFolder, state, isMobile } });
+  const phone = isMobile ? tauriPhone : null;
+  mount(SetupWizard, { target, props: { setup: tauriSetup, pickFolder: tauriSettings.pickFolder, phone, state, isMobile } });
   return true;
 }
 
@@ -72,6 +74,7 @@ if (!(await showWizardIfNeeded(isMobile))) {
     preferencesApi,
     desktop: isShownByTheApp() ? tauriSettings : null,
     isMobile,
+    phone: isMobile ? tauriPhone : null,
   };
   mount(App, { target, context: contextFor(context) });
 }

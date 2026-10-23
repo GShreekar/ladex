@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
-description = "LADEX on Android: the multicast lock, the network the phone is on, and the notification that keeps it sharing"
+description = "LADEX on Android: the multicast lock, the network, the sharing notification, the share sheet and the save folder"
 # Tauri finds the plugin's Kotlin project through this name.
 links = "tauri-plugin-ladex-android"
 

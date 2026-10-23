@@ -4,7 +4,7 @@
   import { useApp } from '../../state/context';
   import type { Transfer, TransferStatus } from '../../state/transfers.svelte';
 
-  const { transfers } = useApp();
+  const { room, transfers } = useApp();
 
   const STATUS_LABELS: Record<TransferStatus, string> = {
     queued: 'Waiting',
@@ -48,7 +48,7 @@
   {/if}
 </div>
 
-{#if transfers.items.length === 0}
+{#if transfers.items.length === 0 && room.saved.length === 0}
   <div class="card empty">
     <Icon name="swap" size={28} />
     <p>Nothing is being sent right now.</p>
@@ -100,6 +100,25 @@
             </div>
           </div>
           <span class="badge {STATUS_BADGES[transfer.status] ?? ''}">{STATUS_LABELS[transfer.status]}</span>
+        </div>
+      </div>
+    {/each}
+  </section>
+{/if}
+
+{#if room.saved.length > 0}
+  <section>
+    <h2>Saved on this phone</h2>
+    {#each room.saved as file (file.id)}
+      <div class="card row">
+        <div class="line">
+          <Icon name="file" size={22} />
+          <div class="info">
+            <div class="truncate"><strong>{file.name}</strong></div>
+            <div class="small faint truncate">{file.shownAs}</div>
+          </div>
+          <button class="btn btn-small" onclick={() => room.openSaved(file)}>Open</button>
+          <button class="btn btn-small" onclick={() => room.shareSaved(file)}>Share</button>
         </div>
       </div>
     {/each}

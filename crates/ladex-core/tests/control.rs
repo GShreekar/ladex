@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use ladex_core::control::server::{self, Endpoint};
-use ladex_core::control::{Event, Reply, Request, Settings, VERSION};
+use ladex_core::control::{self, Event, Events, OpenedFile, Reply, Request, Settings, VERSION};
 use ladex_core::guest::uploads::UploadState;
 use ladex_core::guest::Permission;
 use ladex_core::saved_passphrase;
@@ -13,6 +13,7 @@ use ladex_core::trust::TrustedVia;
 use ladex_core::types::FileView;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
 
 /// Opens a node's control socket the way the node does at start; returns where commands reach it.
 async fn control_of(node: &NodeHandle, data_dir: &Path) -> Endpoint {
@@ -71,6 +72,47 @@ async fn a_file_on_disk_is_shared_and_another_node_saves_it_intact() {
     assert_eq!((shared.name.as_str(), shared.mime_type.as_str()), ("report.pdf", "application/pdf"));
     assert_eq!(saved, Reply::Saved { path: dir.path().canonicalize().unwrap().join("out/report.pdf"), file: saved_file(&saved) });
     assert_eq!(std::fs::read(dir.path().join("out/report.pdf")).unwrap(), three_chunks());
+}
+
+fn opened(path: &Path, name: &str, mime_type: &str) -> OpenedFile {
+    let file = std::fs::File::open(path).unwrap();
+    let size = file.metadata().unwrap().len();
+    OpenedFile { file, name: name.into(), mime_type: mime_type.into(), size }
+}
+
+// An app on a phone hands over files it opened from another app, named by that app rather than by a path.
+#[tokio::test]
+async fn a_file_handed_over_open_is_shared_under_its_given_name_and_another_node_saves_it() {
+    let nodes = spawn_mesh(2, None).await;
+    let dir = tempfile::tempdir().unwrap();
+    let receiver = control_of(&nodes[1], &dir.path().join("b")).await;
+    let source = write(&dir.path().join("1000000123"), &three_chunks());
+    let (sender, _events) = mpsc::channel(16);
+
+    let shared = control::share_opened(&nodes[0].state, vec![opened(&source, "beach.jpg", "image/jpeg")], &Events::new(sender))
+        .await
+        .unwrap()
+        .remove(0);
+    assert!(eventually(async || !nodes[1].hosts_of(&shared.id).await.is_empty()).await);
+    ask(&receiver, Request::Get { file: "beach.jpg".into(), into: dir.path().join("out") }).await.unwrap();
+
+    assert_eq!((shared.name.as_str(), shared.mime_type.as_str()), ("beach.jpg", "image/jpeg"));
+    assert_eq!(std::fs::read(dir.path().join("out/beach.jpg")).unwrap(), three_chunks());
+}
+
+#[tokio::test]
+async fn a_name_and_type_from_another_app_are_held_to_the_network_rules() {
+    let node = &spawn_mesh(1, None).await[0];
+    let dir = tempfile::tempdir().unwrap();
+    let source = write(&dir.path().join("source"), b"note");
+    let (sender, _events) = mpsc::channel(16);
+
+    let shared = control::share_opened(&node.state, vec![opened(&source, "../secret.txt", "not a type")], &Events::new(sender))
+        .await
+        .unwrap()
+        .remove(0);
+
+    assert_eq!((shared.name.as_str(), shared.mime_type.as_str()), (".._secret.txt", "application/octet-stream"));
 }
 
 fn saved_file(reply: &Reply) -> FileView {

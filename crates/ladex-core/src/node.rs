@@ -22,7 +22,7 @@ pub mod lock;
 pub mod web;
 
 pub use bridge::{Bridge, Reply, SocketEvent};
-pub use local::{LinkError, LocalLink, LocalResponse, LocalUpload, SavedFile, SocketReader, SocketWriter};
+pub use local::{Download, LinkError, LocalLink, LocalResponse, LocalUpload, SavedFile, SocketReader, SocketWriter};
 pub use lock::DataDirLock;
 pub use web::UiAssets;
 

@@ -130,6 +130,20 @@ async fn sources_at(paths: &[PathBuf]) -> anyhow::Result<Vec<Source>> {
     tokio::task::spawn_blocking(move || paths.iter().map(|path| source_at(path)).collect()).await?
 }
 
+/// A file the platform handed over already open, such as one shared into the Android app from another app.
+pub struct OpenedFile {
+    pub file: File,
+    pub name: String,
+    pub mime_type: String,
+    pub size: u64,
+}
+
+fn open_at(path: &Path) -> anyhow::Result<OpenedFile> {
+    let file = File::open(path).with_context(|| format!("could not open {}", path.display()))?;
+    let size = file.metadata()?.len();
+    Ok(OpenedFile { file, name: name_of(path), mime_type: mime_type_of(path), size })
+}
+
 /// Copies a file on disk into the store under `id`; returns its manifest root. Nothing is kept if it fails.
 pub(super) async fn import(
     state: &NodeState,
@@ -138,15 +152,24 @@ pub(super) async fn import(
     origin: Origin,
     progress: &mut Progress<'_>,
 ) -> anyhow::Result<String> {
-    let file = Arc::new(File::open(path).with_context(|| format!("could not open {}", path.display()))?);
-    let size = file.metadata()?.len();
-    state::make_room(state, size).await;
-    let blob = state.store.create_with(id, size, origin).map_err(|e| anyhow!("{e}"))?;
-    let imported = copy_into(&blob, file, &name_of(path), progress).await;
+    let opened = open_at(path)?;
+    import_opened(state, opened, id, origin, progress).await.with_context(|| format!("could not share {}", path.display()))
+}
+
+async fn import_opened(
+    state: &NodeState,
+    opened: OpenedFile,
+    id: &str,
+    origin: Origin,
+    progress: &mut Progress<'_>,
+) -> anyhow::Result<String> {
+    state::make_room(state, opened.size).await;
+    let blob = state.store.create_with(id, opened.size, origin).map_err(|e| anyhow!("{e}"))?;
+    let imported = copy_into(&blob, Arc::new(opened.file), &opened.name, progress).await;
     if imported.is_err() {
         state.store.remove(id);
     }
-    imported.with_context(|| format!("could not share {}", path.display()))
+    imported
 }
 
 async fn copy_into(blob: &Blob, file: Arc<File>, name: &str, progress: &mut Progress<'_>) -> anyhow::Result<String> {
@@ -164,13 +187,24 @@ async fn copy_into(blob: &Blob, file: Arc<File>, name: &str, progress: &mut Prog
 }
 
 async fn share_file(state: &NodeState, file: &LocalFile, parent: Option<&str>, progress: &mut Progress<'_>) -> anyhow::Result<FileView> {
+    let opened = open_at(&file.path)?;
+    share_opened_file(state, opened, parent, progress).await.with_context(|| format!("could not share {}", file.path.display()))
+}
+
+async fn share_opened_file(
+    state: &NodeState,
+    opened: OpenedFile,
+    parent: Option<&str>,
+    progress: &mut Progress<'_>,
+) -> anyhow::Result<FileView> {
     let id = new_id("file");
-    let manifest_root = import(state, &file.path, &id, Origin::Published, progress).await?;
+    let (name, mime_type, size) = (opened.name.clone(), opened.mime_type.clone(), opened.size);
+    let manifest_root = import_opened(state, opened, &id, Origin::Published, progress).await?;
     let entry = CatalogEntry {
         file_id: id.clone(),
-        name: name_of(&file.path),
-        size: file.size,
-        mime_type: mime_type_of(&file.path),
+        name,
+        size,
+        mime_type,
         created_at_ms: hlc::wall_clock_ms(),
         manifest_root,
         uploader_id: SHARED_BY_THIS_NODE.to_string(),
@@ -180,7 +214,7 @@ async fn share_file(state: &NodeState, file: &LocalFile, parent: Option<&str>, p
     if listed.is_err() {
         state.store.remove(&id);
     }
-    listed.map_err(|refusal| anyhow!("could not list {}: {refusal}", file.path.display()))
+    listed.map_err(|refusal| anyhow!("could not list it: {refusal}"))
 }
 
 async fn share_folder(state: &NodeState, dir: &Path, files: &[LocalFile], progress: &mut Progress<'_>) -> anyhow::Result<FileView> {
@@ -221,6 +255,22 @@ pub(super) async fn share_paths(state: &NodeState, paths: &[PathBuf], events: &E
             Source::Folder { dir, files } => share_folder(state, dir, files, &mut progress).await?,
         };
         tracing::info!("Control: shared {} ({} bytes) from this machine", view.name, source.size());
+        shared.push(view);
+    }
+    Ok(shared)
+}
+
+/// Shares files that were handed over already open with everyone, each as a file, in the order given.
+pub(super) async fn share_opened(state: &NodeState, files: Vec<OpenedFile>, events: &Events) -> anyhow::Result<Vec<FileView>> {
+    let mut progress = Progress::new(events, files.iter().map(|file| file.size).sum());
+    let mut shared = Vec::new();
+    for mut file in files {
+        // The names come from another app, so they are held to the same rules as names from the network.
+        file.name = validate::sanitize_file_name(&file.name);
+        file.mime_type = validate::sanitize_mime(&file.mime_type);
+        let name = file.name.clone();
+        let view = share_opened_file(state, file, None, &mut progress).await.with_context(|| format!("could not share {name}"))?;
+        tracing::info!("Control: shared {} ({} bytes) handed over by another app", view.name, view.size);
         shared.push(view);
     }
     Ok(shared)

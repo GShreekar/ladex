@@ -29,8 +29,19 @@ impl NetworkReport {
     }
 }
 
+/// A file another app shared into LADEX, waiting for the person to share it on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IncomingFile {
+    pub id: String,
+    pub name: String,
+    /// Unknown until the file is opened, for some apps.
+    pub size: Option<u64>,
+    pub mime_type: String,
+}
+
 /// Something that happened on the phone.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum DeviceEvent {
     Network(NetworkReport),
@@ -38,6 +49,14 @@ pub enum DeviceEvent {
     Shown,
     /// The Stop button in the sharing notification.
     Stop,
+    /// The files shared into the app from another app now; empty once they are shared or set aside.
+    Incoming {
+        files: Vec<IncomingFile>,
+    },
+    /// The folder picker closed, with the folder's name, or none if nothing was chosen.
+    SaveFolder {
+        name: Option<String>,
+    },
 }
 
 /// What the phone should do now.
@@ -294,6 +313,22 @@ mod tests {
     #[test]
     fn the_app_coming_on_screen_is_read() {
         assert_eq!(serde_json::from_str::<DeviceEvent>(r#"{"kind":"shown"}"#).unwrap(), DeviceEvent::Shown);
+    }
+
+    #[test]
+    fn files_shared_in_from_another_app_are_read_with_or_without_a_size() {
+        let json = r#"{"kind":"incoming","files":[{"id":"share1-0","name":"beach.jpg","size":2048,"mimeType":"image/jpeg"},
+            {"id":"share1-1","name":"voice.ogg","size":null,"mimeType":"audio/ogg"}]}"#;
+        let event: DeviceEvent = serde_json::from_str(json).unwrap();
+        let DeviceEvent::Incoming { files } = event else { panic!("expected incoming files, got {event:?}") };
+        assert_eq!((files[0].name.as_str(), files[0].size), ("beach.jpg", Some(2048)));
+        assert_eq!((files[1].mime_type.as_str(), files[1].size), ("audio/ogg", None));
+    }
+
+    #[test]
+    fn a_folder_picker_closed_without_a_choice_is_read() {
+        let event: DeviceEvent = serde_json::from_str(r#"{"kind":"saveFolder","name":null}"#).unwrap();
+        assert_eq!(event, DeviceEvent::SaveFolder { name: None });
     }
 
     #[test]

@@ -98,11 +98,20 @@ export interface FileUploadRequest extends UploadRequest {
 
 export type UploadOutcome = 'shared' | 'awaiting-approval' | 'offered';
 
+/** A file the app wrote to disk itself. */
+export interface SavedDownload {
+  // Where it went, in words fit to show.
+  shownAs: string;
+  // On a phone the file can be handed to other apps: opened in one, or shared onward.
+  open?: () => Promise<void>;
+  shareOnward?: () => Promise<void>;
+}
+
 export interface DownloadTicket {
   url: string;
   filename: string;
-  // Set when the client writes the file to disk itself; resolves to where it went.
-  saveToDisk?: () => Promise<string>;
+  // Set when the client writes the file to disk itself.
+  saveToDisk?: () => Promise<SavedDownload>;
 }
 
 /** Why a transfer stopped, in words fit for a toast. */
