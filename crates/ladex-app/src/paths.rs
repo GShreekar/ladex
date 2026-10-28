@@ -22,14 +22,12 @@ impl AppPaths {
         })
     }
 
-    // A phone app may only write inside its own storage until the person grants it a folder.
+    // Until the person chooses a folder, received files stay in the app's own storage, in the folder its FileProvider
+    // lends to other apps (`received`, under Android's files directory, which is the node's data folder).
     #[cfg(mobile)]
     pub fn resolve(app: &AppHandle) -> tauri::Result<Self> {
         let app_data = app.path().app_data_dir()?;
-        Ok(Self {
-            data_dir: app_data.join("files"),
-            certificate_dir: app_data.clone(),
-            default_downloads: Some(app_data.join("Downloads")),
-        })
+        let data_dir = app_data.join("files");
+        Ok(Self { default_downloads: Some(data_dir.join("received")), data_dir, certificate_dir: app_data })
     }
 }

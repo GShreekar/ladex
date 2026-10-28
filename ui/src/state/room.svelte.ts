@@ -7,6 +7,7 @@ import type {
   DownloadTicket,
   IncomingOffer,
   LadexClient,
+  SavedDownload,
   SelfInfo,
   SharedFile,
 } from '../client/types';
@@ -14,7 +15,13 @@ import { TransferError } from '../client/types';
 import { saveViaBrowser } from './save';
 import type { AutoAccept } from './auto-accept';
 import type { Notifier } from './notifier';
-import type { Toasts } from './toasts.svelte';
+import type { ToastAction, Toasts } from './toasts.svelte';
+
+/** A file saved in this visit that can be handed to another app: one saved on a phone. */
+export interface SavedFile extends SavedDownload {
+  id: number;
+  name: string;
+}
 
 /** What this page knows about the room, kept current from the client's events. */
 export class Room {
@@ -25,10 +32,13 @@ export class Room {
   messages = $state<ChatMessage[]>([]);
   offers = $state<IncomingOffer[]>([]);
   hasNoPeersWarning = $state(false);
+  // Newest first.
+  saved = $state<SavedFile[]>([]);
   // Copied from the client, which learns them from the node only after the page has drawn its navigation.
   capabilities = $state() as Capabilities;
 
   private stopListening: () => void;
+  private nextSavedId = 1;
 
   constructor(
     readonly client: LadexClient,
@@ -84,9 +94,31 @@ export class Room {
       return;
     }
     this.toasts.show('info', `Saving ${ticket.filename}…`);
-    const savedAt = await ticket.saveToDisk();
-    this.toasts.show('success', `Saved to ${savedAt}`);
+    const saved = await ticket.saveToDisk();
+    const actions: ToastAction[] = [];
+    if (saved.open && saved.shareOnward) {
+      const file: SavedFile = { ...saved, id: this.nextSavedId++, name: ticket.filename };
+      this.saved.unshift(file);
+      actions.push({ label: 'Open', run: () => void this.openSaved(file) }, { label: 'Share', run: () => void this.shareSaved(file) });
+    }
+    this.toasts.show('success', `Saved to ${saved.shownAs}`, ...actions);
     this.notifier?.downloadSaved(ticket.filename);
+  }
+
+  async openSaved(file: SavedFile): Promise<void> {
+    await this.handOver(file.open, `Could not open ${file.name}.`);
+  }
+
+  async shareSaved(file: SavedFile): Promise<void> {
+    await this.handOver(file.shareOnward, `Could not share ${file.name}.`);
+  }
+
+  private async handOver(action: (() => Promise<void>) | undefined, fallback: string): Promise<void> {
+    try {
+      await action?.();
+    } catch (error) {
+      this.toasts.show('error', error instanceof TransferError ? error.message : fallback);
+    }
   }
 
   // A file the person's rules accept is saved at once; any other is put to them.

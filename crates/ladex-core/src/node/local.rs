@@ -14,7 +14,7 @@ use hyper::header::{HeaderName, HeaderValue};
 use hyper::{HeaderMap, Method, Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::fs;
-use tokio::io::{AsyncWriteExt, DuplexStream};
+use tokio::io::{AsyncWrite, AsyncWriteExt, DuplexStream};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -88,6 +88,26 @@ pub struct SavedFile {
     pub size_bytes: u64,
 }
 
+/// A file or folder archive the node has begun to send, to be written wherever the caller chooses.
+pub struct Download {
+    body: Incoming,
+}
+
+impl Download {
+    /// Writes the whole download into `file`; returns how many bytes were written. On failure the caller removes what it made.
+    pub async fn write_to(mut self, file: &mut (impl AsyncWrite + Unpin), mut on_progress: impl FnMut(u64)) -> Result<u64, LinkError> {
+        let mut written: u64 = 0;
+        while let Some(frame) = self.body.frame().await {
+            let Ok(data) = frame.map_err(broken)?.into_data() else { continue };
+            file.write_all(&data).await?;
+            written += data.len() as u64;
+            on_progress(written);
+        }
+        file.flush().await?;
+        Ok(written)
+    }
+}
+
 /// The way the app's window talks to its node; every request goes through the same handlers a browser's would.
 #[derive(Clone)]
 pub struct LocalLink {
@@ -131,41 +151,36 @@ impl LocalLink {
         LocalUpload { pieces: Mutex::new(Some(pieces)), answer: Mutex::new(Some(answer)) }
     }
 
-    /// Fetches a file or folder archive from the node and writes it into `directory` under a name that is not taken yet.
-    pub async fn save_download(
-        &self,
-        path: &str,
-        directory: &Path,
-        file_name: &str,
-        mut on_progress: impl FnMut(u64),
-    ) -> Result<SavedFile, LinkError> {
+    /// Asks the node for a file or folder archive; the answer is checked before anything is written anywhere.
+    pub async fn start_download(&self, path: &str) -> Result<Download, LinkError> {
         let response = self.send(Method::GET, path, &[], Empty::<Bytes>::new()).await?;
         if response.status() != StatusCode::OK {
             let status = response.status().as_u16();
             let body = response.into_body().collect().await.map_err(broken)?.to_bytes();
             return Err(refusal(status, &body));
         }
+        Ok(Download { body: response.into_body() })
+    }
 
+    /// Fetches a file or folder archive from the node and writes it into `directory` under a name that is not taken yet.
+    pub async fn save_download(
+        &self,
+        path: &str,
+        directory: &Path,
+        file_name: &str,
+        on_progress: impl FnMut(u64),
+    ) -> Result<SavedFile, LinkError> {
+        let download = self.start_download(path).await?;
         fs::create_dir_all(directory).await?;
         let (mut file, target) = create_unique(directory, &validate::sanitize_file_name(file_name)).await?;
-        let mut body = response.into_body();
-        let mut written: u64 = 0;
-        let copied = async {
-            while let Some(frame) = body.frame().await {
-                let Ok(data) = frame.map_err(broken)?.into_data() else { continue };
-                file.write_all(&data).await?;
-                written += data.len() as u64;
-                on_progress(written);
+        match download.write_to(&mut file, on_progress).await {
+            Ok(size_bytes) => Ok(SavedFile { path: target, size_bytes }),
+            Err(error) => {
+                drop(file);
+                let _ = fs::remove_file(&target).await;
+                Err(error)
             }
-            file.flush().await?;
-            Ok::<_, LinkError>(())
-        };
-        if let Err(error) = copied.await {
-            drop(file);
-            let _ = fs::remove_file(&target).await;
-            return Err(error);
         }
-        Ok(SavedFile { path: target, size_bytes: written })
     }
 
     /// Opens the same WebSocket a browser tab uses, for the live room: devices, files, chat and offers.

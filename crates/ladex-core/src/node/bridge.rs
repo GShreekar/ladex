@@ -12,7 +12,7 @@ use tokio::task::JoinHandle;
 
 use crate::preferences::PreferencesStore;
 
-use super::local::{LinkError, LocalLink, LocalUpload, SocketWriter};
+use super::local::{Download, LinkError, LocalLink, LocalUpload, SocketWriter};
 
 /// What the window sees of the room's WebSocket.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -129,5 +129,10 @@ impl Bridge {
     pub async fn save_download(&self, path: &str, file_name: &str) -> Result<String, LinkError> {
         let saved = self.link.save_download(path, &self.downloads_folder(), file_name, |_| {}).await?;
         Ok(saved.path.display().to_string())
+    }
+
+    /// Starts fetching a file or folder archive, for a caller that writes it somewhere other than the downloads folder.
+    pub async fn start_download(&self, path: &str) -> Result<Download, LinkError> {
+        self.link.start_download(path).await
     }
 }

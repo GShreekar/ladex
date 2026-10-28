@@ -95,6 +95,48 @@ async fn a_shared_file_goes_up_by_id_and_comes_down_into_the_downloads_folder() 
     node.shutdown().await;
 }
 
+// Uploads come from a window that has joined the room.
+async fn share_a_note(bridge: &Bridge) {
+    let (sender, mut events) = mpsc::unbounded_channel();
+    let socket = bridge.open_socket(move |event| drop(sender.send(event))).await.unwrap();
+    let join = json!({ "type": "join", "session_id": SESSION, "user_agent": "test", "nickname": null });
+    bridge.send_to_socket(socket, join.to_string()).await.unwrap();
+    next_message_of_type(&mut events, "peer_joined").await;
+    let upload = bridge.begin_upload("/api/files/file_note", &headers(11), 11);
+    bridge.write_upload(upload, b"hello world".to_vec()).await.unwrap();
+    let reply = bridge.finish_upload(upload).await.unwrap();
+    assert_eq!(reply.status, 201, "{}", reply.body);
+}
+
+// On Android the file is a document in a folder the person chose, which the app opens and hands over.
+#[tokio::test]
+async fn a_download_can_be_written_into_a_file_the_app_opened_itself() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = started(dir.path()).await;
+    let bridge = Bridge::new(node.local_link(), dir.path().join("downloads"));
+    share_a_note(&bridge).await;
+    let target = dir.path().join("document");
+    let mut file = tokio::fs::File::create(&target).await.unwrap();
+
+    let written = bridge.start_download("/api/files/file_note").await.unwrap().write_to(&mut file, |_| {}).await.unwrap();
+
+    assert_eq!(written, 11);
+    assert_eq!(std::fs::read_to_string(target).unwrap(), "hello world");
+    node.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_download_of_a_file_the_node_does_not_have_is_refused_before_anything_is_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = started(dir.path()).await;
+    let bridge = Bridge::new(node.local_link(), dir.path().join("downloads"));
+
+    let refused = bridge.start_download("/api/files/file_missing").await;
+
+    assert!(matches!(refused, Err(ladex_core::node::LinkError::Refused { status: 404, .. })), "{:?}", refused.err());
+    node.shutdown().await;
+}
+
 // The app calls begin_upload from its GUI thread, which has no Tokio runtime of its own.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_upload_can_begin_on_a_thread_outside_the_runtime() {

@@ -1,6 +1,7 @@
 //! The commands the window uses to reach its node, in place of HTTP: thin, since `Bridge` does the work.
 
 use ladex_core::node::{Reply, SocketEvent};
+use serde::Serialize;
 use tauri::ipc::{Channel, InvokeBody, Request};
 use tauri::State;
 
@@ -69,7 +70,24 @@ pub async fn ladex_socket_close(node: State<'_, AppNode>, socket_id: u64) -> Res
     Ok(())
 }
 
+/// Where a saved file went, as the window shows it; on a phone, also the id it is opened or shared onward by.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedDownload {
+    pub shown_as: String,
+    pub saved_id: Option<usize>,
+}
+
+#[cfg(not(target_os = "android"))]
 #[tauri::command]
-pub async fn ladex_save_download(node: State<'_, AppNode>, path: String, file_name: String) -> Result<String, String> {
-    node.bridge().save_download(&path, &file_name).await.map_err(|error| error.to_string())
+pub async fn ladex_save_download(node: State<'_, AppNode>, path: String, file_name: String) -> Result<SavedDownload, String> {
+    let saved = node.bridge().save_download(&path, &file_name).await.map_err(|error| error.to_string())?;
+    Ok(SavedDownload { shown_as: saved, saved_id: None })
+}
+
+// On a phone the file goes into the folder the person chose through Android, not into a path.
+#[cfg(target_os = "android")]
+#[tauri::command]
+pub async fn ladex_save_download(app: tauri::AppHandle, path: String, file_name: String) -> Result<SavedDownload, String> {
+    crate::phone_files::save_download(&app, &path, &file_name).await
 }

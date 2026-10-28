@@ -18,10 +18,9 @@
     <div class="toast {toast.level}">
       <Icon name={ICON_FOR_LEVEL[toast.level] ?? 'info'} size={20} />
       <span class="text">{toast.text}</span>
-      {#if toast.action}
-        {@const action = toast.action}
+      {#each toast.actions as action (action.label)}
         <button class="btn btn-small" onclick={() => { action.run(); toasts.dismiss(toast.id); }}>{action.label}</button>
-      {/if}
+      {/each}
       <button class="btn btn-ghost btn-icon close" aria-label="Dismiss" onclick={() => toasts.dismiss(toast.id)}>
         <Icon name="x" size={16} />
       </button>

@@ -70,6 +70,18 @@ plugin `crates/tauri-plugin-ladex-android`; `src/android.rs` keeps it in step wi
   permission is asked for the first time the service starts, and the notification is posted again once it is granted. If Android closes the window meanwhile, the node keeps
   sharing, and opening the app gives it a new window. Stop tells the other devices goodbye and quits.
 - **Network page.** Two more checks: whether the phone is on Wi-Fi (or sharing its hotspot), and whether the multicast lock is held.
+- **Share sheet.** LADEX takes any files another app shares (`ACTION_SEND` / `ACTION_SEND_MULTIPLE`) and asks whether to
+  share them with everyone. They stay `content://` URIs until then: Kotlin opens each one as a file descriptor that the
+  core reads straight into its store (`control::share_opened`), and only a file with no size up front (a pipe) is copied
+  into the app's cache first. `file://` URIs and LADEX's own are refused, so another app cannot make LADEX share its
+  private files.
+- **Save folder.** Settings › Receiving files (or the wizard) picks a folder with Android's folder picker
+  (`ACTION_OPEN_DOCUMENT_TREE`); the permission is kept, so it is asked once. A saved file streams from the node into a
+  new document there, and the store keeps its own copy in private storage. With no folder (or once Android takes the
+  permission back) files go to the app's own storage, `files/received`.
+- **Open and Share.** A saved file can be opened in another app or shared onward through Android's intents: from the
+  toast that says it was saved, or from **Saved on this phone** on the Transfers page. Files in the app's own storage are
+  lent out through its FileProvider.
 
 Logs go to logcat: `adb logcat -s LADEX`.
 

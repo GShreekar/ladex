@@ -3,6 +3,8 @@
   import type { IconName } from '../components/icons';
   import { useApp } from '../state/context';
   import DropOverlay from './DropOverlay.svelte';
+  import { useHost } from './host-context';
+  import IncomingShareDialog from './IncomingShareDialog.svelte';
   import FilesPage from './pages/FilesPage.svelte';
   import GuestsPage from './pages/GuestsPage.svelte';
   import NetworkPage from './pages/NetworkPage.svelte';
@@ -12,6 +14,7 @@
   import TransfersPage from './pages/TransfersPage.svelte';
 
   const { room, transfers } = useApp();
+  const { phone } = useHost();
 
   let fileChooser: HTMLInputElement;
 
@@ -97,6 +100,10 @@
 
 {#if room.offers[0]}
   <OfferDialog offer={room.offers[0]} />
+{/if}
+
+{#if phone}
+  <IncomingShareDialog {phone} />
 {/if}
 
 <style>

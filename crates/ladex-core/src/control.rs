@@ -23,6 +23,8 @@ mod receiving;
 pub mod server;
 mod share;
 
+pub use share::OpenedFile;
+
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
 
 /// The version commands and nodes must share; they are released together, so any difference is a mismatch.
@@ -320,6 +322,11 @@ impl Events {
             _ => Ok(()),
         }
     }
+}
+
+/// Shares files another app handed over already open, as `ladex send` shares files on disk; progress goes to `events`.
+pub async fn share_opened(state: &NodeState, files: Vec<OpenedFile>, events: &Events) -> anyhow::Result<Vec<FileView>> {
+    share::share_opened(state, files, events).await
 }
 
 /// Carries out one request and sends its outcome as the last event.

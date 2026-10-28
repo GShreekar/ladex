@@ -116,13 +116,37 @@ describe('IpcClient', () => {
   it('saves a download itself, asking the app to write it to disk', async () => {
     const { client, backend } = await startClient();
     backend.replies.set('ladex_request', { status: 200, body: '' });
-    backend.replies.set('ladex_save_download', '/home/me/Downloads/slides.pdf');
+    backend.replies.set('ladex_save_download', { shownAs: '/home/me/Downloads/slides.pdf', savedId: null });
 
     const ticket = await client.prepareDownload(SHARED_FILE);
-    const savedAt = await ticket.saveToDisk?.();
+    const saved = await ticket.saveToDisk?.();
 
-    expect(savedAt).toBe('/home/me/Downloads/slides.pdf');
+    expect(saved).toEqual({ shownAs: '/home/me/Downloads/slides.pdf' });
     expect(backend.sent('ladex_save_download')[0]?.args).toEqual({ path: '/api/files/file_a', fileName: 'slides.pdf' });
+  });
+
+  it('lets a file saved on a phone be opened or shared onward by the id the app gave it', async () => {
+    const { client, backend } = await startClient();
+    backend.replies.set('ladex_request', { status: 200, body: '' });
+    backend.replies.set('ladex_save_download', { shownAs: 'Download/LADEX/slides.pdf', savedId: 3 });
+
+    const saved = await (await client.prepareDownload(SHARED_FILE)).saveToDisk?.();
+    await saved?.open?.();
+    await saved?.shareOnward?.();
+
+    expect(backend.sent('ladex_open_saved')[0]?.args).toEqual({ savedId: 3 });
+    expect(backend.sent('ladex_share_saved')[0]?.args).toEqual({ savedId: 3 });
+  });
+
+  it('reports why another app could not be handed a saved file', async () => {
+    const { client, backend } = await startClient();
+    backend.replies.set('ladex_request', { status: 200, body: '' });
+    backend.replies.set('ladex_save_download', { shownAs: 'Download/LADEX/slides.pdf', savedId: 0 });
+    backend.replies.set('ladex_open_saved', new Error('No app on this phone opens this kind of file'));
+
+    const saved = await (await client.prepareDownload(SHARED_FILE)).saveToDisk?.();
+
+    await expect(saved?.open?.()).rejects.toThrow('No app on this phone opens');
   });
 
   it('reports why a file could not be written to disk', async () => {

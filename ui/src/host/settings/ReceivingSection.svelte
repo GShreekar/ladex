@@ -5,7 +5,7 @@
 
   let { view, onchange }: { view: PreferencesView; onchange: (view: PreferencesView) => void } = $props();
 
-  const { preferencesApi, desktop, isMobile, toasts } = useHost();
+  const { preferencesApi, desktop, phone, toasts } = useHost();
 
   const DEFAULT_SIZE_LIMIT_MIB = 500;
   const rules: Array<{ id: AutoAcceptFrom; label: string; hint: string }> = [
@@ -18,6 +18,8 @@
   const hasSizeLimit = $derived(rule.ask_above_mib !== null);
 
   let downloadsFolder = $state<string | null>(null);
+  // On a phone: the folder chosen through Android, by its name; none keeps files in LADEX's own storage.
+  let phoneFolder = $state<string | null>(null);
   let sizeLimitText = $state(String(DEFAULT_SIZE_LIMIT_MIB));
 
   $effect(() => {
@@ -25,7 +27,8 @@
   });
 
   $effect(() => {
-    void desktop?.downloadsFolder().then((folder) => (downloadsFolder = folder));
+    if (phone) void phone.saveFolder().then((folder) => (phoneFolder = folder));
+    else void desktop?.downloadsFolder().then((folder) => (downloadsFolder = folder));
   });
 
   async function save(update: Parameters<typeof preferencesApi.update>[0]): Promise<void> {
@@ -53,6 +56,19 @@
     void save({ auto_accept: { ...rule, ask_above_mib: mib } });
   }
 
+  async function choosePhoneFolder(): Promise<void> {
+    try {
+      phoneFolder = (await phone?.pickSaveFolder()) ?? null;
+    } catch (error) {
+      toasts.show('error', String(error));
+    }
+  }
+
+  async function stopUsingPhoneFolder(): Promise<void> {
+    await phone?.forgetSaveFolder();
+    phoneFolder = null;
+  }
+
   async function chooseFolder(): Promise<void> {
     const folder = await desktop?.pickFolder('Where should received files be saved?');
     if (folder) await save({ downloads_dir: folder });
@@ -62,13 +78,25 @@
 <section class="card">
   <h2>Receiving files</h2>
 
-  {#if desktop}
+  {#if phone}
+    <div class="field">
+      <span class="label" id="downloads-label">Save received files in</span>
+      <div class="row">
+        <code class="path truncate" aria-labelledby="downloads-label">{phoneFolder ?? 'LADEX’s own storage'}</code>
+        <button class="btn" onclick={choosePhoneFolder}>{phoneFolder ? 'Change…' : 'Choose folder…'}</button>
+        {#if phoneFolder}<button class="btn btn-ghost" onclick={stopUsingPhoneFolder}>Stop using it</button>{/if}
+      </div>
+      {#if !phoneFolder}
+        <span class="small faint">Only LADEX can see files in its own storage. Choose a folder to find them in the Files app.</span>
+      {/if}
+    </div>
+  {:else if desktop}
     <div class="field">
       <span class="label" id="downloads-label">Save received files in</span>
       <div class="row">
         <code class="path truncate" aria-labelledby="downloads-label">{downloadsFolder ?? 'the system downloads folder'}</code>
-        {#if !isMobile}<button class="btn" onclick={chooseFolder}>Change…</button>{/if}
-        {#if view.preferences.downloads_dir && !isMobile}
+        <button class="btn" onclick={chooseFolder}>Change…</button>
+        {#if view.preferences.downloads_dir}
           <button class="btn btn-ghost" onclick={() => save({ downloads_dir: '' })}>Use the default</button>
         {/if}
       </div>
@@ -138,11 +166,13 @@
   }
 
   .row {
+    flex-wrap: wrap;
     align-items: center;
   }
 
   .path {
     flex: 1;
+    min-width: 160px;
     padding: 8px 12px;
     border-radius: var(--radius-sm);
     background: var(--surface-low);

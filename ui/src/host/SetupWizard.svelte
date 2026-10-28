@@ -4,6 +4,7 @@
   import { formatBytes } from '../client/format';
   import Icon from '../components/Icon.svelte';
   import type { DesktopSettings, DesktopSetup, SetupState } from '../desktop/desktop';
+  import type { PhoneShell } from '../desktop/phone';
   import {
     SETUP_STEPS,
     chosenPassphrase,
@@ -18,9 +19,17 @@
   let {
     setup,
     pickFolder,
+    phone,
     state: initial,
     isMobile,
-  }: { setup: DesktopSetup; pickFolder: DesktopSettings['pickFolder']; state: SetupState; isMobile: boolean } = $props();
+  }: {
+    setup: DesktopSetup;
+    pickFolder: DesktopSettings['pickFolder'];
+    // The Android app: received files go to a folder chosen through Android, which keeps it, not to a path.
+    phone: PhoneShell | null;
+    state: SetupState;
+    isMobile: boolean;
+  } = $props();
 
   const TITLES: Record<SetupStep, string> = {
     welcome: 'Welcome to LADEX',
@@ -48,7 +57,10 @@
 
   const stepNumber = $derived(SETUP_STEPS.indexOf(step) + 1);
   const problem = $derived(problemAt(step, answers, initial.freeBytes));
-  const folder = $derived(answers.downloadsDir ?? initial.defaultDownloads ?? 'your Downloads folder');
+  let phoneFolder = $state<string | null>(null);
+  const folder = $derived(
+    phone ? (phoneFolder ?? 'LADEX’s own storage') : (answers.downloadsDir ?? initial.defaultDownloads ?? 'your Downloads folder'),
+  );
 
   async function remakePassphrase(): Promise<void> {
     answers.createdPassphrase = await setup.suggestPassphrase();
@@ -67,6 +79,14 @@
   async function chooseFolder(): Promise<void> {
     const picked = await pickFolder('Where should received files be saved?');
     if (picked) answers.downloadsDir = picked;
+  }
+
+  async function choosePhoneFolder(): Promise<void> {
+    try {
+      phoneFolder = (await phone?.pickSaveFolder()) ?? null;
+    } catch {
+      // The picker did not open; the folder can be chosen later in Settings.
+    }
   }
 
   async function finish(): Promise<void> {
@@ -157,8 +177,15 @@
         <span class="label">Save received files in</span>
         <div class="row">
           <code class="path truncate">{folder}</code>
-          {#if !isMobile}<button type="button" class="btn" onclick={chooseFolder}>Change…</button>{/if}
+          {#if phone}
+            <button type="button" class="btn" onclick={choosePhoneFolder}>{phoneFolder ? 'Change…' : 'Choose folder…'}</button>
+          {:else if !isMobile}
+            <button type="button" class="btn" onclick={chooseFolder}>Change…</button>
+          {/if}
         </div>
+        {#if phone && !phoneFolder}
+          <span class="small faint">Choose a folder to find received files in the Files app; otherwise only LADEX can see them.</span>
+        {/if}
       </div>
       <label class="field">
         <span class="label">Most space LADEX may use for shared files</span>

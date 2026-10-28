@@ -1,5 +1,6 @@
 import { useApp, type AppContext } from '../state/context';
 import type { DesktopSettings } from '../desktop/desktop';
+import type { PhoneShell } from '../desktop/phone';
 import type { GuestsApi } from './guests-api';
 import type { PairingApi } from './pairing-api';
 import type { PreferencesApi } from './preferences-api';
@@ -13,6 +14,8 @@ export interface HostContext extends AppContext {
   desktop: DesktopSettings | null;
   // The app on a phone: the desktop-only settings are hidden.
   isMobile: boolean;
+  // Present in the Android app only: files shared in from other apps, and the folder received files are saved in.
+  phone: PhoneShell | null;
 }
 
 export function useHost(): HostContext {

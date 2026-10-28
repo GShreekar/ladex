@@ -1,4 +1,5 @@
-//! Android: the multicast lock, the sharing notification, pausing off Wi-Fi, and the node outliving its window.
+//! Android: the multicast lock, the sharing notification, pausing off Wi-Fi, the node outliving its window, and passing
+//! on what Kotlin reports about files shared into the app and the save folder.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -8,6 +9,7 @@ use tauri::{AppHandle, Manager, WebviewUrl};
 use tauri_plugin_ladex_android::LadexAndroidExt;
 use tokio::sync::mpsc;
 
+use crate::phone_files::{self, PhoneFiles};
 use crate::running::AppNode;
 use crate::sharing::{self, DeviceEvent, NetworkReport, PauseClock, Situation, UploadWatch, Wanted};
 use crate::{open_window, WINDOW_LABEL};
@@ -30,6 +32,7 @@ pub struct Phone(Mutex<Seen>);
 /// Starts listening to Android and keeping the phone in step with the node; call once, after the window has opened.
 pub fn start(app: &AppHandle) {
     app.manage(Phone::default());
+    app.manage(PhoneFiles::default());
     let (sender, events) = mpsc::unbounded_channel();
     if let Err(error) = app.ladex_android().watch(move |event: DeviceEvent| {
         let _ = sender.send(event);
@@ -88,6 +91,8 @@ async fn keep_in_step(app: AppHandle, mut events: mpsc::UnboundedReceiver<Device
             Some(event) = events.recv() => match event {
                 DeviceEvent::Stop => return quit(&app, "the notification's Stop button").await,
                 DeviceEvent::Shown => reopen_window(&app),
+                DeviceEvent::Incoming { files } => phone_files::incoming_changed(&app, files),
+                DeviceEvent::SaveFolder { name } => phone_files::folder_picked(&app, name),
                 DeviceEvent::Network(report) => {
                     app.state::<Phone>().0.lock().unwrap().network = Some(report);
                     if pause.report(&report, Instant::now()) {

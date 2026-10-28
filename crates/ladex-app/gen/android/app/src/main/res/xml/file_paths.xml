@@ -2,4 +2,6 @@
 <paths xmlns:android="http://schemas.android.com/apk/res/android">
   <external-path name="my_images" path="." />
   <cache-path name="my_cache_images" path="." />
+  <!-- Received files kept in LADEX's own storage, lent to other apps to open or share onward. -->
+  <files-path name="received" path="received/" />
 </paths>

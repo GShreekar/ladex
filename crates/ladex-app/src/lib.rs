@@ -11,6 +11,8 @@ mod launch;
 mod logging;
 mod notify;
 mod paths;
+#[cfg(target_os = "android")]
+mod phone_files;
 mod running;
 mod setup;
 #[cfg(any(target_os = "android", test))]
@@ -156,6 +158,22 @@ pub fn run() {
             desktop::ladex_restart_node,
             #[cfg(target_os = "android")]
             android::ladex_device_checks,
+            #[cfg(target_os = "android")]
+            phone_files::ladex_incoming_files,
+            #[cfg(target_os = "android")]
+            phone_files::ladex_share_incoming,
+            #[cfg(target_os = "android")]
+            phone_files::ladex_set_incoming_aside,
+            #[cfg(target_os = "android")]
+            phone_files::ladex_save_folder,
+            #[cfg(target_os = "android")]
+            phone_files::ladex_pick_save_folder,
+            #[cfg(target_os = "android")]
+            phone_files::ladex_forget_save_folder,
+            #[cfg(target_os = "android")]
+            phone_files::ladex_open_saved,
+            #[cfg(target_os = "android")]
+            phone_files::ladex_share_saved,
             setup::ladex_setup_state,
             setup::ladex_suggest_passphrase,
             setup::ladex_setup_finish,
