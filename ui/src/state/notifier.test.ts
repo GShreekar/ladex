@@ -30,6 +30,7 @@ function file(overrides: Partial<SharedFile>): SharedFile {
     holderNames: [],
     isAvailable: true,
     canUnshare: false,
+    needsThisDeviceOnline: false,
     ...overrides,
   };
 }

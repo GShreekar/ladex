@@ -20,6 +20,8 @@ export interface WireFile {
   hosts: string[];
   // Older nodes leave it out; then a file is available when a node hosts it.
   available?: boolean;
+  // Every node with a whole copy may vanish at any moment (a phone); older nodes leave it out.
+  only_part_time_hosts?: boolean;
   uploaded_at: string;
   is_folder: boolean;
   parent: string | null;

@@ -300,6 +300,8 @@ export class GuestClient implements LadexClient {
           holderNames,
           isAvailable: file.available ?? holderNames.length > 0,
           canUnshare: false,
+          // A guest is a browser, never the device that holds a copy.
+          needsThisDeviceOnline: false,
         };
       });
     this.emit({ type: 'devices', devices });

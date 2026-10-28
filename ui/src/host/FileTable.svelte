@@ -52,6 +52,9 @@
                 <div class="names">
                   <span class="name truncate" title={file.name}>{file.name}</span>
                   <span class="type truncate">{describe(file)}<span class="narrow-only"> · {formatBytes(file.sizeBytes)}</span></span>
+                  {#if file.needsThisDeviceOnline}
+                    <span class="only-here" role="note">Only your phone has this; keep the app open until someone downloads it.</span>
+                  {/if}
                 </div>
               </div>
             </td>
@@ -159,6 +162,12 @@
     color: var(--text-faint);
     font-size: 11px;
     letter-spacing: 0.02em;
+  }
+
+  .only-here {
+    margin-top: 2px;
+    color: var(--warning);
+    font-size: 12px;
   }
 
   .actions-column {

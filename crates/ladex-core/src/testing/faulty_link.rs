@@ -17,7 +17,9 @@ pub(crate) fn detour(dialer: &str, target: SocketAddr) -> SocketAddr {
 }
 
 pub struct FaultyLink {
+    // The relay in front of each end, in the order `ends` names them.
     relays: [UdpRelay; 2],
+    ends: [NodeId; 2],
     detours: [(NodeId, SocketAddr); 2],
 }
 
@@ -40,7 +42,8 @@ impl FaultyLink {
             registered.insert(detours[0].clone(), to_b.addr());
             registered.insert(detours[1].clone(), to_a.addr());
         }
-        let link = FaultyLink { relays: [to_a, to_b], detours };
+        let ends = [a.state.node_id.clone(), b.state.node_id.clone()];
+        let link = FaultyLink { relays: [to_a, to_b], ends, detours };
         b.connect(link.relays[0].addr()).await.expect("b joins a through the link");
         link
     }
@@ -64,6 +67,13 @@ impl FaultyLink {
     pub fn heal(&self) {
         self.relays.iter().for_each(UdpRelay::resume);
     }
+
+    /// How many bytes have crossed the link to `node`, one of its two ends, whichever end dialed.
+    pub fn bytes_delivered_to(&self, node: &str) -> u64 {
+        let end = self.ends.iter().position(|end| end == node).expect("the node is an end of this link");
+        // A dial goes through the relay in front of the node dialed, and the answers come back through it.
+        self.relays[end].delivered_upstream_bytes() + self.relays[1 - end].delivered_back_bytes()
+    }
 }
 
 /// One node's network card: its own speed in each direction, shared by all its links.
@@ -81,9 +91,15 @@ pub struct LinkedMesh {
 impl LinkedMesh {
     /// `n` open nodes, each linked to every other one. Returns once they all see each other.
     pub async fn spawn(n: usize) -> LinkedMesh {
+        Self::spawn_with((0..n).map(|i| NodeConfig::named(&format!("node_{i}"))).collect()).await
+    }
+
+    /// A node for each config, each linked to every other one. Returns once they all see each other.
+    pub async fn spawn_with(configs: Vec<NodeConfig>) -> LinkedMesh {
+        let n = configs.len();
         let mut nodes = Vec::new();
-        for i in 0..n {
-            nodes.push(spawn_node(NodeConfig::named(&format!("node_{i}"))).await);
+        for config in configs {
+            nodes.push(spawn_node(config).await);
         }
         let mut links = BTreeMap::new();
         for i in 0..n {

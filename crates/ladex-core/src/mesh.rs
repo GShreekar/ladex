@@ -6,7 +6,7 @@ use crate::types::*;
 use crate::{pairing, state, NodeState};
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -69,6 +69,9 @@ pub struct MeshPeerHandle {
 }
 
 pub type MeshPeers = Arc<RwLock<HashMap<NodeId, MeshPeerHandle>>>;
+
+/// Connected peers that may vanish at any moment; a plain lock, so a file's view can ask it without waiting.
+pub type PartTimePeers = Arc<std::sync::Mutex<HashSet<NodeId>>>;
 
 // Postcard identifies variants by position, so new variants go at the end and reordering needs a protocol bump.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -179,6 +182,9 @@ struct Intro {
     /// Sender's wall clock (ms since the epoch), to spot badly set clocks.
     #[serde(default)]
     now_ms: u64,
+    /// The sender may vanish at any moment, as a phone does.
+    #[serde(default)]
+    part_time: bool,
 }
 
 impl Intro {
@@ -187,6 +193,7 @@ impl Intro {
             quic_port: state.quic_port,
             ip: state.local_ip().map(|ip| ip.to_string()).unwrap_or_default(),
             now_ms: crate::hlc::wall_clock_ms(),
+            part_time: state.is_part_time,
         };
         serde_json::to_string(&intro).expect("an intro always serializes")
     }
@@ -224,7 +231,14 @@ async fn note_clock_skew(state: &NodeState, peer_name: &str, peer_now_ms: u64) {
 
 /// Removes a peer from mesh_peers and cleans up after it.
 pub async fn remove_mesh_peer(state: &NodeState, peer_node_id: &NodeId) {
-    let removed = state.mesh_peers.write().await.remove(peer_node_id);
+    let removed = {
+        let mut peers = state.mesh_peers.write().await;
+        let removed = peers.remove(peer_node_id);
+        if removed.is_some() {
+            state.part_time_peers.lock().unwrap().remove(peer_node_id);
+        }
+        removed
+    };
     if let Some(handle) = removed {
         // Without this, QUIC keep-alives would hold the connection open with nothing reading it.
         handle.hang_up.notify_one();
@@ -241,14 +255,17 @@ struct Session {
     hang_up: Arc<Notify>,
 }
 
-/// Registers a newly authenticated peer reachable at `addr`, sends it this node's state and starts its heartbeat; None if it is already connected.
-async fn start_session(
-    state: &NodeState,
-    peer_node_id: &NodeId,
-    peer_node_name: &str,
+/// An authenticated peer about to be registered: who it is, where to redial it and what it said of itself.
+struct Arrival<'a> {
+    node_id: &'a NodeId,
+    name: &'a str,
     addr: SocketAddr,
-    dialer: NodeId,
-) -> Option<Session> {
+    is_part_time: bool,
+}
+
+/// Registers a newly authenticated peer, sends it this node's state and starts its heartbeat; None if it is already connected.
+async fn start_session(state: &NodeState, arrival: Arrival<'_>, dialer: NodeId) -> Option<Session> {
+    let Arrival { node_id: peer_node_id, name: peer_node_name, addr, is_part_time } = arrival;
     let (sender, messages) = mpsc::unbounded_channel::<MeshMessage>();
     let (fetches_tx, fetches) = mpsc::channel(FETCH_QUEUE);
     let hang_up = Arc::new(Notify::new());
@@ -263,10 +280,11 @@ async fn start_session(
         hang_up: hang_up.clone(),
         dialer,
     };
-    if !register_peer(state, handle).await {
+    if !register_peer(state, handle, is_part_time).await {
         return None;
     }
-    tracing::info!("Mesh: registered peer {peer_node_id} ({peer_node_name})");
+    let part_time = if is_part_time { ", part-time" } else { "" };
+    tracing::info!("Mesh: registered peer {peer_node_id} ({peer_node_name}{part_time})");
     crate::transfer::sources_changed(state);
     post_handshake_sync(&sender, state).await;
     spawn_heartbeat(state.clone(), peer_node_id.clone(), sender.clone());
@@ -274,7 +292,7 @@ async fn start_session(
 }
 
 /// Registers a connection, hanging up the open one with the peer if the new one replaces it; false if the open one stays.
-async fn register_peer(state: &NodeState, handle: MeshPeerHandle) -> bool {
+async fn register_peer(state: &NodeState, handle: MeshPeerHandle, is_part_time: bool) -> bool {
     let mut peers = state.mesh_peers.write().await;
     if let Some(open) = peers.get(&handle.node_id) {
         if !replaces(&open.dialer, &handle.dialer) {
@@ -283,8 +301,19 @@ async fn register_peer(state: &NodeState, handle: MeshPeerHandle) -> bool {
         tracing::info!("Mesh: a new connection with {} replaces the open one", handle.node_id);
         open.hang_up.notify_one();
     }
+    note_part_time(&state.part_time_peers, &handle.node_id, is_part_time);
     peers.insert(handle.node_id.clone(), handle);
     true
+}
+
+// A reconnecting node may have changed its mind, so its flag is set either way.
+fn note_part_time(part_time_peers: &PartTimePeers, node_id: &NodeId, is_part_time: bool) {
+    let mut part_time = part_time_peers.lock().unwrap();
+    if is_part_time {
+        part_time.insert(node_id.clone());
+    } else {
+        part_time.remove(node_id);
+    }
 }
 
 /// Whether the peer's open connection stays rather than one `new_dialer` is opening, so the new one can be turned away early.

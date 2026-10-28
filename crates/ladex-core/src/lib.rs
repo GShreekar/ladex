@@ -73,6 +73,9 @@ pub struct NodeState {
     /// Connected mesh peers, by node id.
     pub mesh_peers: mesh::MeshPeers,
 
+    /// The connected peers that said they may vanish at any moment, such as phones; kept in step with `mesh_peers`.
+    pub part_time_peers: mesh::PartTimePeers,
+
     /// Peers this node is dialing, as the lower node id of the two.
     pub dial_targets: mesh::dialer::DialTargets,
 
@@ -141,6 +144,9 @@ pub struct NodeState {
     /// This machine's hostname, shown to peers.
     pub node_name: String,
 
+    /// This node may vanish at any moment (it runs on a phone), and tells its peers so.
+    pub is_part_time: bool,
+
     /// What the person chose in the app or with `ladex settings`.
     pub preferences: Arc<preferences::PreferencesStore>,
 
@@ -160,6 +166,14 @@ impl NodeState {
 
     pub fn set_local_ip(&self, ip: Option<IpAddr>) {
         *self.local_ip.write().unwrap() = ip;
+    }
+
+    /// Whether `node`, this one or a connected peer, may vanish at any moment.
+    pub fn is_part_time_node(&self, node: &str) -> bool {
+        if node == self.node_id {
+            return self.is_part_time;
+        }
+        self.part_time_peers.lock().unwrap().contains(node)
     }
 
     /// A node with no network, for unit tests.
@@ -199,6 +213,7 @@ impl NodeState {
             trust: Arc::new(trust::TrustStore::open(&data_dir).unwrap()),
             pairings: Arc::new(pairing::Pairings::new()),
             mesh_peers: Arc::new(RwLock::new(HashMap::new())),
+            part_time_peers: Default::default(),
             dial_targets: Default::default(),
             kept_peers: Default::default(),
             mesh_endpoint: None,
@@ -218,6 +233,7 @@ impl NodeState {
                 map_interval: Duration::from_millis(100),
                 stall_timeout: Duration::from_secs(5),
                 stream_stall_timeout: Duration::from_secs(10),
+                part_time_stall_timeout: Duration::from_secs(3),
                 upload_slots: transfer::UPLOAD_SLOTS,
             })),
             is_seeding_paused: Arc::new(AtomicBool::new(false)),
@@ -231,6 +247,7 @@ impl NodeState {
             http_port: 0,
             local_ip: Default::default(),
             node_name: "test".to_string(),
+            is_part_time: false,
             preferences: Arc::new(preferences::PreferencesStore::open(&data_dir)),
             started_with: Arc::new(control::Settings {
                 data_dir,

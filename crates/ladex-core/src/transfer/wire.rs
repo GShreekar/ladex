@@ -121,6 +121,8 @@ pub enum Reply {
 pub struct Fetch {
     pub request: GetChunks,
     pub replies: mpsc::Sender<Reply>,
+    /// How long the stream may deliver no bytes before it is given up.
+    pub stall_timeout: Duration,
 }
 
 fn invalid(message: &'static str) -> io::Error {

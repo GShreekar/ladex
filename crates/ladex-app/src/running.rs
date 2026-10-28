@@ -84,6 +84,7 @@ fn node_config(paths: &AppPaths) -> Result<NodeConfig, StartFailure> {
     config.passphrase = passphrase_from_environment();
     config.use_saved_passphrase().map_err(StartFailure::Saved)?;
     config.use_saved_storage_limit();
+    config.is_part_time = cfg!(mobile);
     Ok(config)
 }
 

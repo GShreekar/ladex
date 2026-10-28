@@ -147,6 +147,46 @@ describe('LocalNodeClient', () => {
     expect(lastOf(events, 'files').files[0]?.sharedBy).toBe('Sam');
   });
 
+  describe('a file only a phone has', () => {
+    const onlyOnThisPhone = { uploader_id: '', uploader_node: 'node_a', hosts: ['node_a'], only_part_time_hosts: true };
+
+    it('warns the phone that shared it that it must stay open', async () => {
+      const { socket, events } = await startClient(true);
+      socket.deliver({ type: 'file_list_update', files: [wireFile(onlyOnThisPhone)] });
+      expect(lastOf(events, 'files').files[0]?.needsThisDeviceOnline).toBe(true);
+    });
+
+    it('stops warning once another device has a copy', async () => {
+      const { socket, events } = await startClient(true);
+      socket.deliver({ type: 'file_list_update', files: [wireFile({ ...onlyOnThisPhone, hosts: ['node_a', 'node_b'], only_part_time_hosts: false })] });
+      expect(lastOf(events, 'files').files[0]?.needsThisDeviceOnline).toBe(false);
+    });
+
+    it('does not warn a node that is not part-time', async () => {
+      const { socket, events } = await startClient(true);
+      socket.deliver({ type: 'file_list_update', files: [wireFile({ ...onlyOnThisPhone, only_part_time_hosts: false })] });
+      expect(lastOf(events, 'files').files[0]?.needsThisDeviceOnline).toBe(false);
+    });
+
+    it('does not warn from a node too old to say', async () => {
+      const { socket, events } = await startClient(true);
+      socket.deliver({ type: 'file_list_update', files: [wireFile({ uploader_id: '', uploader_node: 'node_a', hosts: ['node_a'] })] });
+      expect(lastOf(events, 'files').files[0]?.needsThisDeviceOnline).toBe(false);
+    });
+
+    it('does not warn about a file another node shared', async () => {
+      const { socket, events } = await startClient(true);
+      socket.deliver({ type: 'file_list_update', files: [wireFile({ ...onlyOnThisPhone, uploader_node: 'node_b' })] });
+      expect(lastOf(events, 'files').files[0]?.needsThisDeviceOnline).toBe(false);
+    });
+
+    it('does not warn a browser tab, which cannot keep the phone’s app open', async () => {
+      const { socket, events } = await startClient(false);
+      socket.deliver({ type: 'file_list_update', files: [wireFile(onlyOnThisPhone)] });
+      expect(lastOf(events, 'files').files[0]?.needsThisDeviceOnline).toBe(false);
+    });
+  });
+
   it('shows a folder whose parts are spread over several nodes as available', async () => {
     const { socket, events } = await startClient();
     socket.deliver({ type: 'file_list_update', files: [wireFile({ is_folder: true, hosts: [], available: true })] });

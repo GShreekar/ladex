@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -76,6 +76,8 @@ struct Link {
     faults: Mutex<Faults>,
     cards: Mutex<Cards>,
     is_silent: AtomicBool,
+    delivered_upstream_bytes: AtomicU64,
+    delivered_back_bytes: AtomicU64,
 }
 
 pub struct UdpRelay {
@@ -90,7 +92,13 @@ impl UdpRelay {
         let near = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.expect("bind the relay's near side");
         let far = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.expect("bind the relay's far side");
         let addr = near.local_addr().expect("the relay has an address");
-        let link = Arc::new(Link { faults: Mutex::new(Faults::default()), cards: Mutex::default(), is_silent: AtomicBool::new(false) });
+        let link = Arc::new(Link {
+            faults: Mutex::new(Faults::default()),
+            cards: Mutex::default(),
+            is_silent: AtomicBool::new(false),
+            delivered_upstream_bytes: AtomicU64::new(0),
+            delivered_back_bytes: AtomicU64::new(0),
+        });
         let task = tokio::spawn(relay(near, far, upstream, link.clone()));
         Self { addr, link, task }
     }
@@ -115,6 +123,16 @@ impl UdpRelay {
 
     pub fn resume(&self) {
         self.link.is_silent.store(false, Ordering::Relaxed);
+    }
+
+    /// How many bytes of datagrams have reached the node behind the relay.
+    pub fn delivered_upstream_bytes(&self) -> u64 {
+        self.link.delivered_upstream_bytes.load(Ordering::Relaxed)
+    }
+
+    /// How many bytes of the node's replies have reached the sender.
+    pub fn delivered_back_bytes(&self) -> u64 {
+        self.link.delivered_back_bytes.load(Ordering::Relaxed)
     }
 }
 
@@ -172,10 +190,14 @@ async fn relay(near: UdpSocket, far: UdpSocket, upstream: SocketAddr, link: Arc<
                 }
                 match (way, sender) {
                     (Way::Upstream, _) => {
-                        let _ = far.send_to(&datagram, upstream).await;
+                        if far.send_to(&datagram, upstream).await.is_ok() {
+                            link.delivered_upstream_bytes.fetch_add(datagram.len() as u64, Ordering::Relaxed);
+                        }
                     }
                     (Way::Back, Some(sender)) => {
-                        let _ = near.send_to(&datagram, sender).await;
+                        if near.send_to(&datagram, sender).await.is_ok() {
+                            link.delivered_back_bytes.fetch_add(datagram.len() as u64, Ordering::Relaxed);
+                        }
                     }
                     (Way::Back, None) => {}
                 }

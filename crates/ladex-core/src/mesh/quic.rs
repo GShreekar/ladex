@@ -18,7 +18,7 @@ use super::endpoint::{Accepting, MeshEndpoint, PeerConnection, HUNG_UP};
 use super::frames::{FrameSender, FramedStream};
 use super::{
     authenticate_inbound, complete_pairing, connection_ended, dialer, dispatch, handshake_local, keeps_open_connection, note_clock_skew,
-    start_session, AlreadyConnected, AuthFailure, Intro, MeshMessage, Session, MAX_MESH_MESSAGE_BYTES, PROTOCOL_VERSION,
+    start_session, AlreadyConnected, Arrival, AuthFailure, Intro, MeshMessage, Session, MAX_MESH_MESSAGE_BYTES, PROTOCOL_VERSION,
 };
 use crate::handshake::{self, Failure, Reason};
 use crate::transfer::wire::Fetch;
@@ -276,7 +276,8 @@ async fn begin(state: &NodeState, connection: PeerConnection, peer: handshake::P
     let remote = connection.connection.remote_address();
     let ip = intro.ip.parse().unwrap_or_else(|_| remote.ip());
     let port = if intro.quic_port == 0 { remote.port() } else { intro.quic_port };
-    let Some(session) = start_session(state, &peer.node_id, &peer.name, SocketAddr::new(ip, port), dialer).await else {
+    let arrival = Arrival { node_id: &peer.node_id, name: &peer.name, addr: SocketAddr::new(ip, port), is_part_time: intro.part_time };
+    let Some(session) = start_session(state, arrival, dialer).await else {
         tracing::warn!("Mesh: duplicate QUIC connection with {} — dropping", peer.node_id);
         connection.connection.close(HUNG_UP, b"already connected");
         return;
@@ -290,7 +291,7 @@ async fn control_loop(state: NodeState, connection: PeerConnection, peer_node_id
     let Session { sender: peer_tx, messages, fetches, hang_up } = session;
     let writer = tokio::spawn(write_frames(sender, messages));
     let chunk_streams = [
-        tokio::spawn(open_chunk_streams(connection.connection.clone(), fetches, state.transfers.stream_stall_timeout())),
+        tokio::spawn(open_chunk_streams(connection.connection.clone(), fetches)),
         tokio::spawn(serve_chunk_streams(state.clone(), connection.clone())),
     ];
     let we_hung_up = loop {
@@ -337,13 +338,13 @@ fn message_frame(message: &MeshMessage) -> Vec<u8> {
 }
 
 /// Opens a stream for each request for chunks the download engine makes of this peer.
-async fn open_chunk_streams(connection: quinn::Connection, mut fetches: mpsc::Receiver<Fetch>, stall_timeout: Duration) {
+async fn open_chunk_streams(connection: quinn::Connection, mut fetches: mpsc::Receiver<Fetch>) {
     while let Some(fetch) = fetches.recv().await {
         let connection = connection.clone();
         tokio::spawn(async move {
             // Dropping the reply channel on any failure tells the download its chunks are free to ask for elsewhere.
             let Ok((send, recv)) = connection.open_bi().await else { return };
-            if let Err(e) = crate::transfer::wire::fetch_stream(recv, send, &fetch.request, fetch.replies, stall_timeout).await {
+            if let Err(e) = crate::transfer::wire::fetch_stream(recv, send, &fetch.request, fetch.replies, fetch.stall_timeout).await {
                 tracing::debug!("Mesh: chunk stream to {} failed: {e}", connection.remote_address());
             }
         });
