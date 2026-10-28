@@ -79,6 +79,7 @@ const SHARED_FILE: SharedFile = {
   holderNames: ['here'],
   isAvailable: true,
   canUnshare: true,
+  needsThisDeviceOnline: false,
 };
 
 describe('IpcClient', () => {

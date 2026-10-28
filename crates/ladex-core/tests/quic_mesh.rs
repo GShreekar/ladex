@@ -5,7 +5,11 @@ use ladex_core::store::{hash_chunk, CHUNK_SIZE};
 use ladex_core::testing::{converged, eventually, fully_connected, spawn_node, NodeConfig, NodeHandle};
 use ladex_core::transfer::wire::{ErrorCode, Fetch, GetChunks, Reply};
 use ladex_core::{transfer, NodeState};
+use std::time::Duration;
 use tokio::sync::mpsc;
+
+// Long enough that only a broken stream ends a request early.
+const ASK_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 async fn spawn_pair(passphrase: Option<&str>) -> Vec<NodeHandle> {
     let config = |name: &str| NodeConfig { passphrase: passphrase.map(String::from), ..NodeConfig::named(name) };
@@ -169,7 +173,7 @@ async fn a_node_told_to_join_its_own_address_refuses() {
 async fn ask(from: &NodeHandle, of: &NodeHandle, request: GetChunks) -> Vec<Reply> {
     let fetches = from.state.mesh_peers.read().await[of.node_id()].fetches.clone();
     let (replies_tx, mut replies) = mpsc::channel(32);
-    fetches.send(Fetch { request, replies: replies_tx }).await.unwrap();
+    fetches.send(Fetch { request, replies: replies_tx, stall_timeout: ASK_STALL_TIMEOUT }).await.unwrap();
     let mut got = Vec::new();
     while let Some(reply) = replies.recv().await {
         got.push(reply);

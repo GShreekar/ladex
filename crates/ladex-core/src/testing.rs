@@ -32,6 +32,8 @@ pub struct NodeConfig {
     pub name: String,
     pub passphrase: Option<String>,
     pub peers: Vec<SocketAddr>,
+    /// Tells peers it may vanish at any moment, as the app on a phone does.
+    pub is_part_time: bool,
 }
 
 impl NodeConfig {
@@ -46,6 +48,11 @@ impl NodeConfig {
 
     pub fn peer(mut self, addr: SocketAddr) -> Self {
         self.peers.push(addr);
+        self
+    }
+
+    pub fn part_time(mut self) -> Self {
+        self.is_part_time = true;
         self
     }
 }
@@ -76,6 +83,7 @@ pub async fn spawn_node(config: NodeConfig) -> NodeHandle {
     state.quic_port = addr.port();
     state.mesh_endpoint = Some(endpoint.clone());
     state.node_name = config.name.clone();
+    state.is_part_time = config.is_part_time;
     state.set_local_ip(Some(addr.ip()));
     // Every test node dials from 127.0.0.1, so that one address must not look like a guesser.
     state.mesh_limiter = Arc::new(ratelimit::AttemptLimiter::new(ratelimit::Policy {

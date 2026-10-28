@@ -113,6 +113,7 @@ fn view_of(state: &NodeState, listed: &Listed, children: &[&str]) -> FileView {
             view.hosts.retain(|node| child_hosts.contains(node));
         }
     }
+    view.only_part_time_hosts = !view.hosts.is_empty() && view.hosts.iter().all(|node| state.is_part_time_node(node));
     view
 }
 

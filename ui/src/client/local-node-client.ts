@@ -418,6 +418,12 @@ export class LocalNodeClient implements LadexClient {
     return file.uploader_id === this.sessionId;
   }
 
+  // The node this page belongs to shared the file, holds the only copy, and is a part-time seed.
+  private needsThisDeviceOnline(file: WireFile): boolean {
+    const isOnlyHolder = file.hosts.length === 1 && file.hosts[0] === this.status.node_id;
+    return this.status.is_host && file.uploader_node === this.status.node_id && isOnlyHolder && file.only_part_time_hosts === true;
+  }
+
   private holderName(nodeId: string): string {
     return nodeId === this.status.node_id ? `${this.nodeName(nodeId)} (this node)` : this.nodeName(nodeId);
   }
@@ -439,6 +445,7 @@ export class LocalNodeClient implements LadexClient {
       holderNames,
       isAvailable: file.available ?? holderNames.length > 0,
       canUnshare: file.uploader_id === this.sessionId || (this.status.is_host && file.uploader_node === this.status.node_id),
+      needsThisDeviceOnline: this.needsThisDeviceOnline(file),
     };
   }
 

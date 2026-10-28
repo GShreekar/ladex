@@ -45,12 +45,17 @@ const ENDGAME_MAX_CHUNKS: u32 = 64;
 const MIN_DEPTH: usize = 1;
 const MAX_DEPTH: usize = 32;
 const TARGET_IN_FLIGHT_SECS: f64 = 0.5;
+// A node that may vanish is counted as this fraction of its speed, so it gets fewer and less urgent chunks.
+const PART_TIME_WEIGHT: f64 = 0.25;
+const FULL_WEIGHT: f64 = 1.0;
 
 pub struct Source {
     // None: has the whole file.
     pub has: Option<Bitmap>,
     pub in_flight: usize,
     pub speed_bps: f64,
+    /// How much of its speed the scheduler counts on; less than 1 for a node that may vanish.
+    pub weight: f64,
 }
 
 impl Source {
@@ -59,10 +64,24 @@ impl Source {
     }
 
     pub fn depth(&self) -> usize {
-        if self.speed_bps <= 0.0 {
+        let counted_speed = self.speed_bps * self.weight;
+        if counted_speed <= 0.0 {
             return MIN_DEPTH;
         }
-        ((self.speed_bps * TARGET_IN_FLIGHT_SECS / CHUNK_SIZE as f64).ceil() as usize).clamp(MIN_DEPTH, MAX_DEPTH)
+        ((counted_speed * TARGET_IN_FLIGHT_SECS / CHUNK_SIZE as f64).ceil() as usize).clamp(MIN_DEPTH, MAX_DEPTH)
+    }
+
+    // Unmeasured sources count as 1 B/s, so their weight still orders them.
+    fn rating(&self) -> f64 {
+        self.speed_bps.max(1.0) * self.weight
+    }
+}
+
+/// Counts sources that may vanish for less, but only while a source that stays is there to take their share.
+pub fn weigh_part_time(sources: &mut [Source], is_part_time: &[bool]) {
+    let has_full_time_source = is_part_time.iter().any(|part_time| !part_time);
+    for (source, &part_time) in sources.iter_mut().zip(is_part_time) {
+        source.weight = if part_time && has_full_time_source { PART_TIME_WEIGHT } else { FULL_WEIGHT };
     }
 }
 
@@ -119,7 +138,7 @@ pub fn plan(want: &[u32], in_flight: &HashMap<u32, Vec<usize>>, sources: &[Sourc
         if already.is_some() && !endgame {
             continue;
         }
-        let score = |s: usize, assigned: &[usize]| sources[s].speed_bps.max(1.0) / (sources[s].in_flight + assigned[s] + 1) as f64;
+        let score = |s: usize, assigned: &[usize]| sources[s].rating() / (sources[s].in_flight + assigned[s] + 1) as f64;
         let mut candidates: Vec<usize> =
             (0..sources.len()).filter(|&s| room[s] > 0 && sources[s].has(index) && !already.is_some_and(|a| a.contains(&s))).collect();
         candidates.sort_by(|&a, &b| score(b, &assigned).total_cmp(&score(a, &assigned)).then(a.cmp(&b)));
@@ -141,6 +160,8 @@ pub struct Tuning {
     pub stall_timeout: Duration,
     /// How long a request's stream may deliver no bytes before its chunks are asked for elsewhere.
     pub stream_stall_timeout: Duration,
+    /// The same for a node that may vanish, while another node could take over its chunks.
+    pub part_time_stall_timeout: Duration,
     /// Uploads this node runs at once, across all the peers asking.
     pub upload_slots: usize,
 }
@@ -154,7 +175,20 @@ impl Default for Tuning {
             map_interval: Duration::from_millis(250),
             stall_timeout: Duration::from_secs(60),
             stream_stall_timeout: Duration::from_secs(20),
+            // Just past the time a busy node takes to say so, so a busy phone is not taken for a vanished one.
+            part_time_stall_timeout: SLOT_WAIT + Duration::from_secs(1),
             upload_slots: UPLOAD_SLOTS,
+        }
+    }
+}
+
+impl Tuning {
+    /// How long a request's stream may deliver nothing; a node that may vanish is given up on soon when another could take over.
+    pub fn stall_timeout_for(&self, is_part_time: bool, has_other_source: bool) -> Duration {
+        if is_part_time && has_other_source {
+            self.part_time_stall_timeout
+        } else {
+            self.stream_stall_timeout
         }
     }
 }
@@ -237,11 +271,6 @@ impl Transfers {
 
     pub fn stall_timeout(&self) -> Duration {
         self.tuning.stall_timeout
-    }
-
-    /// How long a request's stream may deliver nothing before it is abandoned.
-    pub fn stream_stall_timeout(&self) -> Duration {
-        self.tuning.stream_stall_timeout
     }
 
     /// The node-wide upload slots.
@@ -451,14 +480,23 @@ async fn refuse<W: AsyncWrite + Unpin>(writer: &mut W, code: ErrorCode) -> std::
     writer.shutdown().await
 }
 
+/// Chunks of one file to ask one peer for.
+struct ChunkRequest {
+    from: NodeId,
+    file_id: String,
+    indices: Vec<u32>,
+    stall_timeout: Duration,
+}
+
 /// Asks a peer for chunks over a stream of its own and turns what comes back into download events.
-async fn request_chunks(fetches: mpsc::Sender<Fetch>, events: mpsc::Sender<Event>, from: NodeId, file_id: String, indices: Vec<u32>) {
+async fn request_chunks(fetches: mpsc::Sender<Fetch>, events: mpsc::Sender<Event>, asked: ChunkRequest) {
+    let ChunkRequest { from, file_id, indices, stall_timeout } = asked;
     let (replies_tx, mut replies) = mpsc::channel(2);
     let request = GetChunks::for_indices(&file_id, &indices);
     let mut outstanding: HashSet<u32> = indices.into_iter().collect();
     let mut missing = Vec::new();
     let mut fault = Fault::Failed;
-    if fetches.send(Fetch { request, replies: replies_tx }).await.is_ok() {
+    if fetches.send(Fetch { request, replies: replies_tx, stall_timeout }).await.is_ok() {
         while let Some(reply) = replies.recv().await {
             match reply {
                 // Answers for chunks nobody asked for are ignored, so a peer can't push data at us.
@@ -625,9 +663,11 @@ async fn run(state: NodeState, download: Arc<Download>, mut events: mpsc::Receiv
                     (None, Some(Have::Partial(map))) if map.len() == have.len() => Some(map),
                     _ => continue,
                 };
-                sources.push(Source { has, in_flight: peer.in_flight.len(), speed_bps: peer.speed_bps });
+                sources.push(Source { has, in_flight: peer.in_flight.len(), speed_bps: peer.speed_bps, weight: FULL_WEIGHT });
                 source_nodes.push(node.clone());
             }
+            let is_part_time: Vec<bool> = source_nodes.iter().map(|node| state.is_part_time_node(node)).collect();
+            weigh_part_time(&mut sources, &is_part_time);
 
             let mut in_flight: HashMap<u32, Vec<usize>> = HashMap::new();
             for (s, node) in source_nodes.iter().enumerate() {
@@ -642,21 +682,18 @@ async fn run(state: NodeState, download: Arc<Download>, mut events: mpsc::Receiv
             for (s, index) in plan(&want, &in_flight, &sources, endgame) {
                 per_source.entry(s).or_default().push(index);
             }
+            let has_other_source = source_nodes.len() > 1;
             for (s, indices) in per_source {
                 let node = &source_nodes[s];
                 // With several sources, each endgame request asks for one chunk so it can be called off alone.
-                let group_size = if endgame && source_nodes.len() > 1 { 1 } else { MAX_REQUEST_CHUNKS };
+                let group_size = if endgame && has_other_source { 1 } else { MAX_REQUEST_CHUNKS };
+                let stall_timeout = tuning.stall_timeout_for(is_part_time[s], has_other_source);
                 for group in indices.chunks(group_size) {
                     let peer = peers.get_mut(node).unwrap();
                     peer.request_started(Instant::now());
                     peer.in_flight.extend(group);
-                    let request = tokio::spawn(request_chunks(
-                        connected[node].fetches.clone(),
-                        download.events.clone(),
-                        node.clone(),
-                        id.clone(),
-                        group.to_vec(),
-                    ));
+                    let asked = ChunkRequest { from: node.clone(), file_id: id.clone(), indices: group.to_vec(), stall_timeout };
+                    let request = tokio::spawn(request_chunks(connected[node].fetches.clone(), download.events.clone(), asked));
                     if let [index] = group {
                         peer.cancellable.insert(*index, request.abort_handle());
                     }
@@ -725,7 +762,7 @@ mod tests {
             map
         });
         let _ = node;
-        Source { has, in_flight, speed_bps: speed }
+        Source { has, in_flight, speed_bps: speed, weight: FULL_WEIGHT }
     }
 
     fn have(len: u32, present: &[u32]) -> Bitmap {
@@ -824,10 +861,89 @@ mod tests {
         assert_eq!((to_a, planned.len() - to_a), (4, 4));
     }
 
+    fn weights(sources: &[Source]) -> Vec<f64> {
+        sources.iter().map(|s| s.weight).collect()
+    }
+
+    #[test]
+    fn a_part_time_source_counts_for_less_while_a_full_time_one_is_there() {
+        let mut sources = [source("phone", None, 4, 0, DEEP), source("desktop", None, 4, 0, DEEP)];
+
+        weigh_part_time(&mut sources, &[true, false]);
+
+        assert_eq!(weights(&sources), [PART_TIME_WEIGHT, FULL_WEIGHT]);
+    }
+
+    #[test]
+    fn part_time_sources_count_in_full_when_no_full_time_one_is_there() {
+        let mut sources = [source("phone", None, 4, 0, DEEP), source("tablet", None, 4, 0, DEEP)];
+
+        weigh_part_time(&mut sources, &[true, true]);
+
+        assert_eq!(weights(&sources), [FULL_WEIGHT, FULL_WEIGHT]);
+    }
+
+    #[test]
+    fn a_part_time_source_is_given_fewer_chunks_at_once() {
+        let steady = source("desktop", None, 200, 0, 40.0 * CHUNK_SIZE as f64);
+        let phone = Source { weight: PART_TIME_WEIGHT, ..source("phone", None, 200, 0, 40.0 * CHUNK_SIZE as f64) };
+
+        assert_eq!((steady.depth(), phone.depth()), (20, 5));
+    }
+
+    #[test]
+    fn the_most_urgent_chunk_goes_to_a_full_time_source_even_before_either_is_measured() {
+        let sources = [Source { weight: PART_TIME_WEIGHT, ..source("phone", None, 8, 0, 0.0) }, source("desktop", None, 8, 0, 0.0)];
+
+        let planned = plan(&[5, 6], &HashMap::new(), &sources, false);
+
+        assert_eq!(planned, [(1, 5), (0, 6)]);
+    }
+
+    #[test]
+    fn a_full_time_source_gets_most_of_the_work_from_an_equally_fast_part_time_one() {
+        let sources = [
+            Source { weight: PART_TIME_WEIGHT, ..source("phone", None, 64, 0, 64.0 * CHUNK_SIZE as f64) },
+            source("desktop", None, 64, 0, 64.0 * CHUNK_SIZE as f64),
+        ];
+
+        let planned = plan(&(0..64).collect::<Vec<u32>>(), &HashMap::new(), &sources, false);
+
+        let to_phone = planned.iter().filter(|(s, _)| *s == 0).count();
+        assert_eq!((to_phone, planned.len() - to_phone), (8, 32));
+    }
+
+    #[test]
+    fn a_part_time_source_is_given_up_on_sooner_when_another_source_could_take_over() {
+        let tuning = Tuning::default();
+
+        assert_eq!(tuning.stall_timeout_for(true, true), tuning.part_time_stall_timeout);
+        assert!(tuning.part_time_stall_timeout < tuning.stream_stall_timeout);
+    }
+
+    #[test]
+    fn a_part_time_source_that_is_the_only_one_gets_the_usual_patience() {
+        assert_eq!(Tuning::default().stall_timeout_for(true, false), Tuning::default().stream_stall_timeout);
+    }
+
+    #[test]
+    fn a_full_time_source_gets_the_usual_patience() {
+        assert_eq!(Tuning::default().stall_timeout_for(false, true), Tuning::default().stream_stall_timeout);
+    }
+
+    #[test]
+    fn a_busy_phone_says_so_before_it_would_be_taken_for_gone() {
+        assert!(Tuning::default().part_time_stall_timeout > SLOT_WAIT);
+    }
+
     // Sees every reply a node serves; returning false withholds it and leaves the requester waiting in silence.
     type Tamper = Arc<dyn Fn(&mut Reply) -> bool + Send + Sync>;
 
     const STALL: Duration = Duration::from_secs(2);
+
+    fn asking(indices: Vec<u32>) -> ChunkRequest {
+        ChunkRequest { from: "node_a".into(), file_id: "file_x".into(), indices, stall_timeout: STALL }
+    }
 
     fn data_pattern(len: usize, seed: u8) -> Vec<u8> {
         (0..len).map(|i| ((i * 7) as u8).wrapping_add(seed).wrapping_add((i >> 16) as u8)).collect()
@@ -873,7 +989,9 @@ mod tests {
         let (client_reader, client_writer) = tokio::io::split(client_end);
         tokio::spawn(async move { serve_stream(&server, &client_id, server_reader, server_writer).await });
         let (served_tx, mut served) = mpsc::channel(2);
-        tokio::spawn(async move { wire::fetch_stream(client_reader, client_writer, &fetch.request, served_tx, STALL).await });
+        let stall_timeout = fetch.stall_timeout;
+        let request = fetch.request.clone();
+        tokio::spawn(async move { wire::fetch_stream(client_reader, client_writer, &request, served_tx, stall_timeout).await });
         let mut withheld = false;
         while let Some(mut reply) = served.recv().await {
             if tamper.as_ref().is_some_and(|tamper| !tamper(&mut reply)) {
@@ -886,7 +1004,7 @@ mod tests {
         }
         if withheld {
             // The requester gives up on a stream that stays silent, which closes it from this end.
-            tokio::time::sleep(STALL).await;
+            tokio::time::sleep(stall_timeout).await;
         }
     }
 
@@ -1116,7 +1234,7 @@ mod tests {
     async fn chunks_that_were_not_asked_for_are_ignored() {
         let (fetches_tx, mut fetches) = mpsc::channel::<Fetch>(1);
         let (events_tx, mut events) = mpsc::channel(8);
-        let asking = tokio::spawn(request_chunks(fetches_tx, events_tx, "node_a".into(), "file_x".into(), vec![1]));
+        let asking = tokio::spawn(request_chunks(fetches_tx, events_tx, asking(vec![1])));
 
         let fetch = fetches.recv().await.unwrap();
         fetch.replies.send(Reply::ChunkData { index: 9, bytes: vec![0; 4] }).await.unwrap();
@@ -1132,7 +1250,7 @@ mod tests {
     async fn chunks_a_peer_never_answered_are_released_when_its_stream_ends() {
         let (fetches_tx, mut fetches) = mpsc::channel::<Fetch>(1);
         let (events_tx, mut events) = mpsc::channel(8);
-        let asking = tokio::spawn(request_chunks(fetches_tx, events_tx, "node_a".into(), "file_x".into(), vec![1, 2]));
+        let asking = tokio::spawn(request_chunks(fetches_tx, events_tx, asking(vec![1, 2])));
 
         let fetch = fetches.recv().await.unwrap();
         fetch.replies.send(Reply::ChunkData { index: 1, bytes: vec![1; 4] }).await.unwrap();
@@ -1148,7 +1266,7 @@ mod tests {
     async fn chunks_a_peer_says_it_lacks_are_released_as_missing() {
         let (fetches_tx, mut fetches) = mpsc::channel::<Fetch>(1);
         let (events_tx, mut events) = mpsc::channel(8);
-        let asking = tokio::spawn(request_chunks(fetches_tx, events_tx, "node_a".into(), "file_x".into(), vec![1]));
+        let asking = tokio::spawn(request_chunks(fetches_tx, events_tx, asking(vec![1])));
 
         let fetch = fetches.recv().await.unwrap();
         fetch.replies.send(Reply::Missing { index: 1 }).await.unwrap();
@@ -1163,7 +1281,7 @@ mod tests {
     async fn a_busy_peer_releases_its_chunks_as_busy_not_failed() {
         let (fetches_tx, mut fetches) = mpsc::channel::<Fetch>(1);
         let (events_tx, mut events) = mpsc::channel(8);
-        let asking = tokio::spawn(request_chunks(fetches_tx, events_tx, "node_a".into(), "file_x".into(), vec![1, 2]));
+        let asking = tokio::spawn(request_chunks(fetches_tx, events_tx, asking(vec![1, 2])));
 
         let fetch = fetches.recv().await.unwrap();
         fetch.replies.send(Reply::Error(ErrorCode::Busy)).await.unwrap();

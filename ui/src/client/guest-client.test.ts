@@ -152,7 +152,7 @@ describe('GuestClient', () => {
     const { client } = startGuest();
     const ticket = await client.prepareDownload({
       id: 'folder_1', name: 'Photos', mimeType: 'inode/directory', isFolder: true, sizeBytes: 0, folderFileCount: 3,
-      sharedAt: 0, sharedBy: '', isOwn: false, holderNames: [], isAvailable: true, canUnshare: false,
+      sharedAt: 0, sharedBy: '', isOwn: false, holderNames: [], isAvailable: true, canUnshare: false, needsThisDeviceOnline: false,
     });
     expect(ticket).toEqual({ url: '/blobs/folder_1.zip', filename: 'Photos.zip' });
   });

@@ -29,6 +29,8 @@ export interface SharedFile {
   holderNames: string[];
   isAvailable: boolean;
   canUnshare: boolean;
+  // This device published it and is the only one with a copy, and may go offline (a phone): others need it to stay open.
+  needsThisDeviceOnline: boolean;
 }
 
 export interface ChatMessage {

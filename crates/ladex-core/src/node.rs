@@ -62,6 +62,8 @@ pub struct NodeConfig {
     pub storage_limit_bytes: u64,
     pub stall_timeout: Duration,
     pub guest_session_ttl: Duration,
+    /// The node may vanish at any moment, as an app on a phone does; peers then count on it less.
+    pub is_part_time: bool,
 }
 
 impl NodeConfig {
@@ -81,6 +83,7 @@ impl NodeConfig {
             storage_limit_bytes: DEFAULT_STORAGE_LIMIT_GIB * BYTES_PER_GIB,
             stall_timeout: Duration::from_secs(DEFAULT_STALL_TIMEOUT_SECS),
             guest_session_ttl: Duration::from_secs(DEFAULT_GUEST_SESSION_HOURS * 60 * 60),
+            is_part_time: false,
         }
     }
 }
@@ -463,6 +466,7 @@ fn new_state(config: &NodeConfig, parts: StateParts) -> NodeState {
         trust: parts.trust,
         pairings: Arc::new(pairing::Pairings::new()),
         mesh_peers: Arc::new(RwLock::new(HashMap::new())),
+        part_time_peers: Default::default(),
         dial_targets: Default::default(),
         kept_peers: Default::default(),
         mesh_endpoint: Some(parts.mesh_endpoint),
@@ -490,6 +494,7 @@ fn new_state(config: &NodeConfig, parts: StateParts) -> NodeState {
         http_port: parts.http_port,
         local_ip: Arc::new(std::sync::RwLock::new(parts.primary_ip)),
         node_name: types::hostname(),
+        is_part_time: config.is_part_time,
         preferences: Arc::new(crate::preferences::PreferencesStore::open(&config.data_dir)),
         started_with: Arc::new(control::Settings {
             data_dir: config.data_dir.clone(),

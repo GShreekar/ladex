@@ -10,6 +10,8 @@ use tokio::sync::mpsc::{self, UnboundedReceiver};
 
 // A loaded CI runner can take far longer than a quiet machine to move three chunks.
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(60);
+// Long enough that only a broken stream ends a request early.
+const ASK_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 type Tab = UnboundedReceiver<ServerMessage>;
 
@@ -81,7 +83,7 @@ async fn contents(node: &NodeHandle, id: &str) -> Vec<u8> {
 async fn ask(from: &NodeHandle, of: &NodeHandle, request: GetChunks) -> Vec<Reply> {
     let fetches = from.state.mesh_peers.read().await[of.node_id()].fetches.clone();
     let (replies_tx, mut replies) = mpsc::channel(32);
-    fetches.send(Fetch { request, replies: replies_tx }).await.unwrap();
+    fetches.send(Fetch { request, replies: replies_tx, stall_timeout: ASK_STALL_TIMEOUT }).await.unwrap();
     let mut got = Vec::new();
     while let Some(reply) = replies.recv().await {
         got.push(reply);
